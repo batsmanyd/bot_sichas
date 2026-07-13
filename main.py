@@ -74,7 +74,7 @@ def telegram_start():
         "client_id": CLIENT_ID,
         "redirect_uri": CALLBACK_URL,
         "response_type": "code",
-        "scope": "openid profile phone telegram:bot_access",
+        "scope": "openid profile phone",
         "state": state,
         "nonce": nonce,
         "code_challenge": base64url_sha256(verifier),
