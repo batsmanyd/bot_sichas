@@ -72,12 +72,12 @@ function setRadius(km,button){document.querySelectorAll('#radiusToolbar .chip').
 $('openBtn').onclick=()=>requireRegistration(toggleOpen);$('createBtn').onclick=()=>{fillSubs();$('meetingDialog').showModal()};document.querySelectorAll('.sheet>.field .option').forEach(b=>b.onclick=()=>{b.parentElement.querySelectorAll('.option').forEach(x=>x.classList.remove('pick'));b.classList.add('pick')});$('saveMeeting').onclick=()=>{if(isRegistered){createMeeting()}else{$('meetingDialog').close();requireRegistration(createMeeting)}};
 $('nav').querySelectorAll('button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$(b.dataset.page).classList.add('active');$('nav').querySelectorAll('button').forEach(x=>x.classList.remove('active'));b.classList.add('active');scrollTo(0,0);if(b.dataset.page==='nearby'){initMap();setTimeout(()=>map&&map.invalidateSize(),150)}});
 document.querySelectorAll('#radiusToolbar .chip').forEach(b=>b.onclick=()=>setRadius(Number(b.dataset.radius),b));
-function finishOnboarding(){localStorage.setItem('onboardingDone','1');$('onboardingDialog').close()}
+function finishOnboarding(){localStorage.setItem('onboardingDoneV2','1');$('onboardingDialog').close()}
 function drawOnboarding(){const slides=$('onboardingDialog').querySelectorAll('.slide'),dots=$('onboardingDialog').querySelectorAll('.dot');slides.forEach((s,i)=>s.classList.toggle('active',i===onboardingStep));dots.forEach((d,i)=>d.classList.toggle('active',i===onboardingStep));$('onboardNext').textContent=onboardingStep===2?'Посмотреть приложение':'Далее'}
 $('onboardNext').onclick=()=>{if(onboardingStep===2){finishOnboarding()}else{onboardingStep++;drawOnboarding()}};$('skipOnboarding').onclick=finishOnboarding;
 $('helpBtn').onclick=()=>$('helpDialog').showModal();$('closeHelp').onclick=()=>$('helpDialog').close();
 function openRegistration(){pendingAction=null;$('registrationDialog').showModal()}$('guestRegister').onclick=openRegistration;$('profileRegister').onclick=openRegistration;$('continueGuest').onclick=()=>{$('registrationDialog').close();pendingAction=null};$('testRegistration').onclick=()=>{isRegistered=true;localStorage.setItem('registered','1');$('registrationDialog').close();updateAccountUI();const action=pendingAction;pendingAction=null;if(action)action()};
 drawCats();drawOpen();updateAccountUI();
-if(localStorage.getItem('onboardingDone')!=='1'){drawOnboarding();setTimeout(()=>$('onboardingDialog').showModal(),250)}
+if(localStorage.getItem('onboardingDoneV2')!=='1'){drawOnboarding();setTimeout(()=>$('onboardingDialog').showModal(),250)}
 </script>
 </body></html>
