@@ -17,7 +17,7 @@
 - `DATABASE_URL` — добавляется сервисом PostgreSQL;
 - `SECRET_KEY` — случайная длинная строка;
 - `PUBLIC_URL` — публичный адрес Railway без завершающего `/`;
-- `TELEGRAM_BOT_TOKEN` — токен `@vmeste_rjadom_bot`;
+- `TELEGRAM_BOT_TOKEN` — токен `@vmeste_rjadom_bot` (старое имя `BOT_TOKEN` тоже поддерживается);
 - `ALLOW_TEST_AUTH=false`.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
