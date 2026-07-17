@@ -286,7 +286,24 @@ def safe_point(lat, lon, identifier):
     digest = hashlib.sha256(f"{app.secret_key}|{identifier}".encode()).digest()
     lat_offset = ((digest[0] / 255) - 0.5) * 0.005
     lon_offset = ((digest[1] / 255) - 0.5) * 0.008
+    if abs(lat_offset) < 0.0005:
+        lat_offset = 0.0005 if lat_offset >= 0 else -0.0005
+    if abs(lon_offset) < 0.0008:
+        lon_offset = 0.0008 if lon_offset >= 0 else -0.0008
     return round(lat + lat_offset, 4), round(lon + lon_offset, 4)
+
+
+def notify_user(user_id, text):
+    if not BOT_TOKEN:
+        return
+    user = db.session.get(User, user_id)
+    if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      json={"chat_id": user.telegram_id, "text": text}, timeout=5).raise_for_status()
+    except requests.RequestException:
+        app.logger.warning("Telegram notification failed for user %s", user_id)
 
 
 def upsert_telegram_user(data):
@@ -580,10 +597,16 @@ def express_interest(meeting_id):
     if (UserBlock.query.filter_by(blocker_id=user.id, blocked_id=meeting.owner_id).first() or
             UserBlock.query.filter_by(blocker_id=meeting.owner_id, blocked_id=user.id).first()):
         return jsonify(error="Отклик на эту встречу недоступен"), 403
+    accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
+    if meeting.format == "one" and accepted_count:
+        return jsonify(error="У этой встречи уже есть подтверждённый участник"), 409
+    if meeting.format == "group" and accepted_count >= 6:
+        return jsonify(error="Группа уже набрана"), 409
     interest = Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
         db.session.commit()
+        notify_user(meeting.owner_id, f"Новый отклик на встречу «{meeting.description}» от {user.name}")
     return jsonify(ok=True)
 
 
@@ -644,7 +667,14 @@ def decide_interest(interest_id):
     if decision == "accepted" and meeting.format == "one":
         (Interest.query.filter_by(meeting_id=meeting.id, status="pending")
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
+    if decision == "accepted" and meeting.format == "group":
+        accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
+        if accepted_count > 6:
+            db.session.rollback()
+            return jsonify(error="В группе может быть не больше 6 участников"), 409
     db.session.commit()
+    result_text = "принят" if decision == "accepted" else "отклонён"
+    notify_user(interest.user_id, f"Ваш отклик на встречу «{meeting.description}» {result_text}")
     return jsonify(ok=True, interest=interest_payload(interest, user))
 
 
@@ -746,6 +776,8 @@ def send_message(meeting_id):
         return jsonify(error="Напишите сообщение"), 400
     db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
     db.session.commit()
+    for member_id in accepted_user_ids(meeting) - {current_user().id}:
+        notify_user(member_id, f"{current_user().name}: {text[:120]}")
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
