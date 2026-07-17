@@ -104,6 +104,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(main.UserReport.query.count(), 1)
         self.assertEqual(main.UserBlock.query.count(), 1)
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/report", json={
+            "target_user_id": first_user.id, "reason": "Повторная жалоба",
+        }).status_code, 409)
+        self.assertEqual(self.second.get("/api/admin/reports").status_code, 403)
         self.assertEqual(self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
         ).status_code, 403)
@@ -119,6 +123,15 @@ class MvpFlowTest(unittest.TestCase):
         self.login(self.first, 1)
         response = self.first.post("/api/presence", json={"category": "bad", "latitude": 0, "longitude": 0})
         self.assertEqual(response.status_code, 400)
+
+    def test_meeting_rate_limit(self):
+        self.login(self.first, 10)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        payload = {**point, "category": "walk", "description": "Прогуляться", "format": "one"}
+        for _ in range(5):
+            self.assertEqual(self.first.post("/api/meetings", json=payload).status_code, 201)
+        response = self.first.post("/api/meetings", json=payload)
+        self.assertEqual(response.status_code, 429, response.get_json())
         response = self.first.post("/api/meetings", json={"category": "walk", "description": ""})
         self.assertEqual(response.status_code, 400)
 
