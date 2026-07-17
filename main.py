@@ -28,6 +28,7 @@ CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
 CALLBACK_URL = f"{PUBLIC_URL}/auth/telegram/callback"
 ALLOW_TEST_AUTH = os.getenv("ALLOW_TEST_AUTH", "false").lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
+BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
 
 database_url = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}")
 if database_url.startswith("postgres://"):
@@ -249,6 +250,24 @@ class UserModeration(db.Model):
     reason = db.Column(db.String(180), nullable=False)
 
 
+class InviteAccount(db.Model):
+    __tablename__ = "invite_account"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    available = db.Column(db.Integer, nullable=False, default=3)
+
+
+class Invitation(db.Model):
+    __tablename__ = "invitation"
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(40), unique=True, nullable=False, index=True)
+    inviter_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    claimed_by = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True)
+    status = db.Column(db.String(20), nullable=False, default="created")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    claimed_at = db.Column(db.DateTime(timezone=True))
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
@@ -295,6 +314,39 @@ def consume_action(user_id, action, limit, window_seconds):
 def user_hidden(user_id):
     moderation = UserModeration.query.filter_by(user_id=user_id).first()
     return bool(moderation and normalize_dt(moderation.hidden_until) > utcnow())
+
+
+def invite_account(user_id):
+    account = InviteAccount.query.filter_by(user_id=user_id).first()
+    if not account:
+        account = InviteAccount(user_id=user_id, available=3)
+        db.session.add(account)
+    return account
+
+
+def claim_invitation(user, token):
+    token = str(token or "").removeprefix("invite_")[:40]
+    invitation = Invitation.query.filter_by(token=token, status="created").first()
+    if not invitation or invitation.inviter_id == user.id:
+        return False
+    if Invitation.query.filter_by(claimed_by=user.id).first():
+        return False
+    if Meeting.query.filter_by(owner_id=user.id).first() or Interest.query.filter_by(user_id=user.id).first():
+        return False
+    invitation.claimed_by = user.id
+    invitation.status = "claimed"
+    invitation.claimed_at = utcnow()
+    db.session.commit()
+    return True
+
+
+def reward_completed_invites(member_ids):
+    invitations = Invitation.query.filter(Invitation.claimed_by.in_(member_ids),
+                                           Invitation.status == "claimed").all()
+    for invitation in invitations:
+        account = invite_account(invitation.inviter_id)
+        account.available += 1
+        invitation.status = "rewarded"
 
 
 def valid_coordinates(lat, lon):
@@ -421,11 +473,15 @@ def api_session():
 
 @app.post("/auth/telegram-mini-app")
 def telegram_mini_app():
-    user_data = verify_mini_app_init_data(json_body().get("init_data", ""))
+    init_data = json_body().get("init_data", "")
+    user_data = verify_mini_app_init_data(init_data)
     if not user_data:
         return jsonify(error="Не удалось подтвердить запуск из Telegram"), 401
     user = upsert_telegram_user(user_data)
-    return jsonify(ok=True, user={"id": user.id, "name": user.name, "username": user.username})
+    start_param = dict(parse_qsl(init_data, keep_blank_values=True)).get("start_param", "")
+    claimed = claim_invitation(user, start_param) if start_param.startswith("invite_") else False
+    return jsonify(ok=True, invitation_claimed=claimed,
+                   user={"id": user.id, "name": user.name, "username": user.username})
 
 
 @app.post("/auth/test")
@@ -434,6 +490,8 @@ def test_auth():
         return jsonify(error="Тестовый вход отключён"), 404
     suffix = str(json_body().get("user", "1"))[:20]
     user = upsert_telegram_user({"id": f"test-{suffix}", "first_name": f"Тест {suffix}"})
+    if json_body().get("invite_token"):
+        claim_invitation(user, json_body().get("invite_token"))
     return jsonify(ok=True, user={"id": user.id, "name": user.name})
 
 
@@ -864,6 +922,7 @@ def meeting_lifecycle(meeting_id):
         state.status = "cancelled"
     elif action == "complete":
         state.status = "completed"
+        reward_completed_invites(accepted_user_ids(meeting))
     db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                 kind=action, note=str(data.get("note", "")).strip()[:180] or None))
     db.session.commit()
@@ -944,6 +1003,34 @@ def admin_reports():
                            "target": db.session.get(User, item.target_id).name,
                            "reason": item.reason,
                            "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
+
+
+@app.get("/api/invitations")
+@login_required
+def list_invitations():
+    user = current_user()
+    account = invite_account(user.id)
+    db.session.commit()
+    items = Invitation.query.filter_by(inviter_id=user.id).order_by(Invitation.id.desc()).all()
+    return jsonify(available=account.available,
+                   items=[{"url": f"https://t.me/{BOT_USERNAME}?startapp=invite_{item.token}",
+                           "status": item.status} for item in items])
+
+
+@app.post("/api/invitations")
+@login_required
+def create_invitation():
+    user = current_user()
+    account = invite_account(user.id)
+    if account.available <= 0:
+        return jsonify(error="Приглашения закончились. Оно вернётся после успешной встречи приглашённого"), 409
+    token = secrets.token_urlsafe(12)
+    account.available -= 1
+    invitation = Invitation(token=token, inviter_id=user.id, status="created")
+    db.session.add(invitation)
+    db.session.commit()
+    return jsonify(ok=True, available=account.available,
+                   url=f"https://t.me/{BOT_USERNAME}?startapp=invite_{token}"), 201
 
 
 @app.get("/")
