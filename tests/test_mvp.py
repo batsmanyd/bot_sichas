@@ -64,6 +64,18 @@ class MvpFlowTest(unittest.TestCase):
         outgoing = self.second.get("/api/interests").get_json()["outgoing"]
         self.assertEqual(outgoing[0]["owner"]["name"], "Тест 1")
         self.assertEqual(outgoing[0]["status"], "accepted")
+        self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 200)
+        response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        place_id = response.get_json()["room"]["places"][0]["id"]
+        self.assertEqual(self.second.post(f"/api/places/{place_id}/vote").status_code, 200)
+        self.assertEqual(self.second.post(f"/api/places/{place_id}/confirm").status_code, 403)
+        self.assertEqual(self.first.post(f"/api/places/{place_id}/confirm").status_code, 200)
+        response = self.second.post(f"/api/meetings/{meeting_id}/messages", json={"text": "Буду через 10 минут"})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        room = self.first.get(f"/api/meetings/{meeting_id}/room").get_json()
+        self.assertTrue(room["places"][0]["confirmed"])
+        self.assertEqual(room["messages"][0]["text"], "Буду через 10 минут")
         self.assertEqual(self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
         ).status_code, 403)
