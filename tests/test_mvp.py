@@ -132,6 +132,32 @@ class MvpFlowTest(unittest.TestCase):
             self.assertEqual(self.first.post("/api/meetings", json=payload).status_code, 201)
         response = self.first.post("/api/meetings", json=payload)
         self.assertEqual(response.status_code, 429, response.get_json())
+
+    def test_invitation_returns_after_first_completed_meeting(self):
+        self.login(self.first, 20)
+        response = self.first.post("/api/invitations", json={})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertEqual(response.get_json()["available"], 2)
+        token = response.get_json()["url"].split("invite_", 1)[1]
+        response = self.second.post("/auth/test", json={"user": "21", "invite_token": token})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.login(self.third, 22)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        response = self.second.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Первая встреча", "format": "one",
+        })
+        meeting_id = response.get_json()["id"]
+        self.assertEqual(self.third.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 200)
+        interest_id = self.second.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.assertEqual(self.second.post(f"/api/interests/{interest_id}/decision", json={
+            "decision": "accepted",
+        }).status_code, 200)
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "complete",
+        }).status_code, 200)
+        invitations = self.first.get("/api/invitations").get_json()
+        self.assertEqual(invitations["available"], 3)
+        self.assertEqual(invitations["items"][0]["status"], "rewarded")
         response = self.first.post("/api/meetings", json={"category": "walk", "description": ""})
         self.assertEqual(response.status_code, 400)
 
