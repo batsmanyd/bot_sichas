@@ -27,6 +27,7 @@ CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
 CALLBACK_URL = f"{PUBLIC_URL}/auth/telegram/callback"
 ALLOW_TEST_AUTH = os.getenv("ALLOW_TEST_AUTH", "false").lower() == "true"
+ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 
 database_url = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}")
 if database_url.startswith("postgres://"):
@@ -232,6 +233,22 @@ class UserBlock(db.Model):
     __table_args__ = (UniqueConstraint("blocker_id", "blocked_id", name="uq_user_block"),)
 
 
+class ActionLog(db.Model):
+    __tablename__ = "action_log"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    action = db.Column(db.String(30), nullable=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+
+class UserModeration(db.Model):
+    __tablename__ = "user_moderation"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    hidden_until = db.Column(db.DateTime(timezone=True), nullable=False)
+    reason = db.Column(db.String(180), nullable=False)
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
@@ -263,6 +280,21 @@ def login_required(view):
 
 def json_body():
     return request.get_json(silent=True) or {}
+
+
+def consume_action(user_id, action, limit, window_seconds):
+    since = utcnow() - timedelta(seconds=window_seconds)
+    count = ActionLog.query.filter(ActionLog.user_id == user_id, ActionLog.action == action,
+                                   ActionLog.created_at >= since).count()
+    if count >= limit:
+        return False
+    db.session.add(ActionLog(user_id=user_id, action=action))
+    return True
+
+
+def user_hidden(user_id):
+    moderation = UserModeration.query.filter_by(user_id=user_id).first()
+    return bool(moderation and normalize_dt(moderation.hidden_until) > utcnow())
 
 
 def valid_coordinates(lat, lon):
@@ -377,6 +409,7 @@ def api_session():
         telegram_configured=bool(BOT_TOKEN or oidc_configured()),
         mini_app_configured=bool(BOT_TOKEN),
         test_auth_enabled=ALLOW_TEST_AUTH,
+        is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
         user={
             "id": user.id,
             "name": user.name,
@@ -472,6 +505,8 @@ def feed():
                 continue
             if presence.user_id in blocked_ids:
                 continue
+            if user_hidden(presence.user_id):
+                continue
             if category in VALID_CATEGORIES and presence.category != category:
                 continue
             distance = haversine_km(lat, lon, presence.latitude, presence.longitude)
@@ -491,6 +526,8 @@ def feed():
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
         for meeting in meetings:
             if meeting.owner_id in blocked_ids:
+                continue
+            if user_hidden(meeting.owner_id):
                 continue
             if category in VALID_CATEGORIES and meeting.category != category:
                 continue
@@ -575,6 +612,8 @@ def create_meeting():
         return jsonify(error="Некорректный формат встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
+    if not consume_action(user.id, "meeting", 5, 3600):
+        return jsonify(error="Слишком много встреч за час. Попробуйте позже"), 429
     meeting = Meeting(
         owner_id=user.id, category=category, description=description, format=meeting_format,
         latitude=float(lat), longitude=float(lon), expires_at=utcnow() + timedelta(minutes=60),
@@ -592,6 +631,8 @@ def express_interest(meeting_id):
     meeting = db.get_or_404(Meeting, meeting_id)
     if normalize_dt(meeting.expires_at) <= utcnow():
         return jsonify(error="Эта встреча уже завершена"), 409
+    if not consume_action(user.id, "interest", 12, 3600):
+        return jsonify(error="Слишком много откликов за час. Попробуйте позже"), 429
     if meeting.owner_id == user.id:
         return jsonify(error="Это ваша встреча"), 400
     if (UserBlock.query.filter_by(blocker_id=user.id, blocked_id=meeting.owner_id).first() or
@@ -771,6 +812,8 @@ def send_message(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not consume_action(current_user().id, "message", 12, 60):
+        return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
     text = str(json_body().get("text", "")).strip()[:500]
     if not text:
         return jsonify(error="Напишите сообщение"), 400
@@ -856,6 +899,8 @@ def report_user(meeting_id):
     if error:
         return error
     data, reporter = json_body(), current_user()
+    if not consume_action(reporter.id, "report", 5, 86400):
+        return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
     try:
         target_id = int(data.get("target_user_id"))
     except (TypeError, ValueError):
@@ -865,12 +910,40 @@ def report_user(meeting_id):
     reason = str(data.get("reason", "")).strip()[:180]
     if len(reason) < 3:
         return jsonify(error="Опишите причину жалобы"), 400
+    if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=reporter.id, target_id=target_id).first():
+        return jsonify(error="Вы уже отправили жалобу на этого участника"), 409
     db.session.add(UserReport(meeting_id=meeting.id, reporter_id=reporter.id,
                               target_id=target_id, reason=reason))
     if data.get("block") and not UserBlock.query.filter_by(blocker_id=reporter.id, blocked_id=target_id).first():
         db.session.add(UserBlock(blocker_id=reporter.id, blocked_id=target_id))
+    recent = utcnow() - timedelta(hours=24)
+    report_count = UserReport.query.filter(UserReport.target_id == target_id,
+                                           UserReport.created_at >= recent).count()
+    if report_count >= 3:
+        moderation = UserModeration.query.filter_by(user_id=target_id).first()
+        if not moderation:
+            moderation = UserModeration(user_id=target_id, hidden_until=utcnow() + timedelta(hours=24),
+                                        reason="Три независимые жалобы за 24 часа")
+            db.session.add(moderation)
+        else:
+            moderation.hidden_until = utcnow() + timedelta(hours=24)
     db.session.commit()
     return jsonify(ok=True)
+
+
+@app.get("/api/admin/reports")
+@login_required
+def admin_reports():
+    user = current_user()
+    if user.telegram_id not in ADMIN_TELEGRAM_IDS:
+        return jsonify(error="Нет доступа"), 403
+    reports = UserReport.query.order_by(UserReport.id.desc()).limit(200).all()
+    return jsonify(items=[{"id": item.id, "meeting_id": item.meeting_id,
+                           "reporter": db.session.get(User, item.reporter_id).name,
+                           "target_id": item.target_id,
+                           "target": db.session.get(User, item.target_id).name,
+                           "reason": item.reason,
+                           "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
 
 
 @app.get("/")
