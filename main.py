@@ -158,6 +158,33 @@ class Interest(db.Model):
     __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_interest_meeting_user"),)
 
 
+class MeetingPlace(db.Model):
+    __tablename__ = "meeting_place"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    title = db.Column(db.String(120), nullable=False)
+    confirmed = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class PlaceVote(db.Model):
+    __tablename__ = "place_vote"
+    id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("meeting_place.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    __table_args__ = (UniqueConstraint("place_id", "user_id", name="uq_place_vote_user"),)
+
+
+class ChatMessage(db.Model):
+    __tablename__ = "chat_message"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    text = db.Column(db.String(500), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
@@ -561,6 +588,98 @@ def decide_interest(interest_id):
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
     db.session.commit()
     return jsonify(ok=True, interest=interest_payload(interest, user))
+
+
+def meeting_member(meeting, user):
+    if meeting.owner_id == user.id:
+        return Interest.query.filter_by(meeting_id=meeting.id, status="accepted").first() is not None
+    return Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id, status="accepted").first() is not None
+
+
+def meeting_room_or_error(meeting_id):
+    meeting = db.get_or_404(Meeting, meeting_id)
+    if not meeting_member(meeting, current_user()):
+        return None, (jsonify(error="Чат откроется после подтверждения участия"), 403)
+    return meeting, None
+
+
+def room_payload(meeting, user):
+    places = MeetingPlace.query.filter_by(meeting_id=meeting.id).order_by(MeetingPlace.id).all()
+    votes = PlaceVote.query.filter(PlaceVote.place_id.in_([p.id for p in places])).all() if places else []
+    vote_counts, my_votes = {}, set()
+    for vote in votes:
+        vote_counts[vote.place_id] = vote_counts.get(vote.place_id, 0) + 1
+        if vote.user_id == user.id:
+            my_votes.add(vote.place_id)
+    messages = ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
+    return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
+                         "is_owner": meeting.owner_id == user.id},
+            "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
+                        "voted": p.id in my_votes, "confirmed": bool(p.confirmed)} for p in places],
+            "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
+                          "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
+                         for m in messages]}
+
+
+@app.get("/api/meetings/<int:meeting_id>/room")
+@login_required
+def get_meeting_room(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    return error or jsonify(room_payload(meeting, current_user()))
+
+
+@app.post("/api/meetings/<int:meeting_id>/places")
+@login_required
+def propose_place(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    title = str(json_body().get("title", "")).strip()[:120]
+    if len(title) < 2:
+        return jsonify(error="Укажите место встречи"), 400
+    db.session.add(MeetingPlace(meeting_id=meeting.id, user_id=current_user().id, title=title))
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
+
+
+@app.post("/api/places/<int:place_id>/vote")
+@login_required
+def vote_place(place_id):
+    place = db.get_or_404(MeetingPlace, place_id)
+    meeting, error = meeting_room_or_error(place.meeting_id)
+    if error:
+        return error
+    vote = PlaceVote.query.filter_by(place_id=place.id, user_id=current_user().id).first()
+    db.session.delete(vote) if vote else db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, current_user()))
+
+
+@app.post("/api/places/<int:place_id>/confirm")
+@login_required
+def confirm_place(place_id):
+    place = db.get_or_404(MeetingPlace, place_id)
+    meeting = db.session.get(Meeting, place.meeting_id)
+    if meeting.owner_id != current_user().id:
+        return jsonify(error="Место подтверждает создатель встречи"), 403
+    MeetingPlace.query.filter_by(meeting_id=meeting.id).update({"confirmed": 0})
+    place.confirmed = 1
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, current_user()))
+
+
+@app.post("/api/meetings/<int:meeting_id>/messages")
+@login_required
+def send_message(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    text = str(json_body().get("text", "")).strip()[:500]
+    if not text:
+        return jsonify(error="Напишите сообщение"), 400
+    db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
 @app.get("/")
