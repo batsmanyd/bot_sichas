@@ -185,6 +185,53 @@ class ChatMessage(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class MeetingState(db.Model):
+    __tablename__ = "meeting_state"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), unique=True, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default="active")
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class MeetingEvent(db.Model):
+    __tablename__ = "meeting_event"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    target_user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    kind = db.Column(db.String(30), nullable=False)
+    note = db.Column(db.String(180))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class MeetingFeedback(db.Model):
+    __tablename__ = "meeting_feedback"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    trace = db.Column(db.String(180), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_feedback_meeting_user"),)
+
+
+class UserReport(db.Model):
+    __tablename__ = "user_report"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    reporter_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    target_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    reason = db.Column(db.String(180), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class UserBlock(db.Model):
+    __tablename__ = "user_block"
+    id = db.Column(db.Integer, primary_key=True)
+    blocker_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    blocked_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    __table_args__ = (UniqueConstraint("blocker_id", "blocked_id", name="uq_user_block"),)
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
@@ -396,11 +443,17 @@ def feed():
     category = request.args.get("category", "")
     now = utcnow()
     result = []
+    blocked_ids = set()
+    if user:
+        blocked_ids = {b.blocked_id for b in UserBlock.query.filter_by(blocker_id=user.id).all()}
+        blocked_ids |= {b.blocker_id for b in UserBlock.query.filter_by(blocked_id=user.id).all()}
 
     if valid_coordinates(lat, lon):
         presences = Presence.query.filter(Presence.active_until > now).all()
         for presence in presences:
             if user and presence.user_id == user.id:
+                continue
+            if presence.user_id in blocked_ids:
                 continue
             if category in VALID_CATEGORIES and presence.category != category:
                 continue
@@ -420,6 +473,8 @@ def feed():
         if user:
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
         for meeting in meetings:
+            if meeting.owner_id in blocked_ids:
+                continue
             if category in VALID_CATEGORIES and meeting.category != category:
                 continue
             distance = haversine_km(lat, lon, meeting.latitude, meeting.longitude)
@@ -522,6 +577,9 @@ def express_interest(meeting_id):
         return jsonify(error="Эта встреча уже завершена"), 409
     if meeting.owner_id == user.id:
         return jsonify(error="Это ваша встреча"), 400
+    if (UserBlock.query.filter_by(blocker_id=user.id, blocked_id=meeting.owner_id).first() or
+            UserBlock.query.filter_by(blocker_id=meeting.owner_id, blocked_id=user.id).first()):
+        return jsonify(error="Отклик на эту встречу недоступен"), 403
     interest = Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
@@ -612,13 +670,22 @@ def room_payload(meeting, user):
         if vote.user_id == user.id:
             my_votes.add(vote.place_id)
     messages = ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id).all()
+    feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id).order_by(MeetingFeedback.id).all()
+    member_ids = accepted_user_ids(meeting)
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
-                         "is_owner": meeting.owner_id == user.id},
+                         "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active"},
             "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
                         "voted": p.id in my_votes, "confirmed": bool(p.confirmed)} for p in places],
             "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
                           "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
-                         for m in messages]}
+                         for m in messages],
+            "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
+                        "note": e.note or ""} for e in events],
+            "traces": [{"name": db.session.get(User, f.user_id).name, "text": f.trace} for f in feedback],
+            "participants": [{"id": uid, "name": db.session.get(User, uid).name, "mine": uid == user.id}
+                             for uid in member_ids]}
 
 
 @app.get("/api/meetings/<int:meeting_id>/room")
@@ -680,6 +747,98 @@ def send_message(meeting_id):
     db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
     db.session.commit()
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
+
+
+def state_for(meeting):
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if not state:
+        state = MeetingState(meeting_id=meeting.id, status="active")
+        db.session.add(state)
+    return state
+
+
+def accepted_user_ids(meeting):
+    return {meeting.owner_id} | {i.user_id for i in Interest.query.filter_by(
+        meeting_id=meeting.id, status="accepted").all()}
+
+
+@app.post("/api/meetings/<int:meeting_id>/lifecycle")
+@login_required
+def meeting_lifecycle(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    user, data = current_user(), json_body()
+    action = data.get("action")
+    if action not in {"late", "cancel", "complete", "no_show"}:
+        return jsonify(error="Неизвестное действие"), 400
+    state = state_for(meeting)
+    if state.status != "active":
+        return jsonify(error="Встреча уже завершена или отменена"), 409
+    target_id = data.get("target_user_id")
+    if action in {"cancel", "complete"} and meeting.owner_id != user.id:
+        return jsonify(error="Это действие доступно создателю встречи"), 403
+    if action == "no_show":
+        try:
+            target_id = int(target_id)
+        except (TypeError, ValueError):
+            return jsonify(error="Укажите участника, который не пришёл"), 400
+        if target_id == user.id or target_id not in accepted_user_ids(meeting):
+            return jsonify(error="Некорректный участник"), 400
+    if action == "cancel":
+        state.status = "cancelled"
+    elif action == "complete":
+        state.status = "completed"
+    db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
+                                kind=action, note=str(data.get("note", "")).strip()[:180] or None))
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, user))
+
+
+@app.post("/api/meetings/<int:meeting_id>/feedback")
+@login_required
+def leave_feedback(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if not state or state.status != "completed":
+        return jsonify(error="След можно оставить после завершения встречи"), 409
+    trace = str(json_body().get("trace", "")).strip()[:180]
+    if len(trace) < 2:
+        return jsonify(error="Напишите короткое впечатление"), 400
+    feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=current_user().id).first()
+    if not feedback:
+        feedback = MeetingFeedback(meeting_id=meeting.id, user_id=current_user().id, trace=trace)
+        db.session.add(feedback)
+    else:
+        feedback.trace = trace
+    db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, current_user()))
+
+
+@app.post("/api/meetings/<int:meeting_id>/report")
+@login_required
+def report_user(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    data, reporter = json_body(), current_user()
+    try:
+        target_id = int(data.get("target_user_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="Укажите участника"), 400
+    if target_id == reporter.id or target_id not in accepted_user_ids(meeting):
+        return jsonify(error="Некорректный участник"), 400
+    reason = str(data.get("reason", "")).strip()[:180]
+    if len(reason) < 3:
+        return jsonify(error="Опишите причину жалобы"), 400
+    db.session.add(UserReport(meeting_id=meeting.id, reporter_id=reporter.id,
+                              target_id=target_id, reason=reason))
+    if data.get("block") and not UserBlock.query.filter_by(blocker_id=reporter.id, blocked_id=target_id).first():
+        db.session.add(UserBlock(blocker_id=reporter.id, blocked_id=target_id))
+    db.session.commit()
+    return jsonify(ok=True)
 
 
 @app.get("/")

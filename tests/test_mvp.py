@@ -76,6 +76,31 @@ class MvpFlowTest(unittest.TestCase):
         room = self.first.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertTrue(room["places"][0]["confirmed"])
         self.assertEqual(room["messages"][0]["text"], "Буду через 10 минут")
+        first_user = main.User.query.filter_by(telegram_id="test-1").one()
+        second_user = main.User.query.filter_by(telegram_id="test-2").one()
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "late", "note": "Опоздаю на 5 минут",
+        }).status_code, 200)
+        self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "no_show", "target_user_id": second_user.id,
+        }).status_code, 200)
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "complete",
+        }).status_code, 403)
+        self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "complete",
+        }).status_code, 200)
+        response = self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
+            "trace": "Хорошо прогулялись",
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["room"]["traces"][0]["text"], "Хорошо прогулялись")
+        response = self.second.post(f"/api/meetings/{meeting_id}/report", json={
+            "target_user_id": first_user.id, "reason": "Нарушил договорённость", "block": True,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(main.UserReport.query.count(), 1)
+        self.assertEqual(main.UserBlock.query.count(), 1)
         self.assertEqual(self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
         ).status_code, 403)
