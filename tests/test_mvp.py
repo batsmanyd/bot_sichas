@@ -20,6 +20,7 @@ class MvpFlowTest(unittest.TestCase):
         main.Model.metadata.create_all(main.engine)
         self.first = main.app.test_client()
         self.second = main.app.test_client()
+        self.third = main.app.test_client()
 
     def login(self, client, number):
         response = client.post("/auth/test", json={"user": str(number)})
@@ -64,6 +65,8 @@ class MvpFlowTest(unittest.TestCase):
         outgoing = self.second.get("/api/interests").get_json()["outgoing"]
         self.assertEqual(outgoing[0]["owner"]["name"], "Тест 1")
         self.assertEqual(outgoing[0]["status"], "accepted")
+        self.login(self.third, 3)
+        self.assertEqual(self.third.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 409)
         self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 200)
         response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
         self.assertEqual(response.status_code, 201, response.get_json())
