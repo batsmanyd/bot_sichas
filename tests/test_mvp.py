@@ -54,6 +54,19 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 200)
         self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 200)
         self.assertEqual(main.Interest.query.count(), 1)
+        incoming = self.first.get("/api/interests").get_json()["incoming"]
+        self.assertEqual(len(incoming), 1)
+        self.assertTrue(incoming[0]["can_decide"])
+        interest_id = incoming[0]["id"]
+        response = self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["interest"]["status"], "accepted")
+        outgoing = self.second.get("/api/interests").get_json()["outgoing"]
+        self.assertEqual(outgoing[0]["owner"]["name"], "Тест 1")
+        self.assertEqual(outgoing[0]["status"], "accepted")
+        self.assertEqual(self.second.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
+        ).status_code, 403)
         presence = main.Presence.query.one()
         presence.active_until = main.utcnow() - timedelta(seconds=1)
         main.db.session.commit()
