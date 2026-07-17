@@ -502,6 +502,67 @@ def express_interest(meeting_id):
     return jsonify(ok=True)
 
 
+def interest_payload(interest, viewer):
+    meeting = db.session.get(Meeting, interest.meeting_id)
+    participant = db.session.get(User, interest.user_id)
+    accepted = interest.status == "accepted"
+    return {
+        "id": interest.id,
+        "meeting_id": meeting.id,
+        "description": meeting.description,
+        "category": meeting.category,
+        "format": meeting.format,
+        "status": interest.status,
+        "participant": {
+            "name": participant.name,
+            # Personal details are revealed only after the meeting owner accepts.
+            "picture": participant.picture if accepted else None,
+            "username": participant.username if accepted else None,
+        },
+        "owner": {
+            "name": meeting.owner.name,
+            "picture": meeting.owner.picture if accepted else None,
+            "username": meeting.owner.username if accepted else None,
+        },
+        "can_decide": viewer.id == meeting.owner_id and interest.status == "pending",
+    }
+
+
+@app.get("/api/interests")
+@login_required
+def list_interests():
+    user = current_user()
+    owned_meeting_ids = [row.id for row in Meeting.query.filter_by(owner_id=user.id).all()]
+    incoming = (Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all()
+                if owned_meeting_ids else [])
+    outgoing = Interest.query.filter_by(user_id=user.id).all()
+    return jsonify(
+        incoming=[interest_payload(item, user) for item in incoming],
+        outgoing=[interest_payload(item, user) for item in outgoing],
+    )
+
+
+@app.post("/api/interests/<int:interest_id>/decision")
+@login_required
+def decide_interest(interest_id):
+    user = current_user()
+    interest = db.get_or_404(Interest, interest_id)
+    meeting = db.session.get(Meeting, interest.meeting_id)
+    if meeting.owner_id != user.id:
+        return jsonify(error="Решение принимает создатель встречи"), 403
+    if interest.status != "pending":
+        return jsonify(error="По этому отклику решение уже принято"), 409
+    decision = json_body().get("decision")
+    if decision not in {"accepted", "rejected"}:
+        return jsonify(error="Выберите принять или отклонить"), 400
+    interest.status = decision
+    if decision == "accepted" and meeting.format == "one":
+        (Interest.query.filter_by(meeting_id=meeting.id, status="pending")
+         .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
+    db.session.commit()
+    return jsonify(ok=True, interest=interest_payload(interest, user))
+
+
 @app.get("/")
 def index():
     return send_from_directory(BASE_DIR, "index.html")
