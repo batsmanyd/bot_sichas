@@ -201,6 +201,38 @@ class MvpFlowTest(unittest.TestCase):
             401,
         )
 
+    def test_standalone_app_receives_one_time_telegram_handoff(self):
+        original_token = main.BOT_TOKEN
+        main.BOT_TOKEN = "123456:test-token"
+        try:
+            created = self.first.post("/auth/handoff", json={})
+            self.assertEqual(created.status_code, 201, created.get_json())
+            handoff_token = created.get_json()["handoff_token"]
+            self.assertIn(f"startapp=login_{handoff_token}", created.get_json()["telegram_url"])
+
+            pending = self.first.post(f"/auth/handoff/{handoff_token}", json={})
+            self.assertEqual(pending.status_code, 202, pending.get_json())
+
+            values = {
+                "auth_date": str(int(time.time())),
+                "query_id": "AAE-handoff",
+                "start_param": f"login_{handoff_token}",
+                "user": json.dumps({"id": 991, "first_name": "Юрий"}, separators=(",", ":")),
+            }
+            check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+            secret = hmac.new(b"WebAppData", main.BOT_TOKEN.encode(), hashlib.sha256).digest()
+            values["hash"] = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+            telegram = self.second.post("/auth/telegram-mini-app", json={"init_data": urlencode(values)})
+            self.assertEqual(telegram.status_code, 200, telegram.get_json())
+            self.assertTrue(telegram.get_json()["handoff_claimed"])
+
+            completed = self.first.post(f"/auth/handoff/{handoff_token}", json={})
+            self.assertEqual(completed.status_code, 200, completed.get_json())
+            self.assertTrue(completed.get_json()["authenticated"])
+            self.assertTrue(self.first.get("/api/session").get_json()["authenticated"])
+        finally:
+            main.BOT_TOKEN = original_token
+
 
 if __name__ == "__main__":
     unittest.main()
