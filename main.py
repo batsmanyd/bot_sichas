@@ -833,6 +833,63 @@ def logout():
     return jsonify(ok=True)
 
 
+@app.delete("/api/account")
+@login_required
+def delete_account():
+    user = current_user()
+    if json_body().get("confirmation") != "УДАЛИТЬ":
+        return jsonify(error="Подтвердите удаление аккаунта"), 400
+
+    user_id = user.id
+    owned_meeting_ids = [row[0] for row in db.session.query(Meeting.id).filter_by(owner_id=user_id).all()]
+    if owned_meeting_ids:
+        owned_place_ids = [row[0] for row in db.session.query(MeetingPlace.id).filter(
+            MeetingPlace.meeting_id.in_(owned_meeting_ids)
+        ).all()]
+        if owned_place_ids:
+            PlaceVote.query.filter(PlaceVote.place_id.in_(owned_place_ids)).delete(synchronize_session=False)
+        PlaceVote.query.filter(PlaceVote.user_id == user_id).delete(synchronize_session=False)
+        MeetingPlace.query.filter(MeetingPlace.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        ChatMessage.query.filter(ChatMessage.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        MeetingFeedback.query.filter(MeetingFeedback.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        MeetingEvent.query.filter(MeetingEvent.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        UserReport.query.filter(UserReport.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        PhotoConsent.query.filter(PhotoConsent.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        MeetingState.query.filter(MeetingState.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        Meeting.query.filter(Meeting.id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+
+    PlaceVote.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    MeetingPlace.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    ChatMessage.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    MeetingFeedback.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    MeetingEvent.query.filter((MeetingEvent.user_id == user_id) | (MeetingEvent.target_user_id == user_id)).delete(
+        synchronize_session=False)
+    UserReport.query.filter((UserReport.reporter_id == user_id) | (UserReport.target_id == user_id)).delete(
+        synchronize_session=False)
+    UserBlock.query.filter((UserBlock.blocker_id == user_id) | (UserBlock.blocked_id == user_id)).delete(
+        synchronize_session=False)
+    PhotoConsent.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    Interest.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    Presence.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    ProfileSelfie.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    UserProfile.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    ActionLog.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    UserModeration.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    InviteAccount.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    Invitation.query.filter_by(inviter_id=user_id).delete(synchronize_session=False)
+    claimed_invites = Invitation.query.filter_by(claimed_by=user_id).all()
+    for invitation in claimed_invites:
+        invitation.claimed_by = None
+        invitation.claimed_at = None
+        invitation.status = "created"
+    AuthHandoff.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    db.session.delete(user)
+    db.session.commit()
+    session.clear()
+    return jsonify(ok=True)
+
+
 @app.get("/api/feed")
 def feed():
     user = current_user()
