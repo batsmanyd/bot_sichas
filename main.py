@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode
 import jwt
 import requests
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
     Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
     create_engine, literal, select,
@@ -49,6 +50,8 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
+device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-device-auth-v1")
+DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
 
 
 engine_options = {"pool_pre_ping": True}
@@ -410,6 +413,24 @@ def upsert_telegram_user(data):
     return user
 
 
+def issue_device_token(user):
+    return device_token_serializer.dumps({"user_id": user.id, "telegram_id": user.telegram_id})
+
+
+def restore_device_session(token):
+    try:
+        payload = device_token_serializer.loads(token, max_age=DEVICE_TOKEN_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    user = db.session.get(User, payload.get("user_id"))
+    if not user or user.telegram_id != str(payload.get("telegram_id") or ""):
+        return None
+    session.clear()
+    session.permanent = True
+    session["user_id"] = user.id
+    return user
+
+
 def verify_mini_app_init_data(init_data):
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = pairs.pop("hash", "")
@@ -481,8 +502,22 @@ def telegram_mini_app():
     user = upsert_telegram_user(user_data)
     start_param = dict(parse_qsl(init_data, keep_blank_values=True)).get("start_param", "")
     claimed = claim_invitation(user, start_param) if start_param.startswith("invite_") else False
-    return jsonify(ok=True, invitation_claimed=claimed,
+    return jsonify(ok=True, invitation_claimed=claimed, device_token=issue_device_token(user),
                    user={"id": user.id, "name": user.name, "username": user.username})
+
+
+@app.post("/auth/device")
+def device_auth():
+    user = restore_device_session(str(json_body().get("device_token") or ""))
+    if not user:
+        return jsonify(error="Сохранённое подтверждение истекло"), 401
+    return jsonify(ok=True, user={"id": user.id, "name": user.name, "username": user.username})
+
+
+@app.get("/auth/device-token")
+@login_required
+def device_token():
+    return jsonify(device_token=issue_device_token(current_user()))
 
 
 @app.post("/auth/test")
