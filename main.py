@@ -271,6 +271,17 @@ class Invitation(db.Model):
     claimed_at = db.Column(db.DateTime(timezone=True))
 
 
+class AuthHandoff(db.Model):
+    __tablename__ = "auth_handoff"
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    completed_at = db.Column(db.DateTime(timezone=True))
+    used_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
@@ -431,6 +442,19 @@ def restore_device_session(token):
     return user
 
 
+def claim_auth_handoff(user, start_param):
+    if not start_param.startswith("login_"):
+        return False
+    token = start_param.removeprefix("login_")[:64]
+    handoff = AuthHandoff.query.filter_by(token=token).first()
+    if not handoff or handoff.used_at or normalize_dt(handoff.expires_at) <= utcnow():
+        return False
+    handoff.user_id = user.id
+    handoff.completed_at = utcnow()
+    db.session.commit()
+    return True
+
+
 def verify_mini_app_init_data(init_data):
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = pairs.pop("hash", "")
@@ -502,8 +526,47 @@ def telegram_mini_app():
     user = upsert_telegram_user(user_data)
     start_param = dict(parse_qsl(init_data, keep_blank_values=True)).get("start_param", "")
     claimed = claim_invitation(user, start_param) if start_param.startswith("invite_") else False
-    return jsonify(ok=True, invitation_claimed=claimed, device_token=issue_device_token(user),
+    handoff_claimed = claim_auth_handoff(user, start_param)
+    return jsonify(ok=True, invitation_claimed=claimed, handoff_claimed=handoff_claimed,
+                   device_token=issue_device_token(user),
                    user={"id": user.id, "name": user.name, "username": user.username})
+
+
+@app.post("/auth/handoff")
+def create_auth_handoff():
+    if not BOT_TOKEN:
+        return jsonify(error="Вход через Telegram временно недоступен"), 503
+    token = secrets.token_urlsafe(24)
+    db.session.add(AuthHandoff(token=token, expires_at=utcnow() + timedelta(minutes=10)))
+    db.session.commit()
+    session.permanent = True
+    session["auth_handoff"] = token
+    return jsonify(
+        handoff_token=token,
+        telegram_url=f"https://t.me/{BOT_USERNAME}?startapp=login_{token}",
+    ), 201
+
+
+@app.post("/auth/handoff/<token>")
+def complete_auth_handoff(token):
+    if not secrets.compare_digest(str(session.get("auth_handoff") or ""), token):
+        return jsonify(error="Это подтверждение создано на другом устройстве"), 403
+    handoff = AuthHandoff.query.filter_by(token=token).first()
+    if not handoff or normalize_dt(handoff.expires_at) <= utcnow():
+        session.pop("auth_handoff", None)
+        return jsonify(error="Время подтверждения истекло"), 410
+    if not handoff.user_id:
+        return jsonify(authenticated=False, status="pending"), 202
+    user = db.session.get(User, handoff.user_id)
+    if not user or handoff.used_at:
+        session.pop("auth_handoff", None)
+        return jsonify(error="Подтверждение уже использовано"), 410
+    handoff.used_at = utcnow()
+    db.session.commit()
+    session.clear()
+    session.permanent = True
+    session["user_id"] = user.id
+    return jsonify(authenticated=True, user={"id": user.id, "name": user.name, "username": user.username})
 
 
 @app.post("/auth/device")
