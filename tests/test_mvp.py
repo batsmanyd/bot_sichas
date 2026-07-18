@@ -67,7 +67,22 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(outgoing[0]["status"], "accepted")
         self.login(self.third, 3)
         self.assertEqual(self.third.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 409)
-        self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 200)
+        first_user = main.User.query.filter_by(telegram_id="test-1").one()
+        second_user = main.User.query.filter_by(telegram_id="test-2").one()
+        first_user.picture = "https://example.test/first.jpg"
+        second_user.picture = "https://example.test/second.jpg"
+        main.db.session.commit()
+        room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
+        self.assertFalse(room["photos_revealed"])
+        self.assertTrue(all(person["picture"] is None for person in room["participants"]))
+        room = self.second.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
+        self.assertTrue(room["my_photo_consent"])
+        self.assertFalse(room["photos_revealed"])
+        room = self.first.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
+        self.assertTrue(room["photos_revealed"])
+        self.assertEqual({person["picture"] for person in room["participants"]}, {
+            "https://example.test/first.jpg", "https://example.test/second.jpg",
+        })
         response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
         self.assertEqual(response.status_code, 201, response.get_json())
         place_id = response.get_json()["room"]["places"][0]["id"]
@@ -79,8 +94,6 @@ class MvpFlowTest(unittest.TestCase):
         room = self.first.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertTrue(room["places"][0]["confirmed"])
         self.assertEqual(room["messages"][0]["text"], "Буду через 10 минут")
-        first_user = main.User.query.filter_by(telegram_id="test-1").one()
-        second_user = main.User.query.filter_by(telegram_id="test-2").one()
         self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "late", "note": "Опоздаю на 5 минут",
         }).status_code, 200)
@@ -132,6 +145,28 @@ class MvpFlowTest(unittest.TestCase):
             self.assertEqual(self.first.post("/api/meetings", json=payload).status_code, 201)
         response = self.first.post("/api/meetings", json=payload)
         self.assertEqual(response.status_code, 429, response.get_json())
+
+    def test_now_and_within_hour_filters(self):
+        self.login(self.first, 11)
+        self.login(self.second, 12)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        now_response = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Сейчас", "format": "one", "time_mode": "now",
+        })
+        hour_response = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Через полчаса", "format": "one", "time_mode": "hour",
+        })
+        self.assertEqual(now_response.status_code, 201, now_response.get_json())
+        self.assertEqual(hour_response.status_code, 201, hour_response.get_json())
+        now_items = self.second.get(
+            "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe&time=now"
+        ).get_json()["items"]
+        hour_items = self.second.get(
+            "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe&time=hour"
+        ).get_json()["items"]
+        self.assertEqual([item["description"] for item in now_items], ["Сейчас"])
+        self.assertEqual([item["description"] for item in hour_items], ["Через полчаса"])
+        self.assertEqual(hour_items[0]["time_mode"], "hour")
 
     def test_invitation_returns_after_first_completed_meeting(self):
         self.login(self.first, 20)

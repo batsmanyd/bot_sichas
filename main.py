@@ -163,6 +163,15 @@ class Interest(db.Model):
     __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_interest_meeting_user"),)
 
 
+class PhotoConsent(db.Model):
+    __tablename__ = "photo_consent"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_photo_consent_meeting_user"),)
+
+
 class MeetingPlace(db.Model):
     __tablename__ = "meeting_place"
     id = db.Column(db.Integer, primary_key=True)
@@ -648,6 +657,7 @@ def feed():
     lon = request.args.get("lon", type=float)
     radius = min(max(request.args.get("radius", 3, type=float), 1), 12)
     category = request.args.get("category", "")
+    time_mode = request.args.get("time", "now")
     now = utcnow()
     result = []
     blocked_ids = set()
@@ -682,6 +692,12 @@ def feed():
         if user:
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
         for meeting in meetings:
+            starts_at = normalize_dt(meeting.starts_at)
+            is_now = starts_at <= now + timedelta(minutes=5)
+            if time_mode == "now" and not is_now:
+                continue
+            if time_mode == "hour" and (is_now or starts_at > now + timedelta(minutes=60)):
+                continue
             if meeting.owner_id in blocked_ids:
                 continue
             if user_hidden(meeting.owner_id):
@@ -698,6 +714,7 @@ def feed():
                 "description": meeting.description, "format": meeting.format, "distance_km": round(distance, 1),
                 "latitude": point[0], "longitude": point[1], "mine": bool(user and meeting.owner_id == user.id),
                 "interested": meeting.id in interested_ids, "expires_at": normalize_dt(meeting.expires_at).isoformat(),
+                "starts_at": starts_at.isoformat(), "time_mode": "now" if is_now else "hour",
             })
     result.sort(key=lambda item: item["distance_km"])
     return jsonify(items=result)
@@ -762,18 +779,23 @@ def create_meeting():
     category = data.get("category")
     description = str(data.get("description", "")).strip()[:180]
     meeting_format = data.get("format", "one")
+    time_mode = data.get("time_mode", "now")
     lat, lon = data.get("latitude", user.latitude), data.get("longitude", user.longitude)
     if category not in VALID_CATEGORIES or not description:
         return jsonify(error="Выберите занятие и цель встречи"), 400
     if meeting_format not in {"one", "group"}:
         return jsonify(error="Некорректный формат встречи"), 400
+    if time_mode not in {"now", "hour"}:
+        return jsonify(error="Некорректное время встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
     if not consume_action(user.id, "meeting", 5, 3600):
         return jsonify(error="Слишком много встреч за час. Попробуйте позже"), 429
+    starts_at = utcnow() if time_mode == "now" else utcnow() + timedelta(minutes=30)
     meeting = Meeting(
         owner_id=user.id, category=category, description=description, format=meeting_format,
-        latitude=float(lat), longitude=float(lon), expires_at=utcnow() + timedelta(minutes=60),
+        latitude=float(lat), longitude=float(lon), starts_at=starts_at,
+        expires_at=starts_at + timedelta(minutes=60),
     )
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(meeting)
@@ -902,6 +924,8 @@ def room_payload(meeting, user):
     events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id).all()
     feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id).order_by(MeetingFeedback.id).all()
     member_ids = accepted_user_ids(meeting)
+    consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
+    photos_revealed = bool(member_ids) and member_ids.issubset(consented_ids)
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active"},
             "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
@@ -912,8 +936,11 @@ def room_payload(meeting, user):
             "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
                         "note": e.note or ""} for e in events],
             "traces": [{"name": db.session.get(User, f.user_id).name, "text": f.trace} for f in feedback],
-            "participants": [{"id": uid, "name": db.session.get(User, uid).name, "mine": uid == user.id}
-                             for uid in member_ids]}
+            "participants": [{"id": uid, "name": db.session.get(User, uid).name, "mine": uid == user.id,
+                              "picture": db.session.get(User, uid).picture if photos_revealed else None,
+                              "photo_consented": uid in consented_ids} for uid in member_ids],
+            "photos_revealed": photos_revealed,
+            "my_photo_consent": user.id in consented_ids}
 
 
 @app.get("/api/meetings/<int:meeting_id>/room")
@@ -921,6 +948,20 @@ def room_payload(meeting, user):
 def get_meeting_room(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     return error or jsonify(room_payload(meeting, current_user()))
+
+
+@app.post("/api/meetings/<int:meeting_id>/photo-consent")
+@login_required
+def consent_to_photo(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    user = current_user()
+    consent = PhotoConsent.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
+    if not consent:
+        db.session.add(PhotoConsent(meeting_id=meeting.id, user_id=user.id))
+        db.session.commit()
+    return jsonify(ok=True, room=room_payload(meeting, user))
 
 
 @app.post("/api/meetings/<int:meeting_id>/places")
