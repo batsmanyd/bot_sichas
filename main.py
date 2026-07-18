@@ -668,6 +668,8 @@ def feed():
     if valid_coordinates(lat, lon):
         presences = Presence.query.filter(Presence.active_until > now).all()
         for presence in presences:
+            if time_mode == "hour":
+                continue
             if user and presence.user_id == user.id:
                 continue
             if presence.user_id in blocked_ids:
