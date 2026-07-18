@@ -164,8 +164,12 @@ class MvpFlowTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["profile"]["city"], "Минск")
+        stored_selfie = main.ProfileSelfie.query.one()
+        self.assertTrue(stored_selfie.image.startswith("enc:"))
+        self.assertNotIn("base64,test", stored_selfie.image)
         self.assertTrue(self.first.get("/api/session").get_json()["profile_completed"])
         profile = self.first.get("/api/profile").get_json()["profile"]
+        self.assertEqual(profile["selfie_preview"], "data:image/jpeg;base64,test")
         self.assertEqual(profile["name"], "Юрий")
         self.assertEqual(profile["age"], 85)
         self.assertEqual(profile["gender"], "male")
