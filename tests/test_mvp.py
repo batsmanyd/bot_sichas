@@ -69,20 +69,30 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.third.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 409)
         first_user = main.User.query.filter_by(telegram_id="test-1").one()
         second_user = main.User.query.filter_by(telegram_id="test-2").one()
-        first_user.picture = "https://example.test/first.jpg"
-        second_user.picture = "https://example.test/second.jpg"
+        main.db.session.add(main.ProfileSelfie(
+            user_id=first_user.id, image="data:image/jpeg;base64,first", visibility="mutual", about="Люблю прогулки и общение с людьми.",
+        ))
+        main.db.session.add(main.ProfileSelfie(
+            user_id=second_user.id, image="data:image/jpeg;base64,second", visibility="mutual", about="Люблю кофе и новые интересные места.",
+        ))
         main.db.session.commit()
         room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertFalse(room["photos_revealed"])
-        self.assertTrue(all(person["picture"] is None for person in room["participants"]))
+        self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
+        self.assertIsNotNone(next(person["picture"] for person in room["participants"] if person["mine"]))
         room = self.second.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["my_photo_consent"])
         self.assertFalse(room["photos_revealed"])
         room = self.first.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["photos_revealed"])
         self.assertEqual({person["picture"] for person in room["participants"]}, {
-            "https://example.test/first.jpg", "https://example.test/second.jpg",
+            "data:image/jpeg;base64,first", "data:image/jpeg;base64,second",
         })
+        first_selfie = main.ProfileSelfie.query.filter_by(user_id=first_user.id).one()
+        first_selfie.visibility = "hidden"
+        main.db.session.commit()
+        room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
+        self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
         response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
         self.assertEqual(response.status_code, 201, response.get_json())
         place_id = response.get_json()["room"]["places"][0]["id"]
@@ -141,21 +151,26 @@ class MvpFlowTest(unittest.TestCase):
         self.login(self.first, 31)
         self.assertFalse(self.first.get("/api/session").get_json()["profile_completed"])
         self.assertEqual(self.first.post("/api/profile", json={
-            "name": "Ю", "age": 17, "gender": "male", "terms_accepted": True,
+            "name": "Ю", "age": 17, "gender": "male", "about": "Я люблю живое общение и прогулки.",
+            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": True,
         }).status_code, 400)
         self.assertEqual(self.first.post("/api/profile", json={
-            "name": "Юрий", "age": 51, "gender": "male", "terms_accepted": False,
+            "name": "Юрий", "age": 51, "gender": "male", "about": "Я люблю живое общение и прогулки.",
+            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": False,
         }).status_code, 400)
         response = self.first.post("/api/profile", json={
-            "name": "Юрий", "age": 51, "gender": "not_say", "terms_accepted": True,
+            "name": "Юрий", "age": 85, "gender": "male", "about": "Я люблю живое общение и прогулки.",
+            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "hidden", "terms_accepted": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["profile"]["city"], "Минск")
         self.assertTrue(self.first.get("/api/session").get_json()["profile_completed"])
         profile = self.first.get("/api/profile").get_json()["profile"]
         self.assertEqual(profile["name"], "Юрий")
-        self.assertEqual(profile["age"], 51)
-        self.assertEqual(profile["gender"], "not_say")
+        self.assertEqual(profile["age"], 85)
+        self.assertEqual(profile["gender"], "male")
+        self.assertTrue(profile["selfie_present"])
+        self.assertEqual(profile["selfie_visibility"], "hidden")
 
     def test_meeting_rate_limit(self):
         self.login(self.first, 10)
