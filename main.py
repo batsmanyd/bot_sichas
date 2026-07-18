@@ -1401,6 +1401,12 @@ def static_files(path):
 
 with app.app_context():
     db.create_all()
+    legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
+    if legacy_selfies:
+        for legacy_selfie in legacy_selfies:
+            legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
+        db.session.commit()
+        app.logger.info("Encrypted %s legacy profile selfies", len(legacy_selfies))
 
 
 if __name__ == "__main__":
