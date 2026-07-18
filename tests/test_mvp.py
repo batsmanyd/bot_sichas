@@ -137,6 +137,26 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/presence", json={"category": "bad", "latitude": 0, "longitude": 0})
         self.assertEqual(response.status_code, 400)
 
+    def test_short_registration_profile(self):
+        self.login(self.first, 31)
+        self.assertFalse(self.first.get("/api/session").get_json()["profile_completed"])
+        self.assertEqual(self.first.post("/api/profile", json={
+            "name": "Ю", "age": 17, "gender": "male", "terms_accepted": True,
+        }).status_code, 400)
+        self.assertEqual(self.first.post("/api/profile", json={
+            "name": "Юрий", "age": 51, "gender": "male", "terms_accepted": False,
+        }).status_code, 400)
+        response = self.first.post("/api/profile", json={
+            "name": "Юрий", "age": 51, "gender": "not_say", "terms_accepted": True,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["profile"]["city"], "Минск")
+        self.assertTrue(self.first.get("/api/session").get_json()["profile_completed"])
+        profile = self.first.get("/api/profile").get_json()["profile"]
+        self.assertEqual(profile["name"], "Юрий")
+        self.assertEqual(profile["age"], 51)
+        self.assertEqual(profile["gender"], "not_say")
+
     def test_meeting_rate_limit(self):
         self.login(self.first, 10)
         point = {"latitude": 53.9023, "longitude": 27.5619}
