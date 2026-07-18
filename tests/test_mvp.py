@@ -36,7 +36,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.second.post("/api/location", json=point_two).status_code, 200)
         response = self.first.post("/api/presence", json={**point_one, "category": "cafe"})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertTrue(self.first.get("/api/presence").get_json()["active"])
+        saved_presence = self.first.get("/api/presence").get_json()
+        self.assertTrue(saved_presence["active"])
+        self.assertEqual(saved_presence["latitude"], point_one["latitude"])
+        self.assertEqual(saved_presence["longitude"], point_one["longitude"])
         response = self.second.get("/api/feed?lat=53.9060&lon=27.5680&radius=3&category=cafe")
         feed = response.get_json()["items"]
         self.assertEqual(response.status_code, 200)
