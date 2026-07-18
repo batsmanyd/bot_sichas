@@ -460,6 +460,7 @@ def api_session():
         authenticated=bool(user),
         telegram_configured=bool(BOT_TOKEN or oidc_configured()),
         mini_app_configured=bool(BOT_TOKEN),
+        oidc_configured=oidc_configured(),
         test_auth_enabled=ALLOW_TEST_AUTH,
         is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
         user={
