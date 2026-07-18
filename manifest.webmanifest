@@ -1,10 +1,15 @@
 {
-  "name": "Сейчас — Минск",
+  "id": "/",
+  "name": "Сейчас — люди рядом",
   "short_name": "Сейчас",
   "description": "Найти компанию рядом прямо сейчас",
-  "start_url": "/",
+  "start_url": "/?source=installed&v=20260718",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#f6faf5",
-  "theme_color": "#198754",
-  "icons": []
+  "theme_color": "#0b2f24",
+  "icons": [
+    {"src": "/app-icon-192.png?v=20260718", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/app-icon-512.png?v=20260718", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
 }
