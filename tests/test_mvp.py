@@ -176,6 +176,24 @@ class MvpFlowTest(unittest.TestCase):
         self.assertTrue(profile["selfie_present"])
         self.assertEqual(profile["selfie_visibility"], "hidden")
 
+    def test_account_deletion_removes_profile_and_session(self):
+        self.login(self.first, 41)
+        response = self.first.post("/api/profile", json={
+            "name": "Юрий", "age": 51, "gender": "male",
+            "about": "Я люблю живое общение и прогулки.",
+            "selfie": "data:image/jpeg;base64,delete-me",
+            "selfie_visibility": "mutual", "terms_accepted": True,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        user_id = main.User.query.filter_by(telegram_id="test-41").one().id
+        self.assertEqual(self.first.delete("/api/account", json={"confirmation": "нет"}).status_code, 400)
+        response = self.first.delete("/api/account", json={"confirmation": "УДАЛИТЬ"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertIsNone(main.db.session.get(main.User, user_id))
+        self.assertEqual(main.UserProfile.query.filter_by(user_id=user_id).count(), 0)
+        self.assertEqual(main.ProfileSelfie.query.filter_by(user_id=user_id).count(), 0)
+        self.assertFalse(self.first.get("/api/session").get_json()["authenticated"])
+
     def test_meeting_rate_limit(self):
         self.login(self.first, 10)
         point = {"latitude": 53.9023, "longitude": 27.5619}
