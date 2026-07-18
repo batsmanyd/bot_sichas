@@ -138,6 +138,17 @@ class UserProfile(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
 
+class ProfileSelfie(db.Model):
+    __tablename__ = "profile_selfie"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    image = db.Column(db.Text, nullable=False)
+    visibility = db.Column(db.String(20), nullable=False, default="mutual")
+    about = db.Column(db.String(160), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
 class Presence(db.Model):
     __tablename__ = "presence"
     id = db.Column(db.Integer, primary_key=True)
@@ -562,6 +573,7 @@ def health():
 def api_session():
     user = current_user()
     profile = UserProfile.query.filter_by(user_id=user.id).first() if user else None
+    selfie = ProfileSelfie.query.filter_by(user_id=user.id).first() if user else None
     return jsonify(
         authenticated=bool(user),
         telegram_configured=bool(BOT_TOKEN or oidc_configured()),
@@ -569,7 +581,7 @@ def api_session():
         oidc_configured=oidc_configured(),
         test_auth_enabled=ALLOW_TEST_AUTH,
         is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
-        profile_completed=bool(profile),
+        profile_completed=bool(profile and selfie),
         user={
             "id": user.id,
             "name": user.name,
@@ -581,11 +593,16 @@ def api_session():
 
 def user_profile_payload(user):
     profile = UserProfile.query.filter_by(user_id=user.id).first()
+    selfie = ProfileSelfie.query.filter_by(user_id=user.id).first()
     return {
-        "completed": bool(profile), "name": user.name, "picture": user.picture,
+        "completed": bool(profile and selfie), "name": user.name,
         "age": profile.age if profile else None,
         "gender": profile.gender if profile else None,
         "city": profile.city if profile else "Минск",
+        "about": selfie.about if selfie else "",
+        "selfie_present": bool(selfie),
+        "selfie_preview": selfie.image if selfie else None,
+        "selfie_visibility": selfie.visibility if selfie else "mutual",
     }
 
 
@@ -605,21 +622,42 @@ def save_profile():
     except (TypeError, ValueError):
         return jsonify(error="Укажите возраст"), 400
     gender = str(data.get("gender", ""))
+    about = str(data.get("about", "")).strip()[:160]
+    selfie_image = str(data.get("selfie", ""))
+    selfie_visibility = str(data.get("selfie_visibility", "mutual"))
     if len(name) < 2:
         return jsonify(error="Укажите имя — не короче двух букв"), 400
-    if not 18 <= age <= 80:
-        return jsonify(error="Приложение доступно пользователям от 18 до 80 лет"), 400
-    if gender not in {"male", "female", "not_say"}:
+    if not 18 <= age <= 100:
+        return jsonify(error="Приложение доступно пользователям от 18 до 100 лет"), 400
+    if gender not in {"male", "female"}:
         return jsonify(error="Выберите вариант в поле «Пол»"), 400
+    if len(about) < 20:
+        return jsonify(error="Напишите одну короткую фразу о себе — минимум 20 символов"), 400
+    if selfie_visibility not in {"mutual", "accepted", "hidden"}:
+        return jsonify(error="Выберите, кому можно показывать селфи"), 400
     if data.get("terms_accepted") is not True:
         return jsonify(error="Подтвердите правила безопасных встреч"), 400
     profile = UserProfile.query.filter_by(user_id=user.id).first()
+    selfie = ProfileSelfie.query.filter_by(user_id=user.id).first()
+    if selfie_image:
+        if not selfie_image.startswith("data:image/jpeg;base64,") or len(selfie_image) > 700_000:
+            return jsonify(error="Не удалось обработать селфи. Сделайте новое фото"), 400
+    elif not selfie:
+        return jsonify(error="Добавьте свежее селфи"), 400
     if not profile:
         profile = UserProfile(user_id=user.id, age=age, gender=gender, city="Минск")
         db.session.add(profile)
     else:
         profile.age, profile.gender = age, gender
         profile.terms_accepted_at = utcnow()
+    if not selfie:
+        selfie = ProfileSelfie(user_id=user.id, image=selfie_image,
+                               visibility=selfie_visibility, about=about)
+        db.session.add(selfie)
+    else:
+        if selfie_image:
+            selfie.image = selfie_image
+        selfie.visibility, selfie.about = selfie_visibility, about
     user.name = name
     db.session.commit()
     return jsonify(ok=True, profile=user_profile_payload(user))
@@ -807,11 +845,15 @@ def feed():
             if distance > radius:
                 continue
             point = safe_point(presence.latitude, presence.longitude, f"p{presence.id}")
+            profile = UserProfile.query.filter_by(user_id=presence.user_id).first()
+            selfie = ProfileSelfie.query.filter_by(user_id=presence.user_id).first()
             result.append({
                 "kind": "person", "id": presence.id, "icon": CATEGORY_ICONS[presence.category],
                 "name": presence.user.name if user else "Участник рядом", "category": presence.category,
                 "description": "Открыт к общению", "distance_km": round(distance, 1),
                 "latitude": point[0], "longitude": point[1], "expires_at": normalize_dt(presence.active_until).isoformat(),
+                "age": profile.age if profile else None, "gender": profile.gender if profile else None,
+                "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
             })
 
         meetings = Meeting.query.filter(Meeting.expires_at > now).all()
@@ -835,6 +877,8 @@ def feed():
             if distance > radius:
                 continue
             point = safe_point(meeting.latitude, meeting.longitude, f"m{meeting.id}")
+            profile = UserProfile.query.filter_by(user_id=meeting.owner_id).first()
+            selfie = ProfileSelfie.query.filter_by(user_id=meeting.owner_id).first()
             result.append({
                 "kind": "meeting", "id": meeting.id, "icon": CATEGORY_ICONS[meeting.category],
                 "name": meeting.owner.name if user else "Открытая встреча", "category": meeting.category,
@@ -842,6 +886,8 @@ def feed():
                 "latitude": point[0], "longitude": point[1], "mine": bool(user and meeting.owner_id == user.id),
                 "interested": meeting.id in interested_ids, "expires_at": normalize_dt(meeting.expires_at).isoformat(),
                 "starts_at": starts_at.isoformat(), "time_mode": "now" if is_now else "hour",
+                "age": profile.age if profile else None, "gender": profile.gender if profile else None,
+                "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
             })
     result.sort(key=lambda item: item["distance_km"])
     return jsonify(items=result)
@@ -970,13 +1016,13 @@ def interest_payload(interest, viewer):
         "status": interest.status,
         "participant": {
             "name": participant.name,
-            # Personal details are revealed only after the meeting owner accepts.
-            "picture": participant.picture if accepted else None,
+            # Selfies are never exposed here; the meeting room applies the owner's visibility choice.
+            "picture": None,
             "username": participant.username if accepted else None,
         },
         "owner": {
             "name": meeting.owner.name,
-            "picture": meeting.owner.picture if accepted else None,
+            "picture": None,
             "username": meeting.owner.username if accepted else None,
         },
         "can_decide": viewer.id == meeting.owner_id and interest.status == "pending",
@@ -1053,6 +1099,20 @@ def room_payload(meeting, user):
     member_ids = accepted_user_ids(meeting)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
     photos_revealed = bool(member_ids) and member_ids.issubset(consented_ids)
+    participant_payload = []
+    for uid in member_ids:
+        participant = db.session.get(User, uid)
+        selfie = ProfileSelfie.query.filter_by(user_id=uid).first()
+        visibility = selfie.visibility if selfie else "hidden"
+        photo_visible = bool(selfie and (
+            uid == user.id or visibility == "accepted" or (visibility == "mutual" and photos_revealed)
+        ))
+        participant_payload.append({
+            "id": uid, "name": participant.name, "mine": uid == user.id,
+            "picture": selfie.image if photo_visible else None,
+            "photo_visible": photo_visible, "photo_visibility": visibility,
+            "photo_consented": uid in consented_ids,
+        })
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active"},
             "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
@@ -1063,11 +1123,10 @@ def room_payload(meeting, user):
             "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
                         "note": e.note or ""} for e in events],
             "traces": [{"name": db.session.get(User, f.user_id).name, "text": f.trace} for f in feedback],
-            "participants": [{"id": uid, "name": db.session.get(User, uid).name, "mine": uid == user.id,
-                              "picture": db.session.get(User, uid).picture if photos_revealed else None,
-                              "photo_consented": uid in consented_ids} for uid in member_ids],
+            "participants": participant_payload,
             "photos_revealed": photos_revealed,
-            "my_photo_consent": user.id in consented_ids}
+            "my_photo_consent": user.id in consented_ids,
+            "mutual_photo_used": any(p["photo_visibility"] == "mutual" for p in participant_payload)}
 
 
 @app.get("/api/meetings/<int:meeting_id>/room")
