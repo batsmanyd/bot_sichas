@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode
 
 import jwt
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
@@ -44,6 +45,9 @@ if not secret_seed:
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = hashlib.sha256(f"{secret_seed}|seichas-session".encode()).hexdigest()
+selfie_cipher = Fernet(base64.urlsafe_b64encode(
+    hashlib.sha256(f"{app.secret_key}|selfie-storage-v1".encode()).digest()
+))
 app.config.update(
     SESSION_COOKIE_SECURE=PUBLIC_URL.startswith("https://") and not app.testing,
     SESSION_COOKIE_HTTPONLY=True,
@@ -110,6 +114,22 @@ def close_database_session(_exception=None):
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+def encrypt_selfie(value):
+    return "enc:" + selfie_cipher.encrypt(value.encode()).decode()
+
+
+def decrypt_selfie(value):
+    if not value:
+        return None
+    if not value.startswith("enc:"):
+        return value  # Existing records are migrated when the profile is next saved.
+    try:
+        return selfie_cipher.decrypt(value[4:].encode()).decode()
+    except InvalidToken:
+        app.logger.error("Stored selfie could not be decrypted")
+        return None
 
 
 class User(db.Model):
@@ -601,7 +621,7 @@ def user_profile_payload(user):
         "city": profile.city if profile else "Минск",
         "about": selfie.about if selfie else "",
         "selfie_present": bool(selfie),
-        "selfie_preview": selfie.image if selfie else None,
+        "selfie_preview": decrypt_selfie(selfie.image) if selfie else None,
         "selfie_visibility": selfie.visibility if selfie else "mutual",
     }
 
@@ -651,12 +671,12 @@ def save_profile():
         profile.age, profile.gender = age, gender
         profile.terms_accepted_at = utcnow()
     if not selfie:
-        selfie = ProfileSelfie(user_id=user.id, image=selfie_image,
+        selfie = ProfileSelfie(user_id=user.id, image=encrypt_selfie(selfie_image),
                                visibility=selfie_visibility, about=about)
         db.session.add(selfie)
     else:
         if selfie_image:
-            selfie.image = selfie_image
+            selfie.image = encrypt_selfie(selfie_image)
         selfie.visibility, selfie.about = selfie_visibility, about
     user.name = name
     db.session.commit()
@@ -1109,7 +1129,7 @@ def room_payload(meeting, user):
         ))
         participant_payload.append({
             "id": uid, "name": participant.name, "mine": uid == user.id,
-            "picture": selfie.image if photo_visible else None,
+            "picture": decrypt_selfie(selfie.image) if photo_visible else None,
             "photo_visible": photo_visible, "photo_visibility": visibility,
             "photo_consented": uid in consented_ids,
         })
