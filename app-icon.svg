@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <mask id="c-pin">
+      <rect width="1024" height="1024" fill="black"/>
+      <path fill="white" d="M512 118c-214 0-370 151-370 355 0 221 201 385 370 521 169-136 370-300 370-521 0-204-156-355-370-355Z"/>
+      <circle cx="512" cy="462" r="194" fill="black"/>
+      <path d="M512 330 930 238v458L512 594Z" fill="black"/>
+    </mask>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="#0b3b2c"/>
+  <g>
+    <rect x="92" y="62" width="840" height="900" fill="white" mask="url(#c-pin)"/>
+    <circle cx="512" cy="462" r="82" fill="#7fe0ae"/>
+  </g>
+</svg>
