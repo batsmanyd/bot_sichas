@@ -22,7 +22,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://web-production-4d1a9.up.railway.app").rstrip("/")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
@@ -122,6 +122,18 @@ class User(db.Model):
     picture = db.Column(db.Text)
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class UserProfile(db.Model):
+    __tablename__ = "user_profile"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    age = db.Column(db.Integer, nullable=False)
+    gender = db.Column(db.String(20), nullable=False)
+    city = db.Column(db.String(80), nullable=False, default="Минск")
+    terms_accepted_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -413,6 +425,45 @@ def notify_user(user_id, text):
         app.logger.warning("Telegram notification failed for user %s", user_id)
 
 
+TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(f"{app.secret_key}|telegram-webhook".encode()).hexdigest()[:48]
+telegram_bot_configured = False
+
+
+def telegram_api(method, payload):
+    if not BOT_TOKEN:
+        return None
+    response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=5)
+    response.raise_for_status()
+    return response.json()
+
+
+def configure_telegram_bot():
+    global telegram_bot_configured
+    if telegram_bot_configured or not BOT_TOKEN or app.testing:
+        return
+    telegram_bot_configured = True
+    try:
+        telegram_api("setWebhook", {
+            "url": f"{PUBLIC_URL}/telegram/webhook",
+            "secret_token": TELEGRAM_WEBHOOK_SECRET,
+            "allowed_updates": ["message"],
+        })
+        telegram_api("setMyCommands", {"commands": [
+            {"command": "start", "description": "Открыть приложение «Сейчас»"},
+        ]})
+        telegram_api("setChatMenuButton", {"menu_button": {
+            "type": "web_app", "text": "Открыть «Сейчас»", "web_app": {"url": PUBLIC_URL},
+        }})
+    except requests.RequestException:
+        telegram_bot_configured = False
+        app.logger.exception("Telegram bot setup failed")
+
+
+@app.before_request
+def ensure_telegram_bot_configured():
+    configure_telegram_bot()
+
+
 def upsert_telegram_user(data):
     telegram_id = str(data.get("id") or "").strip()
     if not telegram_id:
@@ -504,12 +555,13 @@ def security_headers(response):
 @app.get("/health")
 def health():
     db.session.execute(db.select(db.literal(1)))
-    return jsonify(ok=True)
+    return jsonify(ok=True, telegram_bot_configured=telegram_bot_configured)
 
 
 @app.get("/api/session")
 def api_session():
     user = current_user()
+    profile = UserProfile.query.filter_by(user_id=user.id).first() if user else None
     return jsonify(
         authenticated=bool(user),
         telegram_configured=bool(BOT_TOKEN or oidc_configured()),
@@ -517,6 +569,7 @@ def api_session():
         oidc_configured=oidc_configured(),
         test_auth_enabled=ALLOW_TEST_AUTH,
         is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
+        profile_completed=bool(profile),
         user={
             "id": user.id,
             "name": user.name,
@@ -524,6 +577,78 @@ def api_session():
             "picture": user.picture,
         } if user else None,
     )
+
+
+def user_profile_payload(user):
+    profile = UserProfile.query.filter_by(user_id=user.id).first()
+    return {
+        "completed": bool(profile), "name": user.name, "picture": user.picture,
+        "age": profile.age if profile else None,
+        "gender": profile.gender if profile else None,
+        "city": profile.city if profile else "Минск",
+    }
+
+
+@app.get("/api/profile")
+@login_required
+def get_profile():
+    return jsonify(profile=user_profile_payload(current_user()))
+
+
+@app.post("/api/profile")
+@login_required
+def save_profile():
+    user, data = current_user(), json_body()
+    name = str(data.get("name", "")).strip()[:40]
+    try:
+        age = int(data.get("age"))
+    except (TypeError, ValueError):
+        return jsonify(error="Укажите возраст"), 400
+    gender = str(data.get("gender", ""))
+    if len(name) < 2:
+        return jsonify(error="Укажите имя — не короче двух букв"), 400
+    if not 18 <= age <= 80:
+        return jsonify(error="Приложение доступно пользователям от 18 до 80 лет"), 400
+    if gender not in {"male", "female", "not_say"}:
+        return jsonify(error="Выберите вариант в поле «Пол»"), 400
+    if data.get("terms_accepted") is not True:
+        return jsonify(error="Подтвердите правила безопасных встреч"), 400
+    profile = UserProfile.query.filter_by(user_id=user.id).first()
+    if not profile:
+        profile = UserProfile(user_id=user.id, age=age, gender=gender, city="Минск")
+        db.session.add(profile)
+    else:
+        profile.age, profile.gender = age, gender
+        profile.terms_accepted_at = utcnow()
+    user.name = name
+    db.session.commit()
+    return jsonify(ok=True, profile=user_profile_payload(user))
+
+
+@app.post("/telegram/webhook")
+def telegram_webhook():
+    if not BOT_TOKEN or not secrets.compare_digest(
+            request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), TELEGRAM_WEBHOOK_SECRET):
+        return jsonify(error="Недоступно"), 403
+    message = json_body().get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    if chat_id:
+        try:
+            telegram_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Бот теперь используется только для безопасного входа и уведомлений приложения «Сейчас».",
+                "reply_markup": {"remove_keyboard": True},
+            })
+            telegram_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Нажмите кнопку ниже, чтобы открыть приложение.",
+                "reply_markup": {"inline_keyboard": [[{
+                    "text": "Открыть «Сейчас»", "web_app": {"url": PUBLIC_URL},
+                }]]},
+            })
+        except requests.RequestException:
+            app.logger.exception("Telegram webhook reply failed")
+    return jsonify(ok=True)
 
 
 @app.post("/auth/telegram-mini-app")
