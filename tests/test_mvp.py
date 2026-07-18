@@ -150,6 +150,27 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/presence", json={"category": "bad", "latitude": 0, "longitude": 0})
         self.assertEqual(response.status_code, 400)
 
+    def test_anonymous_media_traffic_is_hashed_and_deduplicated(self):
+        payload = {
+            "visitor_id": "browser-visitor-123",
+            "source": "onliner",
+            "medium": "editorial",
+            "campaign": "public_beta",
+            "landing_path": "/",
+        }
+        first = self.first.post("/api/traffic", json=payload)
+        second = self.first.post("/api/traffic", json=payload)
+        self.assertEqual(first.status_code, 200, first.get_json())
+        self.assertTrue(first.get_json()["counted"])
+        self.assertFalse(second.get_json()["counted"])
+        visit = main.TrafficVisit.query.one()
+        self.assertEqual(visit.source, "onliner")
+        self.assertEqual(len(visit.visitor_hash), 64)
+        self.assertNotIn(payload["visitor_id"], visit.visitor_hash)
+        self.assertEqual(self.first.get("/api/admin/traffic").status_code, 401)
+        self.login(self.first, 8)
+        self.assertEqual(self.first.get("/api/admin/traffic").status_code, 403)
+
     def test_short_registration_profile(self):
         self.login(self.first, 31)
         self.assertFalse(self.first.get("/api/session").get_json()["profile_completed"])
