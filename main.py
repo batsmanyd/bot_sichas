@@ -1018,7 +1018,9 @@ def get_presence():
     presence = Presence.query.filter_by(user_id=current_user().id).first()
     active = bool(presence and normalize_dt(presence.active_until) > utcnow())
     return jsonify(active=active, category=presence.category if active else None,
-                   active_until=normalize_dt(presence.active_until).isoformat() if active else None)
+                   active_until=normalize_dt(presence.active_until).isoformat() if active else None,
+                   latitude=presence.latitude if active else None,
+                   longitude=presence.longitude if active else None)
 
 
 @app.post("/api/meetings")
