@@ -1074,6 +1074,13 @@ def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
+@app.get("/sichas-apple-icon-v2.png")
+def ios_app_icon():
+    response = send_from_directory(BASE_DIR, "apple-touch-icon.png")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
+
+
 @app.get("/<path:path>")
 def static_files(path):
     full_path = os.path.join(BASE_DIR, path)
