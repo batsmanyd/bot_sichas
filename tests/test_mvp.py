@@ -233,6 +233,12 @@ class MvpFlowTest(unittest.TestCase):
         finally:
             main.BOT_TOKEN = original_token
 
+    def test_frontend_processes_handoff_even_when_telegram_session_already_exists(self):
+        with open("index.html", encoding="utf-8") as source:
+            frontend = source.read()
+        self.assertIn("const mustPassHandoff=startParam.startsWith('login_')", frontend)
+        self.assertIn("if(tg?.initData&&(!data.authenticated||mustPassHandoff))", frontend)
+
 
 if __name__ == "__main__":
     unittest.main()
