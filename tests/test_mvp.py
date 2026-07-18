@@ -150,6 +150,38 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/presence", json={"category": "bad", "latitude": 0, "longitude": 0})
         self.assertEqual(response.status_code, 400)
 
+    def test_open_person_can_receive_proposal_and_participant_can_leave(self):
+        self.login(self.first, 61)
+        self.login(self.second, 62)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        opened = self.first.post("/api/presence", json={**point, "category": "cafe"})
+        self.assertEqual(opened.status_code, 200, opened.get_json())
+        presence_id = main.Presence.query.filter_by(
+            user_id=main.User.query.filter_by(telegram_id="test-61").one().id
+        ).one().id
+        proposed = self.second.post(f"/api/presences/{presence_id}/interest", json={})
+        self.assertEqual(proposed.status_code, 201, proposed.get_json())
+        meeting_id = proposed.get_json()["meeting_id"]
+        duplicate = self.second.post(f"/api/presences/{presence_id}/interest", json={})
+        self.assertEqual(duplicate.status_code, 200, duplicate.get_json())
+        self.assertTrue(duplicate.get_json()["already_sent"])
+        self.assertEqual(main.Meeting.query.count(), 1)
+        incoming = self.first.get("/api/interests").get_json()["incoming"]
+        self.assertEqual(len(incoming), 1)
+        self.assertIsNone(incoming[0]["participant"]["username"])
+        accepted = self.first.post(
+            f"/api/interests/{incoming[0]['id']}/decision", json={"decision": "accepted"}
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.get_json())
+        self.assertIsNone(accepted.get_json()["interest"]["participant"]["username"])
+        self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 200)
+        left = self.second.post(
+            f"/api/meetings/{meeting_id}/lifecycle", json={"action": "leave"}
+        )
+        self.assertEqual(left.status_code, 200, left.get_json())
+        self.assertTrue(left.get_json()["left"])
+        self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 403)
+
     def test_anonymous_media_traffic_is_hashed_and_deduplicated(self):
         payload = {
             "visitor_id": "browser-visitor-123",
@@ -227,6 +259,31 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/meetings", json=payload)
         self.assertEqual(response.status_code, 429, response.get_json())
 
+    def test_group_meeting_has_six_people_total(self):
+        self.login(self.first, 70)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        created = self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Групповая прогулка", "format": "group",
+        })
+        meeting_id = created.get_json()["id"]
+        participants = []
+        for number in range(71, 77):
+            client = main.app.test_client()
+            self.login(client, number)
+            self.assertEqual(client.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 200)
+            participants.append(client)
+        incoming = self.first.get("/api/interests").get_json()["incoming"]
+        for item in incoming[:5]:
+            accepted = self.first.post(
+                f"/api/interests/{item['id']}/decision", json={"decision": "accepted"}
+            )
+            self.assertEqual(accepted.status_code, 200, accepted.get_json())
+        rejected = self.first.post(
+            f"/api/interests/{incoming[5]['id']}/decision", json={"decision": "accepted"}
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.get_json())
+        self.assertEqual(main.Interest.query.filter_by(meeting_id=meeting_id, status="accepted").count(), 5)
+
     def test_now_and_within_hour_filters(self):
         self.login(self.first, 11)
         self.login(self.second, 12)
@@ -235,7 +292,8 @@ class MvpFlowTest(unittest.TestCase):
             **point, "category": "cafe", "description": "Сейчас", "format": "one", "time_mode": "now",
         })
         hour_response = self.first.post("/api/meetings", json={
-            **point, "category": "cafe", "description": "Через полчаса", "format": "one", "time_mode": "hour",
+            **point, "category": "cafe", "description": "Через 45 минут", "format": "one",
+            "time_mode": "hour", "starts_in_minutes": 45,
         })
         self.assertEqual(now_response.status_code, 201, now_response.get_json())
         self.assertEqual(hour_response.status_code, 201, hour_response.get_json())
@@ -246,8 +304,14 @@ class MvpFlowTest(unittest.TestCase):
             "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe&time=hour"
         ).get_json()["items"]
         self.assertEqual([item["description"] for item in now_items], ["Сейчас"])
-        self.assertEqual([item["description"] for item in hour_items], ["Через полчаса"])
+        self.assertEqual([item["description"] for item in hour_items], ["Через 45 минут"])
         self.assertEqual(hour_items[0]["time_mode"], "hour")
+        self.assertGreaterEqual(hour_items[0]["starts_in_minutes"], 44)
+        invalid = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Некорректное время", "format": "one",
+            "time_mode": "hour", "starts_in_minutes": 25,
+        })
+        self.assertEqual(invalid.status_code, 400)
 
     def test_invitation_returns_after_first_completed_meeting(self):
         self.login(self.first, 20)
@@ -354,6 +418,11 @@ class MvpFlowTest(unittest.TestCase):
             frontend = source.read()
         self.assertIn("const mustPassHandoff=startParam.startsWith('login_')", frontend)
         self.assertIn("if(tg?.initData&&(!data.authenticated||mustPassHandoff))", frontend)
+        self.assertIn("data-presence", frontend)
+        self.assertIn("reportParticipant", frontend)
+        self.assertIn("setInterval(refreshLiveData,15000)", frontend)
+        with open("main.py", encoding="utf-8") as source:
+            self.assertNotIn('"scope": "openid profile phone"', source.read())
 
 
 if __name__ == "__main__":
