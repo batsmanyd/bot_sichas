@@ -297,6 +297,17 @@ class ActionLog(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
 
 
+class TrafficVisit(db.Model):
+    __tablename__ = "traffic_visit"
+    id = db.Column(db.Integer, primary_key=True)
+    visitor_hash = db.Column(db.String(64), nullable=False, index=True)
+    source = db.Column(db.String(60), nullable=False, default="direct", index=True)
+    medium = db.Column(db.String(40), nullable=False, default="none")
+    campaign = db.Column(db.String(80), nullable=False, default="public_beta", index=True)
+    landing_path = db.Column(db.String(120), nullable=False, default="/")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+
 class UserModeration(db.Model):
     __tablename__ = "user_moderation"
     id = db.Column(db.Integer, primary_key=True)
@@ -365,6 +376,12 @@ def login_required(view):
 
 def json_body():
     return request.get_json(silent=True) or {}
+
+
+def clean_tracking_value(value, fallback, max_length):
+    value = str(value or "").strip().lower()
+    cleaned = "".join(char for char in value if char.isalnum() or char in "._-")
+    return (cleaned or fallback)[:max_length]
 
 
 def consume_action(user_id, action, limit, window_seconds):
@@ -609,6 +626,40 @@ def api_session():
             "picture": user.picture,
         } if user else None,
     )
+
+
+@app.post("/api/traffic")
+def track_traffic_visit():
+    data = json_body()
+    visitor_id = str(data.get("visitor_id") or "").strip()
+    if not 8 <= len(visitor_id) <= 100:
+        return jsonify(error="Некорректный идентификатор визита"), 400
+    source = clean_tracking_value(data.get("source"), "direct", 60)
+    medium = clean_tracking_value(data.get("medium"), "none", 40)
+    campaign = clean_tracking_value(data.get("campaign"), "public_beta", 80)
+    landing_path = str(data.get("landing_path") or "/").strip()[:120]
+    if not landing_path.startswith("/"):
+        landing_path = "/"
+    visitor_hash = hashlib.sha256(
+        f"{app.secret_key}|traffic-v1|{visitor_id}".encode()
+    ).hexdigest()
+    since = utcnow() - timedelta(hours=24)
+    existing = TrafficVisit.query.filter(
+        TrafficVisit.visitor_hash == visitor_hash,
+        TrafficVisit.source == source,
+        TrafficVisit.campaign == campaign,
+        TrafficVisit.created_at >= since,
+    ).first()
+    if not existing:
+        db.session.add(TrafficVisit(
+            visitor_hash=visitor_hash,
+            source=source,
+            medium=medium,
+            campaign=campaign,
+            landing_path=landing_path,
+        ))
+        db.session.commit()
+    return jsonify(ok=True, counted=not bool(existing))
 
 
 def user_profile_payload(user):
@@ -1408,6 +1459,37 @@ def admin_reports():
                            "target": db.session.get(User, item.target_id).name,
                            "reason": item.reason,
                            "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
+
+
+@app.get("/api/admin/traffic")
+@login_required
+def admin_traffic():
+    user = current_user()
+    if user.telegram_id not in ADMIN_TELEGRAM_IDS:
+        return jsonify(error="Нет доступа"), 403
+    try:
+        days = min(max(int(request.args.get("days", 30)), 1), 90)
+    except ValueError:
+        days = 30
+    visits = TrafficVisit.query.filter(
+        TrafficVisit.created_at >= utcnow() - timedelta(days=days)
+    ).order_by(TrafficVisit.id.desc()).all()
+    grouped = {}
+    for visit in visits:
+        key = (visit.source, visit.medium, visit.campaign)
+        item = grouped.setdefault(key, {
+            "source": visit.source,
+            "medium": visit.medium,
+            "campaign": visit.campaign,
+            "visits": 0,
+            "unique_visitors": set(),
+        })
+        item["visits"] += 1
+        item["unique_visitors"].add(visit.visitor_hash)
+    items = [{**item, "unique_visitors": len(item["unique_visitors"])} for item in grouped.values()]
+    items.sort(key=lambda item: (-item["visits"], item["source"]))
+    return jsonify(days=days, total_visits=len(visits),
+                   unique_visitors=len({visit.visitor_hash for visit in visits}), items=items)
 
 
 @app.get("/api/invitations")
