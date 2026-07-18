@@ -350,6 +350,12 @@ CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
     "shop": "🛍", "help": "🤝", "leisure": "🎬",
 }
+CATEGORY_MEETING_TITLES = {
+    "cafe": "Выпить кофе или чай", "walk": "Прогуляться вместе",
+    "talk": "Поговорить", "active": "Заняться активностью",
+    "shop": "Сходить за покупками", "help": "Помочь друг другу",
+    "leisure": "Провести досуг вместе",
+}
 
 
 def normalize_dt(value):
@@ -523,7 +529,8 @@ def upsert_telegram_user(data):
     full_name = " ".join(filter(None, [data.get("first_name"), data.get("last_name")])).strip()
     user.name = (data.get("name") or full_name or user.name or "Участник")[:80]
     user.username = (data.get("username") or "")[:80] or None
-    user.phone_number = (data.get("phone_number") or "")[:40] or user.phone_number
+    # The app does not request or retain a phone number; Telegram is used only to confirm identity.
+    user.phone_number = None
     user.picture = data.get("photo_url") or data.get("picture") or user.picture
     db.session.commit()
     session.clear()
@@ -845,7 +852,7 @@ def telegram_start():
     session.update(oidc_state=state, oidc_nonce=nonce, oidc_verifier=verifier)
     params = {
         "client_id": CLIENT_ID, "redirect_uri": CALLBACK_URL, "response_type": "code",
-        "scope": "openid profile phone", "state": state, "nonce": nonce,
+        "scope": "openid profile", "state": state, "nonce": nonce,
         "code_challenge": base64url_sha256(verifier), "code_challenge_method": "S256",
     }
     return redirect(f"https://oauth.telegram.org/auth?{urlencode(params)}")
@@ -955,6 +962,15 @@ def feed():
     if user:
         blocked_ids = {b.blocked_id for b in UserBlock.query.filter_by(blocker_id=user.id).all()}
         blocked_ids |= {b.blocker_id for b in UserBlock.query.filter_by(blocked_id=user.id).all()}
+    proposed_owner_ids = set()
+    if user:
+        proposed_owner_ids = {
+            meeting.owner_id
+            for interest in Interest.query.filter_by(user_id=user.id).all()
+            if (meeting := db.session.get(Meeting, interest.meeting_id))
+            and meeting.description.startswith("Предложение встретиться · ")
+            and normalize_dt(meeting.expires_at) > now
+        }
 
     if valid_coordinates(lat, lon):
         presences = Presence.query.filter(Presence.active_until > now).all()
@@ -982,6 +998,7 @@ def feed():
                 "latitude": point[0], "longitude": point[1], "expires_at": normalize_dt(presence.active_until).isoformat(),
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
+                "interested": presence.user_id in proposed_owner_ids,
             })
 
         meetings = Meeting.query.filter(Meeting.expires_at > now).all()
@@ -1014,6 +1031,7 @@ def feed():
                 "latitude": point[0], "longitude": point[1], "mine": bool(user and meeting.owner_id == user.id),
                 "interested": meeting.id in interested_ids, "expires_at": normalize_dt(meeting.expires_at).isoformat(),
                 "starts_at": starts_at.isoformat(), "time_mode": "now" if is_now else "hour",
+                "starts_in_minutes": max(0, round((starts_at - now).total_seconds() / 60)),
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
             })
@@ -1083,6 +1101,10 @@ def create_meeting():
     description = str(data.get("description", "")).strip()[:180]
     meeting_format = data.get("format", "one")
     time_mode = data.get("time_mode", "now")
+    try:
+        starts_in_minutes = int(data.get("starts_in_minutes", 0 if time_mode == "now" else 30))
+    except (TypeError, ValueError):
+        return jsonify(error="Некорректное время встречи"), 400
     lat, lon = data.get("latitude", user.latitude), data.get("longitude", user.longitude)
     if category not in VALID_CATEGORIES or not description:
         return jsonify(error="Выберите занятие и цель встречи"), 400
@@ -1090,11 +1112,17 @@ def create_meeting():
         return jsonify(error="Некорректный формат встречи"), 400
     if time_mode not in {"now", "hour"}:
         return jsonify(error="Некорректное время встречи"), 400
+    if starts_in_minutes not in {0, 15, 30, 45, 60}:
+        return jsonify(error="Выберите время от 15 минут до часа"), 400
+    if time_mode == "now" and starts_in_minutes != 0:
+        return jsonify(error="Для встречи прямо сейчас время должно быть нулевым"), 400
+    if time_mode == "hour" and starts_in_minutes == 0:
+        return jsonify(error="Выберите время встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
     if not consume_action(user.id, "meeting", 5, 3600):
         return jsonify(error="Слишком много встреч за час. Попробуйте позже"), 429
-    starts_at = utcnow() if time_mode == "now" else utcnow() + timedelta(minutes=30)
+    starts_at = utcnow() + timedelta(minutes=starts_in_minutes)
     meeting = Meeting(
         owner_id=user.id, category=category, description=description, format=meeting_format,
         latitude=float(lat), longitude=float(lon), starts_at=starts_at,
@@ -1104,6 +1132,42 @@ def create_meeting():
     db.session.add(meeting)
     db.session.commit()
     return jsonify(ok=True, id=meeting.id), 201
+
+
+@app.post("/api/presences/<int:presence_id>/interest")
+@login_required
+def propose_meeting_to_presence(presence_id):
+    user = current_user()
+    presence = db.get_or_404(Presence, presence_id)
+    if normalize_dt(presence.active_until) <= utcnow():
+        return jsonify(error="Этот человек уже не открыт для встречи"), 409
+    if presence.user_id == user.id:
+        return jsonify(error="Это ваш статус"), 400
+    if (UserBlock.query.filter_by(blocker_id=user.id, blocked_id=presence.user_id).first() or
+            UserBlock.query.filter_by(blocker_id=presence.user_id, blocked_id=user.id).first()):
+        return jsonify(error="Предложение этому человеку недоступно"), 403
+    if not consume_action(user.id, "interest", 12, 3600):
+        return jsonify(error="Слишком много откликов за час. Попробуйте позже"), 429
+    description = f"Предложение встретиться · {CATEGORY_MEETING_TITLES[presence.category]}"
+    existing = (Interest.query.join(Meeting, Interest.meeting_id == Meeting.id)
+                .filter(Interest.user_id == user.id,
+                        Meeting.owner_id == presence.user_id,
+                        Meeting.description == description,
+                        Meeting.expires_at > utcnow()).first())
+    if existing:
+        return jsonify(ok=True, meeting_id=existing.meeting_id, already_sent=True)
+    meeting = Meeting(
+        owner_id=presence.user_id, category=presence.category, description=description,
+        format="one", latitude=presence.latitude, longitude=presence.longitude,
+        starts_at=utcnow(), expires_at=min(normalize_dt(presence.active_until), utcnow() + timedelta(minutes=60)),
+    )
+    db.session.add(meeting)
+    db.session.flush()
+    db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+    db.session.commit()
+    notify_user(presence.user_id,
+                f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}")
+    return jsonify(ok=True, meeting_id=meeting.id, already_sent=False), 201
 
 
 @app.post("/api/meetings/<int:meeting_id>/interest")
@@ -1123,7 +1187,7 @@ def express_interest(meeting_id):
     accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
     if meeting.format == "one" and accepted_count:
         return jsonify(error="У этой встречи уже есть подтверждённый участник"), 409
-    if meeting.format == "group" and accepted_count >= 6:
+    if meeting.format == "group" and accepted_count >= 5:
         return jsonify(error="Группа уже набрана"), 409
     interest = Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not interest:
@@ -1148,12 +1212,12 @@ def interest_payload(interest, viewer):
             "name": participant.name,
             # Selfies are never exposed here; the meeting room applies the owner's visibility choice.
             "picture": None,
-            "username": participant.username if accepted else None,
+            "username": None,
         },
         "owner": {
             "name": meeting.owner.name,
             "picture": None,
-            "username": meeting.owner.username if accepted else None,
+            "username": None,
         },
         "can_decide": viewer.id == meeting.owner_id and interest.status == "pending",
     }
@@ -1192,9 +1256,9 @@ def decide_interest(interest_id):
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
     if decision == "accepted" and meeting.format == "group":
         accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
-        if accepted_count > 6:
+        if accepted_count > 5:
             db.session.rollback()
-            return jsonify(error="В группе может быть не больше 6 участников"), 409
+            return jsonify(error="В группе может быть не больше 6 человек вместе с создателем"), 409
     db.session.commit()
     result_text = "принят" if decision == "accepted" else "отклонён"
     notify_user(interest.user_id, f"Ваш отклик на встречу «{meeting.description}» {result_text}")
@@ -1359,7 +1423,7 @@ def meeting_lifecycle(meeting_id):
         return error
     user, data = current_user(), json_body()
     action = data.get("action")
-    if action not in {"late", "cancel", "complete", "no_show"}:
+    if action not in {"late", "cancel", "complete", "no_show", "leave"}:
         return jsonify(error="Неизвестное действие"), 400
     state = state_for(meeting)
     if state.status != "active":
@@ -1367,6 +1431,20 @@ def meeting_lifecycle(meeting_id):
     target_id = data.get("target_user_id")
     if action in {"cancel", "complete"} and meeting.owner_id != user.id:
         return jsonify(error="Это действие доступно создателю встречи"), 403
+    if action == "leave":
+        if meeting.owner_id == user.id:
+            return jsonify(error="Создатель может отменить встречу"), 400
+        interest = Interest.query.filter_by(
+            meeting_id=meeting.id, user_id=user.id, status="accepted"
+        ).first()
+        if not interest:
+            return jsonify(error="Вы уже не участвуете в этой встрече"), 409
+        interest.status = "rejected"
+        db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
+                                    kind="leave", note="Участник отказался от встречи"))
+        db.session.commit()
+        notify_user(meeting.owner_id, f"{user.name} отказался от встречи «{meeting.description}»")
+        return jsonify(ok=True, left=True)
     if action == "no_show":
         try:
             target_id = int(target_id)
@@ -1542,12 +1620,16 @@ def static_files(path):
 
 with app.app_context():
     db.create_all()
+    cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
+        {"phone_number": None}, synchronize_session=False
+    )
     legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
-    if legacy_selfies:
+    if legacy_selfies or cleared_phones:
         for legacy_selfie in legacy_selfies:
             legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
         db.session.commit()
-        app.logger.info("Encrypted %s legacy profile selfies", len(legacy_selfies))
+        app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
+                        len(legacy_selfies), cleared_phones)
 
 
 if __name__ == "__main__":
