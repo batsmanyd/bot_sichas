@@ -182,6 +182,25 @@ class MvpFlowTest(unittest.TestCase):
         finally:
             main.BOT_TOKEN = original_token
 
+    def test_device_token_restores_session_without_telegram_confirmation(self):
+        self.login(self.first, 91)
+        token_response = self.first.get("/auth/device-token")
+        self.assertEqual(token_response.status_code, 200, token_response.get_json())
+        token = token_response.get_json()["device_token"]
+        self.assertEqual(self.first.post("/auth/logout").status_code, 200)
+        self.assertFalse(self.first.get("/api/session").get_json()["authenticated"])
+
+        restore = self.first.post("/auth/device", json={"device_token": token})
+        self.assertEqual(restore.status_code, 200, restore.get_json())
+        session_data = self.first.get("/api/session").get_json()
+        self.assertTrue(session_data["authenticated"])
+        self.assertEqual(session_data["user"]["name"], "Тест 91")
+
+        self.assertEqual(
+            self.second.post("/auth/device", json={"device_token": token + "broken"}).status_code,
+            401,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
