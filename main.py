@@ -1037,6 +1037,7 @@ def feed():
             selfie = ProfileSelfie.query.filter_by(user_id=presence.user_id).first()
             result.append({
                 "kind": "person", "id": presence.id, "icon": CATEGORY_ICONS[presence.category],
+                "_owner_id": presence.user_id,
                 "name": presence.user.name if user else "Участник рядом", "category": presence.category,
                 "description": "Открыт к общению", "distance_km": round(distance, 1),
                 "latitude": point[0], "longitude": point[1], "expires_at": normalize_dt(presence.active_until).isoformat(),
@@ -1045,7 +1046,7 @@ def feed():
                 "interested": presence.user_id in proposed_owner_ids,
             })
 
-        meetings = Meeting.query.filter(Meeting.expires_at > now).all()
+        meetings = Meeting.query.filter(Meeting.expires_at > now).order_by(Meeting.id.desc()).all()
         interested_ids = set()
         if user:
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
@@ -1070,6 +1071,7 @@ def feed():
             selfie = ProfileSelfie.query.filter_by(user_id=meeting.owner_id).first()
             result.append({
                 "kind": "meeting", "id": meeting.id, "icon": CATEGORY_ICONS[meeting.category],
+                "_owner_id": meeting.owner_id,
                 "name": meeting.owner.name if user else "Открытая встреча", "category": meeting.category,
                 "description": meeting.description, "format": meeting.format, "distance_km": round(distance, 1),
                 "latitude": point[0], "longitude": point[1], "mine": bool(user and meeting.owner_id == user.id),
@@ -1079,6 +1081,15 @@ def feed():
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
             })
+    unique_people = {}
+    for item in result:
+        owner_id = item.pop("_owner_id")
+        previous = unique_people.get(owner_id)
+        if (previous is None
+                or (item["kind"] == "meeting" and previous["kind"] == "person")
+                or (item["kind"] == previous["kind"] == "meeting" and item["id"] > previous["id"])):
+            unique_people[owner_id] = item
+    result = list(unique_people.values())
     result.sort(key=lambda item: item["distance_km"])
     return jsonify(items=result)
 
@@ -1352,6 +1363,7 @@ def room_payload(meeting, user):
             "photo_consented": uid in consented_ids,
         })
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
+                         "latitude": meeting.latitude, "longitude": meeting.longitude,
                          "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active"},
             "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
                         "voted": p.id in my_votes, "confirmed": bool(p.confirmed)} for p in places],
