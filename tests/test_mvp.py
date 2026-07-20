@@ -470,6 +470,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
+        self.assertIn('id="closeMeeting"', frontend)
+        self.assertIn("meetingTouchStart", frontend)
+        self.assertIn(".meeting-sheet{", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
