@@ -497,6 +497,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("maximum-scale=1,user-scalable=no", frontend)
         self.assertIn("syncVisualViewport", frontend)
         self.assertIn("meetings.filter(item=>!item.mine)", frontend)
+        self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
+        self.assertIn("placePickerMap=L.map('placePickerMap');placePickerMap.attributionControl.setPrefix(false)", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
