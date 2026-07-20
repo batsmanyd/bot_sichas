@@ -259,6 +259,24 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/meetings", json=payload)
         self.assertEqual(response.status_code, 429, response.get_json())
 
+    def test_feed_shows_one_card_and_marker_per_person(self):
+        self.login(self.first, 61)
+        self.login(self.second, 62)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        self.assertEqual(self.first.post("/api/presence", json={**point, "category": "cafe"}).status_code, 200)
+        first_meeting = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе или чай", "format": "one",
+        })
+        second_meeting = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Открыть новое место", "format": "one",
+        })
+        self.assertEqual(first_meeting.status_code, 201)
+        self.assertEqual(second_meeting.status_code, 201)
+        feed = self.second.get("/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe").get_json()["items"]
+        self.assertEqual(len(feed), 1)
+        self.assertEqual(feed[0]["kind"], "meeting")
+        self.assertEqual(feed[0]["id"], second_meeting.get_json()["id"])
+
     def test_group_meeting_has_six_people_total(self):
         self.login(self.first, 70)
         point = {"latitude": 53.9023, "longitude": 27.5619}
@@ -473,6 +491,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn('id="closeMeeting"', frontend)
         self.assertIn("meetingTouchStart", frontend)
         self.assertIn(".meeting-sheet{", frontend)
+        self.assertIn("openPlacePicker", frontend)
+        self.assertIn("Выбрать на карте", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
