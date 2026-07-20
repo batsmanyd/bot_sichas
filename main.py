@@ -7,7 +7,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 import jwt
 import requests
@@ -749,6 +749,13 @@ def telegram_webhook():
     message = json_body().get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     if chat_id:
+        message_text = str(message.get("text") or "").strip()
+        start_payload = ""
+        if message_text.startswith("/start "):
+            start_payload = message_text.split(maxsplit=1)[1][:80]
+        web_app_url = PUBLIC_URL
+        if start_payload.startswith(("login_", "invite_")):
+            web_app_url = f"{PUBLIC_URL}/?handoff={quote(start_payload, safe='')}"
         try:
             telegram_api("sendMessage", {
                 "chat_id": chat_id,
@@ -759,7 +766,7 @@ def telegram_webhook():
                 "chat_id": chat_id,
                 "text": "Нажмите кнопку ниже, чтобы открыть приложение.",
                 "reply_markup": {"inline_keyboard": [[{
-                    "text": "Открыть «Сейчас»", "web_app": {"url": PUBLIC_URL},
+                    "text": "Открыть «Сейчас»", "web_app": {"url": web_app_url},
                 }]]},
             })
         except requests.RequestException:
@@ -769,12 +776,15 @@ def telegram_webhook():
 
 @app.post("/auth/telegram-mini-app")
 def telegram_mini_app():
-    init_data = json_body().get("init_data", "")
+    data = json_body()
+    init_data = data.get("init_data", "")
     user_data = verify_mini_app_init_data(init_data)
     if not user_data:
         return jsonify(error="Не удалось подтвердить запуск из Telegram"), 401
     user = upsert_telegram_user(user_data)
-    start_param = dict(parse_qsl(init_data, keep_blank_values=True)).get("start_param", "")
+    start_param = str(data.get("handoff") or "")[:80]
+    if not start_param:
+        start_param = dict(parse_qsl(init_data, keep_blank_values=True)).get("start_param", "")
     claimed = claim_invitation(user, start_param) if start_param.startswith("invite_") else False
     handoff_claimed = claim_auth_handoff(user, start_param)
     return jsonify(ok=True, invitation_claimed=claimed, handoff_claimed=handoff_claimed,
@@ -793,7 +803,7 @@ def create_auth_handoff():
     session["auth_handoff"] = token
     return jsonify(
         handoff_token=token,
-        telegram_url=f"https://t.me/{BOT_USERNAME}?startapp=login_{token}",
+        telegram_url=f"https://t.me/{BOT_USERNAME}?start=login_{token}",
     ), 201
 
 
