@@ -388,7 +388,9 @@ class MvpFlowTest(unittest.TestCase):
             created = self.first.post("/auth/handoff", json={})
             self.assertEqual(created.status_code, 201, created.get_json())
             handoff_token = created.get_json()["handoff_token"]
-            self.assertIn(f"start=login_{handoff_token}", created.get_json()["telegram_url"])
+            self.assertRegex(handoff_token, r"^\d{8}$")
+            self.assertEqual(created.get_json()["login_code"], handoff_token)
+            self.assertEqual(created.get_json()["telegram_url"], "https://t.me/vmeste_rjadom_bot")
 
             pending = self.first.post(f"/auth/handoff/{handoff_token}", json={})
             self.assertEqual(pending.status_code, 202, pending.get_json())
@@ -438,6 +440,25 @@ class MvpFlowTest(unittest.TestCase):
         finally:
             main.BOT_TOKEN = original_token
 
+    def test_standalone_code_can_be_confirmed_by_bot_message(self):
+        original_token, original_api = main.BOT_TOKEN, main.telegram_api
+        main.BOT_TOKEN = "123456:test-token"
+        sent = []
+        main.telegram_api = lambda method, payload: sent.append((method, payload))
+        try:
+            created = self.first.post("/auth/handoff", json={}).get_json()
+            code = created["login_code"]
+            response = self.second.post("/telegram/webhook", json={"message": {
+                "chat": {"id": 992}, "from": {"id": 992, "first_name": "Анна"}, "text": code,
+            }}, headers={"X-Telegram-Bot-Api-Secret-Token": main.TELEGRAM_WEBHOOK_SECRET})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertIn("Вход подтверждён", sent[-1][1]["text"])
+            completed = self.first.post(f"/auth/handoff/{code}", json={})
+            self.assertEqual(completed.status_code, 200, completed.get_json())
+            self.assertTrue(completed.get_json()["authenticated"])
+        finally:
+            main.BOT_TOKEN, main.telegram_api = original_token, original_api
+
     def test_frontend_processes_handoff_even_when_telegram_session_already_exists(self):
         with open("index.html", encoding="utf-8") as source:
             frontend = source.read()
@@ -448,6 +469,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("setInterval(refreshLiveData,15000)", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
+        self.assertIn("startBotCodeLogin", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
