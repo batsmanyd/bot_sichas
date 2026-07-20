@@ -158,7 +158,7 @@ function secureStorageRemove(){if(secureStorageAvailable())tg.SecureStorage.remo
 async function rememberDeviceToken(token){if(token)await secureStorageSet(token)}
 async function restoreDeviceSession(){const token=await secureStorageGet();if(!token)return false;try{await api('/auth/device',{method:'POST',body:JSON.stringify({device_token:token})});return true}catch(error){secureStorageRemove();return false}}
 async function refreshDeviceToken(){if(!secureStorageAvailable())return;try{const data=await api('/auth/device-token');await rememberDeviceToken(data.device_token)}catch(error){console.warn('Не удалось сохранить подтверждение устройства',error)}}
-async function authenticateMiniApp(){if(!tg?.initData)return false;const handoff=new URLSearchParams(location.search).get('handoff')||'';const data=await api('/auth/telegram-mini-app',{method:'POST',body:JSON.stringify({init_data:tg.initData,handoff})});await rememberDeviceToken(data.device_token);localStorage.setItem('sichasRegistered','1');if(data.handoff_claimed&&tg?.showAlert)setTimeout(()=>tg.showAlert('Аккаунт подтверждён. Вернитесь в приложение «Сейчас» на экране телефона.'),250);return true}
+async function authenticateMiniApp(){if(!tg?.initData)return false;const handoff=new URLSearchParams(location.search).get('handoff')||'';const data=await api('/auth/telegram-mini-app',{method:'POST',body:JSON.stringify({init_data:tg.initData,handoff})});await rememberDeviceToken(data.device_token);localStorage.setItem('sichasRegistered','1');if(data.handoff_claimed&&tg?.showAlert)setTimeout(()=>tg.showAlert('Аккаунт подтверждён. Возвращаем вас в установленное приложение.',()=>tg.close()),250);return true}
 async function startStandaloneLogin(){const data=await api('/auth/handoff',{method:'POST',body:'{}'});localStorage.setItem('sichasPendingLogin',data.handoff_token);location.href=data.telegram_url}
 async function completePendingLogin(){const token=localStorage.getItem('sichasPendingLogin');if(!token)return false;try{const data=await api(`/auth/handoff/${encodeURIComponent(token)}`,{method:'POST',body:'{}'});if(data.authenticated){localStorage.removeItem('sichasPendingLogin');return true}return false}catch(error){localStorage.removeItem('sichasPendingLogin');return false}}
 function telegramStartParam(){return String(tg?.initDataUnsafe?.start_param||new URLSearchParams(tg?.initData||'').get('start_param')||'')}
@@ -168,5 +168,10 @@ drawCats();drawOpen();updateAccountUI();trackTraffic();sessionLoadPromise=loadSe
 if(localStorage.getItem('onboardingDoneV2')!=='1'){drawOnboarding();setTimeout(()=>$('onboardingDialog').showModal(),250)}
 async function refreshLiveData(){if(document.visibilityState!=='visible'||demoMode)return;await loadFeed(true);if($('chats').classList.contains('active'))await loadInterests(true);if(activeRoom&&$('roomDialog').open&&!$('roomDialog').contains(document.activeElement)){try{drawRoom(await api(`/api/meetings/${activeRoom.meeting.id}/room`))}catch(error){if(error.message.includes('подтверждения')){$('roomDialog').close();activeRoom=null;await loadInterests(true)}}}}
 setInterval(refreshLiveData,15000);
+let resumingStandaloneLogin=false;
+async function resumeStandaloneLogin(){if(document.visibilityState!=='visible'||tg?.initData||resumingStandaloneLogin||!localStorage.getItem('sichasPendingLogin'))return;resumingStandaloneLogin=true;try{await loadServerSession();if(isRegistered){if($('registrationDialog').open)$('registrationDialog').close();showToast('Вход подтверждён. Добро пожаловать!')}}finally{resumingStandaloneLogin=false}}
+document.addEventListener('visibilitychange',resumeStandaloneLogin);
+window.addEventListener('focus',resumeStandaloneLogin);
+window.addEventListener('pageshow',resumeStandaloneLogin);
 </script>
 </body></html>
