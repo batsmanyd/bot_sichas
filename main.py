@@ -4,6 +4,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -750,6 +751,31 @@ def telegram_webhook():
     chat_id = (message.get("chat") or {}).get("id")
     if chat_id:
         message_text = str(message.get("text") or "").strip()
+        code_match = re.fullmatch(r"(?:/start\s+login_)?(\d{8})", message_text)
+        if code_match:
+            handoff = AuthHandoff.query.filter_by(token=code_match.group(1)).first()
+            if handoff and not handoff.used_at and normalize_dt(handoff.expires_at) > utcnow():
+                sender = message.get("from") or {}
+                try:
+                    user = upsert_telegram_user(sender)
+                    handoff.user_id = user.id
+                    handoff.completed_at = utcnow()
+                    db.session.commit()
+                    telegram_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": "Вход подтверждён. Вернитесь в установленное приложение «Сейчас».",
+                    })
+                except (ValueError, requests.RequestException):
+                    app.logger.exception("Telegram code login failed")
+                return jsonify(ok=True)
+            try:
+                telegram_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "Код не найден или его время истекло. Получите новый код в приложении «Сейчас».",
+                })
+            except requests.RequestException:
+                app.logger.exception("Telegram expired code reply failed")
+            return jsonify(ok=True)
         start_payload = ""
         if message_text.startswith("/start "):
             start_payload = message_text.split(maxsplit=1)[1][:80]
@@ -796,14 +822,22 @@ def telegram_mini_app():
 def create_auth_handoff():
     if not BOT_TOKEN:
         return jsonify(error="Вход через Telegram временно недоступен"), 503
-    token = secrets.token_urlsafe(24)
+    token = ""
+    for _ in range(10):
+        candidate = f"{secrets.randbelow(100_000_000):08d}"
+        if not AuthHandoff.query.filter_by(token=candidate).first():
+            token = candidate
+            break
+    if not token:
+        return jsonify(error="Не удалось создать код. Попробуйте ещё раз"), 503
     db.session.add(AuthHandoff(token=token, expires_at=utcnow() + timedelta(minutes=10)))
     db.session.commit()
     session.permanent = True
     session["auth_handoff"] = token
     return jsonify(
         handoff_token=token,
-        telegram_url=f"https://t.me/{BOT_USERNAME}?start=login_{token}",
+        login_code=token,
+        telegram_url=f"https://t.me/{BOT_USERNAME}",
     ), 201
 
 
