@@ -1051,6 +1051,8 @@ def feed():
         if user:
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
         for meeting in meetings:
+            if user and meeting.owner_id == user.id:
+                continue
             starts_at = normalize_dt(meeting.starts_at)
             is_now = starts_at <= now + timedelta(minutes=5)
             if time_mode == "now" and not is_now:
@@ -1175,7 +1177,20 @@ def create_meeting():
         return jsonify(error="Выберите время встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
+    active_owned = Meeting.query.filter(Meeting.owner_id == user.id, Meeting.expires_at > utcnow()).all()
+    for previous in active_owned:
+        if Interest.query.filter_by(meeting_id=previous.id, status="accepted").first():
+            return jsonify(error="Сначала завершите или отмените текущую подтверждённую встречу"), 409
+    for previous in active_owned:
+        previous.expires_at = utcnow()
+        Interest.query.filter_by(meeting_id=previous.id, status="pending").update(
+            {"status": "rejected"}, synchronize_session=False
+        )
+        previous_state = MeetingState.query.filter_by(meeting_id=previous.id).first()
+        if previous_state:
+            previous_state.status = "cancelled"
     if not consume_action(user.id, "meeting", 5, 3600):
+        db.session.rollback()
         return jsonify(error="Слишком много встреч за час. Попробуйте позже"), 429
     starts_at = utcnow() + timedelta(minutes=starts_in_minutes)
     meeting = Meeting(
@@ -1282,10 +1297,15 @@ def interest_payload(interest, viewer):
 @login_required
 def list_interests():
     user = current_user()
-    owned_meeting_ids = [row.id for row in Meeting.query.filter_by(owner_id=user.id).all()]
+    active_meeting_ids = [row.id for row in Meeting.query.filter(Meeting.expires_at > utcnow()).all()]
+    owned_meeting_ids = [row.id for row in Meeting.query.filter(
+        Meeting.owner_id == user.id, Meeting.id.in_(active_meeting_ids)
+    ).all()] if active_meeting_ids else []
     incoming = (Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all()
                 if owned_meeting_ids else [])
-    outgoing = Interest.query.filter_by(user_id=user.id).all()
+    outgoing = (Interest.query.filter(Interest.user_id == user.id,
+                                      Interest.meeting_id.in_(active_meeting_ids)).all()
+                if active_meeting_ids else [])
     return jsonify(
         incoming=[interest_payload(item, user) for item in incoming],
         outgoing=[interest_payload(item, user) for item in outgoing],
@@ -1343,7 +1363,14 @@ def room_payload(meeting, user):
             my_votes.add(vote.place_id)
     messages = ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
-    events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id).all()
+    raw_events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id.desc()).all()
+    event_keys, events = set(), []
+    for event in raw_events:
+        key = (event.kind, event.user_id, event.target_user_id)
+        if key not in event_keys:
+            event_keys.add(key)
+            events.append(event)
+    events.reverse()
     feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id).order_by(MeetingFeedback.id).all()
     member_ids = accepted_user_ids(meeting)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
@@ -1362,9 +1389,11 @@ def room_payload(meeting, user):
             "photo_visible": photo_visible, "photo_visibility": visibility,
             "photo_consented": uid in consented_ids,
         })
+    my_late = any(event.kind == "late" and event.user_id == user.id for event in events)
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
-                         "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active"},
+                         "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active",
+                         "my_late": my_late},
             "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
                         "voted": p.id in my_votes, "confirmed": bool(p.confirmed)} for p in places],
             "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
@@ -1510,9 +1539,23 @@ def meeting_lifecycle(meeting_id):
             return jsonify(error="Некорректный участник"), 400
     if action == "cancel":
         state.status = "cancelled"
+        meeting.expires_at = utcnow()
     elif action == "complete":
         state.status = "completed"
+        meeting.expires_at = utcnow()
         reward_completed_invites(accepted_user_ids(meeting))
+    elif action == "late":
+        existing_late = MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=user.id, kind="late"
+        ).all()
+        if existing_late:
+            for event in existing_late:
+                db.session.delete(event)
+            db.session.commit()
+            return jsonify(ok=True, room=room_payload(meeting, user))
+    elif action == "no_show":
+        MeetingEvent.query.filter_by(meeting_id=meeting.id, user_id=user.id,
+                                     target_user_id=target_id, kind="no_show").delete()
     db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                 kind=action, note=str(data.get("note", "")).strip()[:180] or None))
     db.session.commit()
