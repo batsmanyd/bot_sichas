@@ -496,6 +496,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertGreaterEqual(frontend.count("attributionControl.setPrefix(false)"), 2)
         self.assertIn("maximum-scale=1,user-scalable=no", frontend)
         self.assertIn("syncVisualViewport", frontend)
+        self.assertIn("meetings.filter(item=>!item.mine)", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
