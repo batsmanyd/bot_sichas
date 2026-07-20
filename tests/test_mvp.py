@@ -446,6 +446,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("data-presence", frontend)
         self.assertIn("reportParticipant", frontend)
         self.assertIn("setInterval(refreshLiveData,15000)", frontend)
+        self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
+        self.assertIn("tg.close()", frontend)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
