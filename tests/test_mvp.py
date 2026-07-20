@@ -107,9 +107,14 @@ class MvpFlowTest(unittest.TestCase):
         room = self.first.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertTrue(room["places"][0]["confirmed"])
         self.assertEqual(room["messages"][0]["text"], "Буду через 10 минут")
-        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+        late_response = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "late", "note": "Опоздаю на 5 минут",
-        }).status_code, 200)
+        })
+        self.assertEqual(late_response.status_code, 200)
+        self.assertTrue(late_response.get_json()["room"]["meeting"]["my_late"])
+        late_response = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "late"})
+        self.assertEqual(late_response.status_code, 200)
+        self.assertFalse(late_response.get_json()["room"]["meeting"]["my_late"])
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "no_show", "target_user_id": second_user.id,
         }).status_code, 200)
@@ -272,10 +277,14 @@ class MvpFlowTest(unittest.TestCase):
         })
         self.assertEqual(first_meeting.status_code, 201)
         self.assertEqual(second_meeting.status_code, 201)
+        own_feed = self.first.get("/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe").get_json()["items"]
+        self.assertEqual(own_feed, [])
         feed = self.second.get("/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe").get_json()["items"]
         self.assertEqual(len(feed), 1)
         self.assertEqual(feed[0]["kind"], "meeting")
         self.assertEqual(feed[0]["id"], second_meeting.get_json()["id"])
+        old_meeting = main.db.session.get(main.Meeting, first_meeting.get_json()["id"])
+        self.assertLessEqual(main.normalize_dt(old_meeting.expires_at), main.utcnow())
 
     def test_group_meeting_has_six_people_total(self):
         self.login(self.first, 70)
@@ -305,11 +314,12 @@ class MvpFlowTest(unittest.TestCase):
     def test_now_and_within_hour_filters(self):
         self.login(self.first, 11)
         self.login(self.second, 12)
+        self.login(self.third, 13)
         point = {"latitude": 53.9023, "longitude": 27.5619}
         now_response = self.first.post("/api/meetings", json={
             **point, "category": "cafe", "description": "Сейчас", "format": "one", "time_mode": "now",
         })
-        hour_response = self.first.post("/api/meetings", json={
+        hour_response = self.third.post("/api/meetings", json={
             **point, "category": "cafe", "description": "Через 45 минут", "format": "one",
             "time_mode": "hour", "starts_in_minutes": 45,
         })
