@@ -493,6 +493,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn(".meeting-sheet{", frontend)
         self.assertIn("openPlacePicker", frontend)
         self.assertIn("Выбрать на карте", frontend)
+        self.assertGreaterEqual(frontend.count("attributionControl.setPrefix(false)"), 2)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
