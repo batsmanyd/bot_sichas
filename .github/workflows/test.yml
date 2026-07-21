@@ -15,10 +15,11 @@ jobs:
       DATABASE_URL: "sqlite:////tmp/sichas-test.db"
       SECRET_KEY: "ci-test-secret"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - name: Run tests with concise logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone -q --depth 1 --branch "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          python3 -m pip install -q -r requirements.txt >/dev/null 2>&1
+          python3 -m unittest discover -s tests -v
