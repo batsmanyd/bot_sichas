@@ -22,4 +22,4 @@ jobs:
           git clone -q --depth 1 --branch "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
           python3 -m pip install -q -r requirements.txt >/dev/null 2>&1
-          python3 -m unittest discover -s tests -v
+          python3 tests/run_v2_suite.py
