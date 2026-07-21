@@ -7,6 +7,12 @@ and is replaced by ``test_selfie_is_never_used_as_meeting_photo``.
 
 import sys
 import unittest
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 
 OBSOLETE_TESTS = {
