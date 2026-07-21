@@ -1,7 +1,7 @@
 import unittest
 from datetime import timedelta
 
-import app_v2
+import safe_app as app_v2
 
 
 class SafetyGoodDeedsV2Test(unittest.TestCase):
@@ -11,9 +11,10 @@ class SafetyGoodDeedsV2Test(unittest.TestCase):
         app_v2.legacy.ALLOW_TEST_AUTH = True
 
     def setUp(self):
-        app_v2.db.session.remove()
+        app_v2.legacy.db.session.remove()
         app_v2.legacy.Model.metadata.drop_all(app_v2.legacy.engine)
         app_v2.legacy.Model.metadata.create_all(app_v2.legacy.engine)
+        app_v2.legacy.ADMIN_TELEGRAM_IDS.clear()
         self.first = app_v2.app.test_client()
         self.second = app_v2.app.test_client()
         self.guest = app_v2.app.test_client()
@@ -86,12 +87,20 @@ class SafetyGoodDeedsV2Test(unittest.TestCase):
         self.assertTrue(any('real-second' in value for value in pictures))
         self.assertFalse(any('selfie-' in value for value in pictures))
 
-    def test_good_deed_builds_confirmed_trace(self):
+    def test_invalid_delete_confirmation_keeps_v2_data(self):
+        self.login(self.first, 15)
+        self.profile(self.first, 'Юрий', 'delete')
+        media_count = app_v2.v2.ProfileMedia.query.count()
+        response = self.first.delete('/api/account', json={'confirmation': 'нет'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(app_v2.v2.ProfileMedia.query.count(), media_count)
+        self.assertEqual(app_v2.legacy.User.query.count(), 1)
+
+    def test_good_deed_moderation_and_confirmed_trace(self):
         self.login(self.first, 21)
         self.login(self.second, 22)
         self.profile(self.first, 'Юрий', 'owner')
         self.profile(self.second, 'Анна', 'member')
-        app_v2.legacy.ADMIN_TELEGRAM_IDS.add('test-21')
 
         starts = (app_v2.legacy.utcnow() + timedelta(hours=2)).isoformat()
         deed_response = self.first.post('/api/v2/good-deeds', json={
@@ -106,7 +115,15 @@ class SafetyGoodDeedsV2Test(unittest.TestCase):
             'instructions': 'Взять перчатки. Деньги, документы и доступы не требуются.',
         })
         self.assertEqual(deed_response.status_code, 201, deed_response.get_json())
+        self.assertTrue(deed_response.get_json()['pending'])
         deed_id = deed_response.get_json()['item']['id']
+        self.assertEqual(self.guest.get('/api/v2/good-deeds').get_json()['items'], [])
+
+        app_v2.legacy.ADMIN_TELEGRAM_IDS.add('test-21')
+        approved = self.first.post(f'/api/v2/admin/good-deeds/{deed_id}/decision', json={'decision': 'active'})
+        self.assertEqual(approved.status_code, 200, approved.get_json())
+        self.assertEqual(approved.get_json()['item']['status'], 'active')
+
         joined = self.second.post(f'/api/v2/good-deeds/{deed_id}/join', json={})
         self.assertEqual(joined.status_code, 200, joined.get_json())
         completed = self.first.post(f'/api/v2/good-deeds/{deed_id}/complete', json={
