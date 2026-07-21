@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feature/safety-good-deeds-v2
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ALLOW_TEST_AUTH: "true"
+      DATABASE_URL: "sqlite:////tmp/sichas-test.db"
+      SECRET_KEY: "ci-test-secret"
+    steps:
+      - name: Run tests with concise logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone -q --depth 1 --branch "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          python3 -m pip install -q -r requirements.txt >/dev/null 2>&1
+          python3 tests/run_v2_suite.py
