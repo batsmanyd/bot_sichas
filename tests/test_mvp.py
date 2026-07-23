@@ -286,6 +286,26 @@ class MvpFlowTest(unittest.TestCase):
         old_meeting = main.db.session.get(main.Meeting, first_meeting.get_json()["id"])
         self.assertLessEqual(main.normalize_dt(old_meeting.expires_at), main.utcnow())
 
+    def test_owner_can_manage_active_meeting_before_first_response(self):
+        self.login(self.first, 63)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        created = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе или чай", "format": "one",
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        meeting_id = created.get_json()["id"]
+        interests = self.first.get("/api/interests").get_json()
+        self.assertEqual(len(interests["owned"]), 1)
+        self.assertEqual(interests["owned"][0]["meeting_id"], meeting_id)
+        self.assertEqual(interests["owned"][0]["accepted_count"], 0)
+        room = self.first.get(f"/api/meetings/{meeting_id}/room")
+        self.assertEqual(room.status_code, 200, room.get_json())
+        cancelled = self.first.post(
+            f"/api/meetings/{meeting_id}/lifecycle", json={"action": "cancel"}
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.get_json())
+        self.assertEqual(self.first.get("/api/interests").get_json()["owned"], [])
+
     def test_group_meeting_has_six_people_total(self):
         self.login(self.first, 70)
         point = {"latitude": 53.9023, "longitude": 27.5619}
@@ -509,6 +529,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("meetings.filter(item=>!item.mine)", frontend)
         self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
         self.assertIn("placePickerMap=L.map('placePickerMap',{zoomControl:true});placePickerMap.attributionControl.setPrefix(false)", frontend)
+        self.assertIn("Ваша активная встреча", frontend)
+        self.assertIn("item.age?item.age+' лет'", frontend)
+        self.assertEqual(frontend.count("$('locateMe').onclick=locateMe"), 1)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
 
