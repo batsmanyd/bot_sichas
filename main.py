@@ -6,6 +6,8 @@ import math
 import os
 import re
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import parse_qsl, quote, urlencode
@@ -226,6 +228,15 @@ class MeetingPlace(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class MeetingPlaceLocation(db.Model):
+    __tablename__ = "meeting_place_location"
+    id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("meeting_place.id"), unique=True, nullable=False, index=True)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    source = db.Column(db.String(20), nullable=False, default="map")
+
+
 class PlaceVote(db.Model):
     __tablename__ = "place_vote"
     id = db.Column(db.Integer, primary_key=True)
@@ -270,6 +281,16 @@ class MeetingFeedback(db.Model):
     trace = db.Column(db.String(180), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_feedback_meeting_user"),)
+
+
+class MeetingThanks(db.Model):
+    __tablename__ = "meeting_thanks"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    giver_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    receiver_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (UniqueConstraint("meeting_id", "giver_id", "receiver_id", name="uq_meeting_thanks"),)
 
 
 class UserReport(db.Model):
@@ -333,6 +354,25 @@ class Invitation(db.Model):
     status = db.Column(db.String(20), nullable=False, default="created")
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     claimed_at = db.Column(db.DateTime(timezone=True))
+
+
+class UserNotification(db.Model):
+    __tablename__ = "user_notification"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    kind = db.Column(db.String(30), nullable=False, default="info")
+    text = db.Column(db.String(300), nullable=False)
+    dedupe_key = db.Column(db.String(120), unique=True, index=True)
+    read_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+
+class GeocodeCache(db.Model):
+    __tablename__ = "geocode_cache"
+    id = db.Column(db.Integer, primary_key=True)
+    coordinate_key = db.Column(db.String(40), unique=True, nullable=False, index=True)
+    title = db.Column(db.String(180), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class AuthHandoff(db.Model):
@@ -439,6 +479,39 @@ def reward_completed_invites(member_ids):
         invitation.status = "rewarded"
 
 
+def trust_payload(user_id):
+    completed_states = MeetingState.query.filter_by(status="completed").all()
+    completed_ids = {state.meeting_id for state in completed_states}
+    completed = 0
+    for meeting_id in completed_ids:
+        meeting = db.session.get(Meeting, meeting_id)
+        if not meeting:
+            continue
+        if meeting.owner_id == user_id or Interest.query.filter_by(
+                meeting_id=meeting_id, user_id=user_id, status="accepted").first():
+            completed += 1
+    thanks = MeetingThanks.query.filter_by(receiver_id=user_id).count()
+    no_shows = MeetingEvent.query.filter_by(target_user_id=user_id, kind="no_show").count()
+    score = max(20, min(100, 70 + min(completed * 4, 20) + min(thanks * 3, 15) - min(no_shows * 15, 45)))
+    if completed == 0 and thanks == 0 and no_shows == 0:
+        level = "Новый участник"
+    elif score >= 90:
+        level = "Высокое доверие"
+    elif score >= 70:
+        level = "Надёжный участник"
+    else:
+        level = "Требует внимания"
+    develops_club = Invitation.query.filter_by(inviter_id=user_id, status="rewarded").count() > 0
+    return {
+        "score": score,
+        "level": level,
+        "completed_meetings": completed,
+        "thanks": thanks,
+        "no_shows": no_shows,
+        "develops_club": develops_club,
+    }
+
+
 def valid_coordinates(lat, lon):
     try:
         lat, lon = float(lat), float(lon)
@@ -467,17 +540,47 @@ def safe_point(lat, lon, identifier):
     return round(lat + lat_offset, 4), round(lon + lon_offset, 4)
 
 
-def notify_user(user_id, text):
+def notify_user(user_id, text, kind="info", dedupe_key=None):
+    if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
+        return False
+    db.session.add(UserNotification(
+        user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
+    ))
+    db.session.commit()
     if not BOT_TOKEN:
-        return
+        return True
     user = db.session.get(User, user_id)
     if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
-        return
+        return True
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       json={"chat_id": user.telegram_id, "text": text}, timeout=5).raise_for_status()
     except requests.RequestException:
         app.logger.warning("Telegram notification failed for user %s", user_id)
+    return True
+
+
+def process_presence_reminders():
+    threshold = utcnow() - timedelta(hours=1)
+    active = Presence.query.filter(Presence.active_until > utcnow(), Presence.updated_at <= threshold).all()
+    for presence in active:
+        started = normalize_dt(presence.updated_at).replace(microsecond=0).isoformat()
+        notify_user(
+            presence.user_id,
+            "Вы всё ещё открыты для общения. Оставить статус включённым или выключить его в приложении?",
+            kind="presence_reminder",
+            dedupe_key=f"presence-reminder:{presence.id}:{started}",
+        )
+
+
+def presence_reminder_loop():
+    while True:
+        time.sleep(60)
+        try:
+            with app.app_context():
+                process_presence_reminders()
+        except Exception:
+            app.logger.exception("Presence reminder worker failed")
 
 
 TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(f"{app.secret_key}|telegram-webhook".encode()).hexdigest()[:48]
@@ -632,6 +735,7 @@ def api_session():
             "name": user.name,
             "username": user.username,
             "picture": user.picture,
+            "trust": trust_payload(user.id),
         } if user else None,
     )
 
@@ -682,6 +786,7 @@ def user_profile_payload(user):
         "selfie_present": bool(selfie),
         "selfie_preview": decrypt_selfie(selfie.image) if selfie else None,
         "selfie_visibility": selfie.visibility if selfie else "mutual",
+        "trust": trust_payload(user.id),
     }
 
 
@@ -943,6 +1048,10 @@ def delete_account():
         return jsonify(error="Подтвердите удаление аккаунта"), 400
 
     user_id = user.id
+    proposed_place_ids = [row[0] for row in db.session.query(MeetingPlace.id).filter_by(user_id=user_id).all()]
+    if proposed_place_ids:
+        MeetingPlaceLocation.query.filter(
+            MeetingPlaceLocation.place_id.in_(proposed_place_ids)).delete(synchronize_session=False)
     owned_meeting_ids = [row[0] for row in db.session.query(Meeting.id).filter_by(owner_id=user_id).all()]
     if owned_meeting_ids:
         owned_place_ids = [row[0] for row in db.session.query(MeetingPlace.id).filter(
@@ -950,10 +1059,13 @@ def delete_account():
         ).all()]
         if owned_place_ids:
             PlaceVote.query.filter(PlaceVote.place_id.in_(owned_place_ids)).delete(synchronize_session=False)
+            MeetingPlaceLocation.query.filter(
+                MeetingPlaceLocation.place_id.in_(owned_place_ids)).delete(synchronize_session=False)
         PlaceVote.query.filter(PlaceVote.user_id == user_id).delete(synchronize_session=False)
         MeetingPlace.query.filter(MeetingPlace.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         ChatMessage.query.filter(ChatMessage.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         MeetingFeedback.query.filter(MeetingFeedback.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
+        MeetingThanks.query.filter(MeetingThanks.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         MeetingEvent.query.filter(MeetingEvent.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         UserReport.query.filter(UserReport.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         PhotoConsent.query.filter(PhotoConsent.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
@@ -965,6 +1077,9 @@ def delete_account():
     MeetingPlace.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     ChatMessage.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     MeetingFeedback.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    MeetingThanks.query.filter(
+        (MeetingThanks.giver_id == user_id) | (MeetingThanks.receiver_id == user_id)
+    ).delete(synchronize_session=False)
     MeetingEvent.query.filter((MeetingEvent.user_id == user_id) | (MeetingEvent.target_user_id == user_id)).delete(
         synchronize_session=False)
     UserReport.query.filter((UserReport.reporter_id == user_id) | (UserReport.target_id == user_id)).delete(
@@ -986,6 +1101,7 @@ def delete_account():
         invitation.claimed_at = None
         invitation.status = "created"
     AuthHandoff.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    UserNotification.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     db.session.delete(user)
     db.session.commit()
     session.clear()
@@ -1035,6 +1151,7 @@ def feed():
             point = safe_point(presence.latitude, presence.longitude, f"p{presence.id}")
             profile = UserProfile.query.filter_by(user_id=presence.user_id).first()
             selfie = ProfileSelfie.query.filter_by(user_id=presence.user_id).first()
+            trust = trust_payload(presence.user_id)
             result.append({
                 "kind": "person", "id": presence.id, "icon": CATEGORY_ICONS[presence.category],
                 "_owner_id": presence.user_id,
@@ -1044,6 +1161,7 @@ def feed():
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
                 "interested": presence.user_id in proposed_owner_ids,
+                "trust": trust,
             })
 
         meetings = Meeting.query.filter(Meeting.expires_at > now).order_by(Meeting.id.desc()).all()
@@ -1071,6 +1189,7 @@ def feed():
             point = safe_point(meeting.latitude, meeting.longitude, f"m{meeting.id}")
             profile = UserProfile.query.filter_by(user_id=meeting.owner_id).first()
             selfie = ProfileSelfie.query.filter_by(user_id=meeting.owner_id).first()
+            trust = trust_payload(meeting.owner_id)
             result.append({
                 "kind": "meeting", "id": meeting.id, "icon": CATEGORY_ICONS[meeting.category],
                 "_owner_id": meeting.owner_id,
@@ -1082,6 +1201,7 @@ def feed():
                 "starts_in_minutes": max(0, round((starts_at - now).total_seconds() / 60)),
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
+                "trust": trust,
             })
     unique_people = {}
     for item in result:
@@ -1122,11 +1242,15 @@ def set_presence():
         return jsonify(error="Разрешите геолокацию, чтобы стать видимым рядом"), 400
     presence = Presence.query.filter_by(user_id=user.id).first() or Presence(user_id=user.id)
     presence.category, presence.latitude, presence.longitude = category, float(lat), float(lon)
-    presence.active_until = utcnow() + timedelta(minutes=60)
+    # The status stays active until the user explicitly switches it off.
+    # A distant date keeps the existing indexed feed query and old rows compatible.
+    presence.active_until = utcnow() + timedelta(days=3650)
+    presence.updated_at = utcnow()
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(presence)
     db.session.commit()
-    return jsonify(ok=True, active_until=normalize_dt(presence.active_until).isoformat())
+    return jsonify(ok=True, active_until=None,
+                   reminder_due_at=(normalize_dt(presence.updated_at) + timedelta(hours=1)).isoformat())
 
 
 @app.delete("/api/presence")
@@ -1144,9 +1268,38 @@ def get_presence():
     presence = Presence.query.filter_by(user_id=current_user().id).first()
     active = bool(presence and normalize_dt(presence.active_until) > utcnow())
     return jsonify(active=active, category=presence.category if active else None,
-                   active_until=normalize_dt(presence.active_until).isoformat() if active else None,
+                   active_until=None,
+                   reminder_due_at=(normalize_dt(presence.updated_at) + timedelta(hours=1)).isoformat()
+                   if active else None,
                    latitude=presence.latitude if active else None,
                    longitude=presence.longitude if active else None)
+
+
+@app.get("/api/notifications")
+@login_required
+def list_notifications():
+    user = current_user()
+    items = UserNotification.query.filter_by(user_id=user.id).order_by(
+        UserNotification.id.desc()).limit(100).all()
+    return jsonify(
+        unread=sum(1 for item in items if not item.read_at),
+        items=[{
+            "id": item.id,
+            "kind": item.kind,
+            "text": item.text,
+            "read": bool(item.read_at),
+            "created_at": normalize_dt(item.created_at).isoformat(),
+        } for item in items],
+    )
+
+
+@app.post("/api/notifications/read")
+@login_required
+def read_notifications():
+    UserNotification.query.filter_by(user_id=current_user().id, read_at=None).update(
+        {"read_at": utcnow()}, synchronize_session=False)
+    db.session.commit()
+    return jsonify(ok=True)
 
 
 @app.post("/api/meetings")
@@ -1385,6 +1538,7 @@ def room_payload(meeting, user):
             events.append(event)
     events.reverse()
     feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id).order_by(MeetingFeedback.id).all()
+    thanks = MeetingThanks.query.filter_by(meeting_id=meeting.id).all()
     member_ids = accepted_user_ids(meeting)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
     photos_revealed = bool(member_ids) and member_ids.issubset(consented_ids)
@@ -1401,20 +1555,35 @@ def room_payload(meeting, user):
             "picture": decrypt_selfie(selfie.image) if photo_visible else None,
             "photo_visible": photo_visible, "photo_visibility": visibility,
             "photo_consented": uid in consented_ids,
+            "trust": trust_payload(uid),
+            "thanked_by_me": any(row.giver_id == user.id and row.receiver_id == uid for row in thanks),
         })
     my_late = any(event.kind == "late" and event.user_id == user.id for event in events)
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
                          "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active",
                          "my_late": my_late},
-            "places": [{"id": p.id, "title": p.title, "votes": vote_counts.get(p.id, 0),
-                        "voted": p.id in my_votes, "confirmed": bool(p.confirmed)} for p in places],
+            "places": [{
+                "id": p.id,
+                "title": p.title,
+                "votes": vote_counts.get(p.id, 0),
+                "voted": p.id in my_votes,
+                "confirmed": bool(p.confirmed),
+                "latitude": location.latitude if (location := MeetingPlaceLocation.query.filter_by(
+                    place_id=p.id).first()) else None,
+                "longitude": location.longitude if location else None,
+                "map_url": (
+                    f"https://www.openstreetmap.org/?mlat={location.latitude:.6f}"
+                    f"&mlon={location.longitude:.6f}#map=17/{location.latitude:.6f}/{location.longitude:.6f}"
+                ) if location else None,
+            } for p in places],
             "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
                           "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
                          for m in messages],
             "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
                         "note": e.note or ""} for e in events],
             "traces": [{"name": db.session.get(User, f.user_id).name, "text": f.trace} for f in feedback],
+            "thanks": [{"giver_id": row.giver_id, "receiver_id": row.receiver_id} for row in thanks],
             "participants": participant_payload,
             "photos_revealed": photos_revealed,
             "my_photo_consent": user.id in consented_ids,
@@ -1451,9 +1620,64 @@ def propose_place(meeting_id):
     title = str(json_body().get("title", "")).strip()[:120]
     if len(title) < 2:
         return jsonify(error="Укажите место встречи"), 400
-    db.session.add(MeetingPlace(meeting_id=meeting.id, user_id=current_user().id, title=title))
+    latitude = json_body().get("latitude")
+    longitude = json_body().get("longitude")
+    has_coordinates = latitude is not None or longitude is not None
+    if has_coordinates and not valid_coordinates(latitude, longitude):
+        return jsonify(error="Некорректная точка на карте"), 400
+    place = MeetingPlace(meeting_id=meeting.id, user_id=current_user().id, title=title)
+    db.session.add(place)
+    db.session.flush()
+    if has_coordinates:
+        db.session.add(MeetingPlaceLocation(
+            place_id=place.id, latitude=float(latitude), longitude=float(longitude), source="map",
+        ))
     db.session.commit()
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
+
+
+@app.post("/api/geocode/reverse")
+@login_required
+def reverse_geocode():
+    data = json_body()
+    if not valid_coordinates(data.get("latitude"), data.get("longitude")):
+        return jsonify(error="Некорректная точка на карте"), 400
+    if not consume_action(current_user().id, "geocode", 30, 3600):
+        return jsonify(error="Слишком много запросов к карте. Попробуйте позже"), 429
+    latitude, longitude = float(data["latitude"]), float(data["longitude"])
+    coordinate_key = f"{latitude:.5f},{longitude:.5f}"
+    cached = GeocodeCache.query.filter_by(coordinate_key=coordinate_key).first()
+    if cached:
+        return jsonify(title=cached.title, latitude=latitude, longitude=longitude)
+    title = "Точка на карте"
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": latitude, "lon": longitude, "format": "jsonv2", "accept-language": "ru"},
+            headers={"User-Agent": f"Sichas-Minsk/0.15 ({PUBLIC_URL}; dudicoffnet@gmail.com)"},
+            timeout=6,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        address = payload.get("address") or {}
+        title = (
+            payload.get("name")
+            or address.get("amenity")
+            or address.get("shop")
+            or address.get("leisure")
+            or address.get("road")
+            or payload.get("display_name")
+            or title
+        )
+        if title == address.get("road"):
+            house_number = address.get("house_number")
+            title = f"{title}, {house_number}" if house_number else title
+    except (requests.RequestException, ValueError):
+        app.logger.warning("Reverse geocoding failed for %s", coordinate_key)
+    title = str(title).strip()[:120] or "Точка на карте"
+    db.session.add(GeocodeCache(coordinate_key=coordinate_key, title=title))
+    db.session.commit()
+    return jsonify(title=title, latitude=latitude, longitude=longitude)
 
 
 @app.post("/api/places/<int:place_id>/vote")
@@ -1572,6 +1796,15 @@ def meeting_lifecycle(meeting_id):
     db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                 kind=action, note=str(data.get("note", "")).strip()[:180] or None))
     db.session.commit()
+    if action in {"cancel", "complete", "late", "no_show"}:
+        action_text = {
+            "cancel": "Встреча отменена создателем",
+            "complete": "Встреча завершена — можно оставить благодарность и короткий след",
+            "late": f"{user.name} сообщает, что опаздывает",
+            "no_show": "По встрече отмечена неявка участника",
+        }[action]
+        for member_id in accepted_user_ids(meeting) - {user.id}:
+            notify_user(member_id, f"{action_text}: «{meeting.description}»", kind=f"meeting_{action}")
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
@@ -1595,6 +1828,35 @@ def leave_feedback(meeting_id):
         feedback.trace = trace
     db.session.commit()
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
+
+
+@app.post("/api/meetings/<int:meeting_id>/thanks")
+@login_required
+def thank_participant(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if not state or state.status != "completed":
+        return jsonify(error="Поблагодарить можно после завершения встречи"), 409
+    user = current_user()
+    try:
+        receiver_id = int(json_body().get("target_user_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="Укажите участника"), 400
+    if receiver_id == user.id or receiver_id not in accepted_user_ids(meeting):
+        return jsonify(error="Некорректный участник"), 400
+    thanks = MeetingThanks.query.filter_by(
+        meeting_id=meeting.id, giver_id=user.id, receiver_id=receiver_id).first()
+    if not thanks:
+        db.session.add(MeetingThanks(
+            meeting_id=meeting.id, giver_id=user.id, receiver_id=receiver_id,
+        ))
+        db.session.commit()
+        notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
+                    kind="thanks",
+                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}")
+    return jsonify(ok=True, room=room_payload(meeting, user))
 
 
 @app.post("/api/meetings/<int:meeting_id>/report")
@@ -1689,7 +1951,9 @@ def list_invitations():
     account = invite_account(user.id)
     db.session.commit()
     items = Invitation.query.filter_by(inviter_id=user.id).order_by(Invitation.id.desc()).all()
-    return jsonify(available=account.available,
+    rewarded = Invitation.query.filter_by(inviter_id=user.id, status="rewarded").count()
+    return jsonify(available=account.available, rewarded=rewarded,
+                   develops_club=rewarded > 0,
                    items=[{"url": f"https://t.me/{BOT_USERNAME}?startapp=invite_{item.token}",
                            "status": item.status} for item in items])
 
@@ -1742,6 +2006,9 @@ with app.app_context():
         db.session.commit()
         app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
                         len(legacy_selfies), cleared_phones)
+
+if BOT_TOKEN and os.getenv("DATABASE_URL"):
+    threading.Thread(target=presence_reminder_loop, name="presence-reminders", daemon=True).start()
 
 
 if __name__ == "__main__":
