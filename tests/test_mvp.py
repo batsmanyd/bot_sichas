@@ -386,8 +386,81 @@ class MvpFlowTest(unittest.TestCase):
         invitations = self.first.get("/api/invitations").get_json()
         self.assertEqual(invitations["available"], 3)
         self.assertEqual(invitations["items"][0]["status"], "rewarded")
+        self.assertTrue(invitations["develops_club"])
+        self.assertEqual(invitations["rewarded"], 1)
         response = self.first.post("/api/meetings", json={"category": "walk", "description": ""})
         self.assertEqual(response.status_code, 400)
+
+    def test_presence_stays_open_and_creates_one_hour_reminder(self):
+        self.login(self.first, 101)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        opened = self.first.post("/api/presence", json={**point, "category": "cafe"})
+        self.assertEqual(opened.status_code, 200, opened.get_json())
+        self.assertIsNone(opened.get_json()["active_until"])
+        presence = main.Presence.query.one()
+        self.assertGreater(
+            main.normalize_dt(presence.active_until),
+            main.utcnow() + timedelta(days=3000),
+        )
+        presence.updated_at = main.utcnow() - timedelta(minutes=61)
+        main.db.session.commit()
+        main.process_presence_reminders()
+        main.process_presence_reminders()
+        self.assertEqual(main.UserNotification.query.filter_by(kind="presence_reminder").count(), 1)
+        state = self.first.get("/api/presence").get_json()
+        self.assertTrue(state["active"])
+        self.assertIsNone(state["active_until"])
+
+    def test_place_is_saved_as_map_object(self):
+        self.login(self.first, 102)
+        self.login(self.second, 103)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        created = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе или чай", "format": "one",
+        })
+        meeting_id = created.get_json()["id"]
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/interest", json={}).status_code, 200)
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.assertEqual(self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        ).status_code, 200)
+        response = self.second.post(f"/api/meetings/{meeting_id}/places", json={
+            "title": "Кафе у парка", "latitude": 53.9031, "longitude": 27.5627,
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        place = response.get_json()["room"]["places"][0]
+        self.assertEqual(place["latitude"], 53.9031)
+        self.assertEqual(place["longitude"], 27.5627)
+        self.assertIn("openstreetmap.org", place["map_url"])
+        self.assertEqual(main.MeetingPlaceLocation.query.count(), 1)
+
+    def test_thanks_no_show_trust_and_notification_history(self):
+        self.login(self.first, 104)
+        self.login(self.second, 105)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Прогуляться вместе", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        second_user = main.User.query.filter_by(telegram_id="test-105").one()
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "no_show", "target_user_id": second_user.id,
+        })
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        thanked = self.first.post(f"/api/meetings/{meeting_id}/thanks", json={
+            "target_user_id": second_user.id,
+        })
+        self.assertEqual(thanked.status_code, 200, thanked.get_json())
+        trust = main.trust_payload(second_user.id)
+        self.assertEqual(trust["completed_meetings"], 1)
+        self.assertEqual(trust["thanks"], 1)
+        self.assertEqual(trust["no_shows"], 1)
+        notifications = self.second.get("/api/notifications").get_json()
+        self.assertGreaterEqual(notifications["unread"], 1)
+        self.assertEqual(self.second.post("/api/notifications/read", json={}).status_code, 200)
+        self.assertEqual(self.second.get("/api/notifications").get_json()["unread"], 0)
 
     def test_telegram_mini_app_signature(self):
         original_token = main.BOT_TOKEN
