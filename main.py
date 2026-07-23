@@ -59,6 +59,8 @@ app.config.update(
 )
 device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-device-auth-v1")
 DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
+GEOCODE_LOCK = threading.Lock()
+last_geocode_request_at = 0.0
 
 
 engine_options = {"pool_pre_ping": True}
@@ -1639,6 +1641,7 @@ def propose_place(meeting_id):
 @app.post("/api/geocode/reverse")
 @login_required
 def reverse_geocode():
+    global last_geocode_request_at
     data = json_body()
     if not valid_coordinates(data.get("latitude"), data.get("longitude")):
         return jsonify(error="Некорректная точка на карте"), 400
@@ -1651,12 +1654,17 @@ def reverse_geocode():
         return jsonify(title=cached.title, latitude=latitude, longitude=longitude)
     title = "Точка на карте"
     try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"lat": latitude, "lon": longitude, "format": "jsonv2", "accept-language": "ru"},
-            headers={"User-Agent": f"Sichas-Minsk/0.15 ({PUBLIC_URL}; dudicoffnet@gmail.com)"},
-            timeout=6,
-        )
+        with GEOCODE_LOCK:
+            wait_seconds = 1.05 - (time.monotonic() - last_geocode_request_at)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": latitude, "lon": longitude, "format": "jsonv2", "accept-language": "ru"},
+                headers={"User-Agent": f"Sichas-Minsk/0.15 ({PUBLIC_URL}; dudicoffnet@gmail.com)"},
+                timeout=6,
+            )
+            last_geocode_request_at = time.monotonic()
         response.raise_for_status()
         payload = response.json()
         address = payload.get("address") or {}
