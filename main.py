@@ -1297,16 +1297,29 @@ def interest_payload(interest, viewer):
 @login_required
 def list_interests():
     user = current_user()
-    active_meeting_ids = [row.id for row in Meeting.query.filter(Meeting.expires_at > utcnow()).all()]
-    owned_meeting_ids = [row.id for row in Meeting.query.filter(
-        Meeting.owner_id == user.id, Meeting.id.in_(active_meeting_ids)
-    ).all()] if active_meeting_ids else []
+    active_meetings = Meeting.query.filter(Meeting.expires_at > utcnow()).all()
+    active_meeting_ids = [row.id for row in active_meetings]
+    owned_meetings = [row for row in active_meetings if row.owner_id == user.id]
+    owned_meeting_ids = [row.id for row in owned_meetings]
     incoming = (Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all()
                 if owned_meeting_ids else [])
     outgoing = (Interest.query.filter(Interest.user_id == user.id,
                                       Interest.meeting_id.in_(active_meeting_ids)).all()
                 if active_meeting_ids else [])
     return jsonify(
+        owned=[{
+            "meeting_id": meeting.id,
+            "description": meeting.description,
+            "category": meeting.category,
+            "format": meeting.format,
+            "status": "owned",
+            "accepted_count": Interest.query.filter_by(
+                meeting_id=meeting.id, status="accepted"
+            ).count(),
+            "pending_count": Interest.query.filter_by(
+                meeting_id=meeting.id, status="pending"
+            ).count(),
+        } for meeting in owned_meetings],
         incoming=[interest_payload(item, user) for item in incoming],
         outgoing=[interest_payload(item, user) for item in outgoing],
     )
@@ -1342,7 +1355,7 @@ def decide_interest(interest_id):
 
 def meeting_member(meeting, user):
     if meeting.owner_id == user.id:
-        return Interest.query.filter_by(meeting_id=meeting.id, status="accepted").first() is not None
+        return True
     return Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id, status="accepted").first() is not None
 
 
