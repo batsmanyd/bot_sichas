@@ -482,6 +482,14 @@ class MvpFlowTest(unittest.TestCase):
             self.first.get(f"/api/meetings/{meeting_id}/room").get_json()["messages"][0]["text"],
             "Я уже иду",
         )
+        owner_interests = self.first.get("/api/interests").get_json()
+        guest_interests = self.second.get("/api/interests").get_json()
+        self.assertEqual(owner_interests["owned"][0]["latest_message"]["text"], "Я уже иду")
+        self.assertFalse(owner_interests["owned"][0]["latest_message"]["mine"])
+        self.assertEqual(guest_interests["outgoing"][0]["latest_message"]["text"], "Я уже иду")
+        self.assertTrue(guest_interests["outgoing"][0]["latest_message"]["mine"])
+        self.assertEqual(owner_interests["owned"][0]["people"], ["Тест 109"])
+        self.assertEqual(guest_interests["outgoing"][0]["people"], ["Тест 108"])
 
     def test_thanks_no_show_trust_and_notification_history(self):
         self.login(self.first, 104)
@@ -638,6 +646,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("reportParticipant", frontend)
         self.assertIn("activeRoom&&$('roomDialog').open?2500", frontend)
         self.assertIn("scheduleLiveRefresh()", frontend)
+        self.assertIn("groupedMeetings(items)", frontend)
+        self.assertIn("cache:'no-store'", frontend)
+        self.assertIn("await loadInterests(true)", frontend)
+        self.assertIn("0.16.1 · одна карточка встречи", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
