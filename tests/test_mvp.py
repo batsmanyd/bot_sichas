@@ -434,6 +434,55 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("openstreetmap.org", place["map_url"])
         self.assertEqual(main.MeetingPlaceLocation.query.count(), 1)
 
+    def test_place_deduplicates_auto_confirms_and_chat_stays_in_app(self):
+        self.login(self.first, 108)
+        self.login(self.second, 109)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+
+        proposed = self.second.post(f"/api/meetings/{meeting_id}/places", json={
+            "title": "Кафе у парка", "latitude": 53.9031, "longitude": 27.5627,
+        })
+        self.assertEqual(proposed.status_code, 201, proposed.get_json())
+        place_id = proposed.get_json()["room"]["places"][0]["id"]
+        self.assertEqual(proposed.get_json()["room"]["places"][0]["votes"], 1)
+
+        agreed = self.first.post(f"/api/meetings/{meeting_id}/places", json={
+            "title": "Та же точка", "latitude": 53.90311, "longitude": 27.56271,
+        })
+        self.assertEqual(agreed.status_code, 200, agreed.get_json())
+        self.assertTrue(agreed.get_json()["already_exists"])
+        self.assertEqual(main.MeetingPlace.query.count(), 1)
+        self.assertEqual(main.PlaceVote.query.filter_by(place_id=place_id).count(), 2)
+        self.assertTrue(agreed.get_json()["room"]["places"][0]["confirmed"])
+
+        owner_feed = self.first.get(
+            "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe&time=now"
+        ).get_json()
+        guest_feed = self.second.get(
+            "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe&time=now"
+        ).get_json()
+        self.assertEqual(owner_feed["agreed_places"][0]["meeting_id"], meeting_id)
+        self.assertEqual(guest_feed["agreed_places"][0]["meeting_id"], meeting_id)
+
+        notifications_before_chat = main.UserNotification.query.count()
+        sent = self.second.post(
+            f"/api/meetings/{meeting_id}/messages", json={"text": "Я уже иду"}
+        )
+        self.assertEqual(sent.status_code, 201, sent.get_json())
+        self.assertEqual(main.UserNotification.query.count(), notifications_before_chat)
+        self.assertEqual(
+            self.first.get(f"/api/meetings/{meeting_id}/room").get_json()["messages"][0]["text"],
+            "Я уже иду",
+        )
+
     def test_thanks_no_show_trust_and_notification_history(self):
         self.login(self.first, 104)
         self.login(self.second, 105)
@@ -587,7 +636,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("if(tg?.initData&&(!data.authenticated||mustPassHandoff))", frontend)
         self.assertIn("data-presence", frontend)
         self.assertIn("reportParticipant", frontend)
-        self.assertIn("setInterval(refreshLiveData,15000)", frontend)
+        self.assertIn("activeRoom&&$('roomDialog').open?2500", frontend)
+        self.assertIn("scheduleLiveRefresh()", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
@@ -600,6 +650,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("maximum-scale=1,user-scalable=no", frontend)
         self.assertIn("syncVisualViewport", frontend)
         self.assertIn("meetings.filter(item=>!item.mine)", frontend)
+        self.assertIn("agreedPlaces.map", frontend)
+        self.assertIn("Место согласовано ✓", frontend)
         self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
         self.assertIn("placePickerMap=L.map('placePickerMap',{zoomControl:true});placePickerMap.attributionControl.setPrefix(false)", frontend)
         self.assertIn("Ваша активная встреча", frontend)
