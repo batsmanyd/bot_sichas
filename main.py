@@ -1449,7 +1449,6 @@ def express_interest(meeting_id):
 def interest_payload(interest, viewer):
     meeting = db.session.get(Meeting, interest.meeting_id)
     participant = db.session.get(User, interest.user_id)
-    accepted = interest.status == "accepted"
     return {
         "id": interest.id,
         "meeting_id": meeting.id,
@@ -1469,6 +1468,34 @@ def interest_payload(interest, viewer):
             "username": None,
         },
         "can_decide": viewer.id == meeting.owner_id and interest.status == "pending",
+        **meeting_list_summary(meeting, viewer),
+    }
+
+
+def meeting_list_summary(meeting, viewer):
+    """Return one shared summary for every representation of the same meeting."""
+    member_ids = {meeting.owner_id}
+    member_ids.update(row.user_id for row in Interest.query.filter_by(
+        meeting_id=meeting.id, status="accepted"
+    ).all())
+    people = []
+    for user_id in sorted(member_ids):
+        if user_id == viewer.id:
+            continue
+        person = db.session.get(User, user_id)
+        if person and person.name not in people:
+            people.append(person.name)
+    latest = (ChatMessage.query.filter_by(meeting_id=meeting.id)
+              .order_by(ChatMessage.id.desc()).first())
+    return {
+        "people": people,
+        "latest_message": {
+            "id": latest.id,
+            "name": db.session.get(User, latest.user_id).name,
+            "text": latest.text,
+            "mine": latest.user_id == viewer.id,
+            "created_at": normalize_dt(latest.created_at).isoformat(),
+        } if latest else None,
     }
 
 
@@ -1498,6 +1525,7 @@ def list_interests():
             "pending_count": Interest.query.filter_by(
                 meeting_id=meeting.id, status="pending"
             ).count(),
+            **meeting_list_summary(meeting, user),
         } for meeting in owned_meetings],
         incoming=[interest_payload(item, user) for item in incoming],
         outgoing=[interest_payload(item, user) for item in outgoing],
