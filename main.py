@@ -1120,6 +1120,7 @@ def feed():
     time_mode = request.args.get("time", "now")
     now = utcnow()
     result = []
+    agreed_places = []
     blocked_ids = set()
     if user:
         blocked_ids = {b.blocked_id for b in UserBlock.query.filter_by(blocker_id=user.id).all()}
@@ -1205,6 +1206,29 @@ def feed():
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
                 "trust": trust,
             })
+    if user:
+        for meeting in Meeting.query.filter(Meeting.expires_at > now).all():
+            if not meeting_member(meeting, user):
+                continue
+            state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+            if state and state.status != "active":
+                continue
+            confirmed = MeetingPlace.query.filter_by(
+                meeting_id=meeting.id, confirmed=1
+            ).order_by(MeetingPlace.id.desc()).first()
+            if not confirmed:
+                continue
+            location = MeetingPlaceLocation.query.filter_by(place_id=confirmed.id).first()
+            if not location:
+                continue
+            agreed_places.append({
+                "meeting_id": meeting.id,
+                "title": confirmed.title,
+                "description": meeting.description,
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+            })
+
     unique_people = {}
     for item in result:
         owner_id = item.pop("_owner_id")
@@ -1215,7 +1239,7 @@ def feed():
             unique_people[owner_id] = item
     result = list(unique_people.values())
     result.sort(key=lambda item: item["distance_km"])
-    return jsonify(items=result)
+    return jsonify(items=result, agreed_places=agreed_places)
 
 
 @app.post("/api/location")
@@ -1627,6 +1651,34 @@ def propose_place(meeting_id):
     has_coordinates = latitude is not None or longitude is not None
     if has_coordinates and not valid_coordinates(latitude, longitude):
         return jsonify(error="Некорректная точка на карте"), 400
+    existing_place = None
+    for candidate in MeetingPlace.query.filter_by(meeting_id=meeting.id).all():
+        candidate_location = MeetingPlaceLocation.query.filter_by(place_id=candidate.id).first()
+        same_title = candidate.title.strip().casefold() == title.casefold()
+        same_point = bool(
+            has_coordinates and candidate_location
+            and haversine_km(
+                float(latitude), float(longitude),
+                candidate_location.latitude, candidate_location.longitude,
+            ) <= 0.03
+        )
+        if same_title or same_point:
+            existing_place = candidate
+            break
+    if existing_place:
+        if not PlaceVote.query.filter_by(
+            place_id=existing_place.id, user_id=current_user().id
+        ).first():
+            db.session.add(PlaceVote(
+                place_id=existing_place.id, user_id=current_user().id
+            ))
+            db.session.commit()
+            maybe_confirm_place(meeting, existing_place)
+        return jsonify(
+            ok=True, already_exists=True,
+            room=room_payload(meeting, current_user()),
+        )
+
     place = MeetingPlace(meeting_id=meeting.id, user_id=current_user().id, title=title)
     db.session.add(place)
     db.session.flush()
@@ -1634,7 +1686,9 @@ def propose_place(meeting_id):
         db.session.add(MeetingPlaceLocation(
             place_id=place.id, latitude=float(latitude), longitude=float(longitude), source="map",
         ))
+    db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
     db.session.commit()
+    maybe_confirm_place(meeting, place)
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
@@ -1696,9 +1750,39 @@ def vote_place(place_id):
     if error:
         return error
     vote = PlaceVote.query.filter_by(place_id=place.id, user_id=current_user().id).first()
-    db.session.delete(vote) if vote else db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    if vote:
+        if place.confirmed:
+            return jsonify(error="Место уже согласовано всеми участниками"), 409
+        db.session.delete(vote)
+    else:
+        db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
     db.session.commit()
+    if not vote:
+        maybe_confirm_place(meeting, place)
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
+
+
+def maybe_confirm_place(meeting, place, force=False):
+    member_ids = accepted_user_ids(meeting)
+    vote_count = PlaceVote.query.filter_by(place_id=place.id).count()
+    should_confirm = force or (
+        meeting.format == "one" and len(member_ids) == 2 and vote_count >= 2
+    )
+    if not should_confirm or place.confirmed:
+        return False
+    MeetingPlace.query.filter_by(meeting_id=meeting.id).update(
+        {"confirmed": 0}, synchronize_session=False
+    )
+    place.confirmed = 1
+    db.session.commit()
+    for member_id in member_ids:
+        notify_user(
+            member_id,
+            f"Место встречи согласовано: {place.title}",
+            kind="place_confirmed",
+            dedupe_key=f"place-confirmed-{meeting.id}-{place.id}-{member_id}",
+        )
+    return True
 
 
 @app.post("/api/places/<int:place_id>/confirm")
@@ -1708,9 +1792,7 @@ def confirm_place(place_id):
     meeting = db.session.get(Meeting, place.meeting_id)
     if meeting.owner_id != current_user().id:
         return jsonify(error="Место подтверждает создатель встречи"), 403
-    MeetingPlace.query.filter_by(meeting_id=meeting.id).update({"confirmed": 0})
-    place.confirmed = 1
-    db.session.commit()
+    maybe_confirm_place(meeting, place, force=True)
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
 
 
@@ -1727,8 +1809,6 @@ def send_message(meeting_id):
         return jsonify(error="Напишите сообщение"), 400
     db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
     db.session.commit()
-    for member_id in accepted_user_ids(meeting) - {current_user().id}:
-        notify_user(member_id, f"{current_user().name}: {text[:120]}")
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
@@ -1743,6 +1823,58 @@ def state_for(meeting):
 def accepted_user_ids(meeting):
     return {meeting.owner_id} | {i.user_id for i in Interest.query.filter_by(
         meeting_id=meeting.id, status="accepted").all()}
+
+
+def deduplicate_meeting_places():
+    changed = False
+    for meeting in Meeting.query.all():
+        canonical_places = []
+        for place in MeetingPlace.query.filter_by(meeting_id=meeting.id).order_by(
+            MeetingPlace.id
+        ).all():
+            location = MeetingPlaceLocation.query.filter_by(place_id=place.id).first()
+            canonical = None
+            for candidate, candidate_location in canonical_places:
+                same_title = candidate.title.strip().casefold() == place.title.strip().casefold()
+                same_point = bool(
+                    location and candidate_location
+                    and haversine_km(
+                        location.latitude, location.longitude,
+                        candidate_location.latitude, candidate_location.longitude,
+                    ) <= 0.03
+                )
+                if same_title or same_point:
+                    canonical = candidate
+                    break
+            if not canonical:
+                canonical_places.append((place, location))
+                continue
+            existing_voters = {
+                vote.user_id for vote in PlaceVote.query.filter_by(place_id=canonical.id).all()
+            }
+            for vote in PlaceVote.query.filter_by(place_id=place.id).all():
+                if vote.user_id in existing_voters:
+                    db.session.delete(vote)
+                else:
+                    vote.place_id = canonical.id
+                    existing_voters.add(vote.user_id)
+            if place.confirmed:
+                canonical.confirmed = 1
+            if location:
+                db.session.delete(location)
+            db.session.delete(place)
+            changed = True
+        if meeting.format == "one" and len(accepted_user_ids(meeting)) == 2:
+            for place, _location in canonical_places:
+                if PlaceVote.query.filter_by(place_id=place.id).count() >= 2:
+                    MeetingPlace.query.filter_by(meeting_id=meeting.id).update(
+                        {"confirmed": 0}, synchronize_session=False
+                    )
+                    place.confirmed = 1
+                    changed = True
+                    break
+    if changed:
+        db.session.commit()
 
 
 @app.post("/api/meetings/<int:meeting_id>/lifecycle")
@@ -2004,6 +2136,7 @@ def static_files(path):
 
 with app.app_context():
     db.create_all()
+    deduplicate_meeting_places()
     cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
         {"phone_number": None}, synchronize_session=False
     )
