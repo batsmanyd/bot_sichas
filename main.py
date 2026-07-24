@@ -1553,6 +1553,14 @@ def room_payload(meeting, user):
         vote_counts[vote.place_id] = vote_counts.get(vote.place_id, 0) + 1
         if vote.user_id == user.id:
             my_votes.add(vote.place_id)
+    if meeting.format == "one" and len(accepted_user_ids(meeting)) == 2:
+        agreed = next((place for place in places if vote_counts.get(place.id, 0) >= 2), None)
+        if agreed and not agreed.confirmed:
+            MeetingPlace.query.filter_by(meeting_id=meeting.id).update(
+                {"confirmed": 0}, synchronize_session=False
+            )
+            agreed.confirmed = 1
+            db.session.commit()
     messages = ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     raw_events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id.desc()).all()
@@ -1825,58 +1833,6 @@ def accepted_user_ids(meeting):
         meeting_id=meeting.id, status="accepted").all()}
 
 
-def deduplicate_meeting_places():
-    changed = False
-    for meeting in Meeting.query.all():
-        canonical_places = []
-        for place in MeetingPlace.query.filter_by(meeting_id=meeting.id).order_by(
-            MeetingPlace.id
-        ).all():
-            location = MeetingPlaceLocation.query.filter_by(place_id=place.id).first()
-            canonical = None
-            for candidate, candidate_location in canonical_places:
-                same_title = candidate.title.strip().casefold() == place.title.strip().casefold()
-                same_point = bool(
-                    location and candidate_location
-                    and haversine_km(
-                        location.latitude, location.longitude,
-                        candidate_location.latitude, candidate_location.longitude,
-                    ) <= 0.03
-                )
-                if same_title or same_point:
-                    canonical = candidate
-                    break
-            if not canonical:
-                canonical_places.append((place, location))
-                continue
-            existing_voters = {
-                vote.user_id for vote in PlaceVote.query.filter_by(place_id=canonical.id).all()
-            }
-            for vote in PlaceVote.query.filter_by(place_id=place.id).all():
-                if vote.user_id in existing_voters:
-                    db.session.delete(vote)
-                else:
-                    vote.place_id = canonical.id
-                    existing_voters.add(vote.user_id)
-            if place.confirmed:
-                canonical.confirmed = 1
-            if location:
-                db.session.delete(location)
-            db.session.delete(place)
-            changed = True
-        if meeting.format == "one" and len(accepted_user_ids(meeting)) == 2:
-            for place, _location in canonical_places:
-                if PlaceVote.query.filter_by(place_id=place.id).count() >= 2:
-                    MeetingPlace.query.filter_by(meeting_id=meeting.id).update(
-                        {"confirmed": 0}, synchronize_session=False
-                    )
-                    place.confirmed = 1
-                    changed = True
-                    break
-    if changed:
-        db.session.commit()
-
-
 @app.post("/api/meetings/<int:meeting_id>/lifecycle")
 @login_required
 def meeting_lifecycle(meeting_id):
@@ -2136,7 +2092,6 @@ def static_files(path):
 
 with app.app_context():
     db.create_all()
-    deduplicate_meeting_places()
     cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
         {"phone_number": None}, synchronize_session=False
     )
