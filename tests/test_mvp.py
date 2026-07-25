@@ -118,9 +118,15 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "no_show", "target_user_id": second_user.id,
         }).status_code, 200)
-        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+        pending_completion = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
-        }).status_code, 403)
+        })
+        self.assertEqual(pending_completion.status_code, 200)
+        self.assertEqual(pending_completion.get_json()["room"]["meeting"]["status"], "active")
+        self.assertTrue(pending_completion.get_json()["room"]["meeting"]["my_completion_confirmed"])
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
+            "trace": "Пока рано",
+        }).status_code, 409)
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
         }).status_code, 200)
@@ -178,6 +184,10 @@ class MvpFlowTest(unittest.TestCase):
             f"/api/interests/{incoming[0]['id']}/decision", json={"decision": "accepted"}
         )
         self.assertEqual(accepted.status_code, 200, accepted.get_json())
+        self.assertFalse(self.first.get("/api/presence").get_json()["active"])
+        reopened = self.first.post("/api/presence", json={**point, "category": "cafe"})
+        self.assertEqual(reopened.status_code, 200, reopened.get_json())
+        self.assertTrue(self.first.get("/api/presence").get_json()["active"])
         self.assertIsNone(accepted.get_json()["interest"]["participant"]["username"])
         self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 200)
         left = self.second.post(
@@ -383,6 +393,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
         }).status_code, 200)
+        self.assertEqual(self.third.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "complete",
+        }).status_code, 200)
         invitations = self.first.get("/api/invitations").get_json()
         self.assertEqual(invitations["available"], 3)
         self.assertEqual(invitations["items"][0]["status"], "rewarded")
@@ -506,6 +519,10 @@ class MvpFlowTest(unittest.TestCase):
             "action": "no_show", "target_user_id": second_user.id,
         })
         self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        pending_trust = main.trust_payload(second_user.id)
+        self.assertEqual(pending_trust["completed_meetings"], 0)
+        self.assertEqual(pending_trust["level"], "Есть замечания")
+        self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
         thanked = self.first.post(f"/api/meetings/{meeting_id}/thanks", json={
             "target_user_id": second_user.id,
         })
@@ -649,7 +666,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.16.1 · одна карточка встречи", frontend)
+        self.assertIn("0.17.0 · отдельное пространство встречи", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
