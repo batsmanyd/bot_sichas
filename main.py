@@ -481,9 +481,33 @@ def reward_completed_invites(member_ids):
         invitation.status = "rewarded"
 
 
+def completed_by_all(meeting):
+    member_ids = accepted_user_ids(meeting)
+    if len(member_ids) < 2:
+        return False
+    confirmed_ids = {
+        row.user_id for row in MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, kind="complete"
+        ).all()
+    }
+    return member_ids.issubset(confirmed_ids)
+
+
+def effective_meeting_status(meeting):
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if not state:
+        return "active"
+    if state.status == "completed" and not completed_by_all(meeting):
+        return "active"
+    return state.status
+
+
 def trust_payload(user_id):
     completed_states = MeetingState.query.filter_by(status="completed").all()
-    completed_ids = {state.meeting_id for state in completed_states}
+    completed_ids = {
+        state.meeting_id for state in completed_states
+        if (meeting := db.session.get(Meeting, state.meeting_id)) and completed_by_all(meeting)
+    }
     completed = 0
     for meeting_id in completed_ids:
         meeting = db.session.get(Meeting, meeting_id)
@@ -495,14 +519,14 @@ def trust_payload(user_id):
     thanks = MeetingThanks.query.filter_by(receiver_id=user_id).count()
     no_shows = MeetingEvent.query.filter_by(target_user_id=user_id, kind="no_show").count()
     score = max(20, min(100, 70 + min(completed * 4, 20) + min(thanks * 3, 15) - min(no_shows * 15, 45)))
-    if completed == 0 and thanks == 0 and no_shows == 0:
+    if completed < 3 and no_shows == 0:
         level = "Новый участник"
-    elif score >= 90:
+    elif completed >= 8 and thanks >= 3 and no_shows == 0:
         level = "Высокое доверие"
-    elif score >= 70:
+    elif completed >= 3 and no_shows == 0:
         level = "Надёжный участник"
     else:
-        level = "Требует внимания"
+        level = "Есть замечания"
     develops_club = Invitation.query.filter_by(inviter_id=user_id, status="rewarded").count() > 0
     return {
         "score": score,
@@ -542,14 +566,14 @@ def safe_point(lat, lon, identifier):
     return round(lat + lat_offset, 4), round(lon + lon_offset, 4)
 
 
-def notify_user(user_id, text, kind="info", dedupe_key=None):
+def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
     if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
         return False
     db.session.add(UserNotification(
         user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
     ))
     db.session.commit()
-    if not BOT_TOKEN:
+    if not telegram or not BOT_TOKEN:
         return True
     user = db.session.get(User, user_id)
     if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
@@ -572,6 +596,7 @@ def process_presence_reminders():
             "Вы всё ещё открыты для общения. Оставить статус включённым или выключить его в приложении?",
             kind="presence_reminder",
             dedupe_key=f"presence-reminder:{presence.id}:{started}",
+            telegram=True,
         )
 
 
@@ -1291,7 +1316,21 @@ def stop_presence():
 @app.get("/api/presence")
 @login_required
 def get_presence():
-    presence = Presence.query.filter_by(user_id=current_user().id).first()
+    user = current_user()
+    presence = Presence.query.filter_by(user_id=user.id).first()
+    if presence and normalize_dt(presence.active_until) > utcnow():
+        accepted_rows = []
+        for interest in Interest.query.filter_by(status="accepted").all():
+            meeting = db.session.get(Meeting, interest.meeting_id)
+            if meeting and effective_meeting_status(meeting) == "active" and (
+                meeting.owner_id == user.id or interest.user_id == user.id
+            ):
+                accepted_rows.append(interest)
+        if accepted_rows and normalize_dt(presence.updated_at) <= max(
+            normalize_dt(row.created_at) for row in accepted_rows
+        ):
+            presence.active_until = utcnow()
+            db.session.commit()
     active = bool(presence and normalize_dt(presence.active_until) > utcnow())
     return jsonify(active=active, category=presence.category if active else None,
                    active_until=None,
@@ -1414,8 +1453,11 @@ def propose_meeting_to_presence(presence_id):
     db.session.flush()
     db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
     db.session.commit()
-    notify_user(presence.user_id,
-                f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}")
+    notify_user(
+        presence.user_id,
+        f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}",
+        telegram=True,
+    )
     return jsonify(ok=True, meeting_id=meeting.id, already_sent=False), 201
 
 
@@ -1442,7 +1484,11 @@ def express_interest(meeting_id):
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
         db.session.commit()
-        notify_user(meeting.owner_id, f"Новый отклик на встречу «{meeting.description}» от {user.name}")
+        notify_user(
+            meeting.owner_id,
+            f"Новый отклик на встречу «{meeting.description}» от {user.name}",
+            telegram=True,
+        )
     return jsonify(ok=True)
 
 
@@ -1487,8 +1533,12 @@ def meeting_list_summary(meeting, viewer):
             people.append(person.name)
     latest = (ChatMessage.query.filter_by(meeting_id=meeting.id)
               .order_by(ChatMessage.id.desc()).first())
+    confirmed_place = (MeetingPlace.query.filter_by(meeting_id=meeting.id, confirmed=1)
+                       .order_by(MeetingPlace.id.desc()).first())
     return {
         "people": people,
+        "meeting_status": effective_meeting_status(meeting),
+        "confirmed_place": confirmed_place.title if confirmed_place else None,
         "latest_message": {
             "id": latest.id,
             "name": db.session.get(User, latest.user_id).name,
@@ -1503,15 +1553,31 @@ def meeting_list_summary(meeting, viewer):
 @login_required
 def list_interests():
     user = current_user()
-    active_meetings = Meeting.query.filter(Meeting.expires_at > utcnow()).all()
-    active_meeting_ids = [row.id for row in active_meetings]
-    owned_meetings = [row for row in active_meetings if row.owner_id == user.id]
+    now = utcnow()
+    all_meetings = Meeting.query.order_by(Meeting.id.desc()).all()
+    owned_meetings = []
+    for meeting in all_meetings:
+        if meeting.owner_id != user.id or effective_meeting_status(meeting) == "cancelled":
+            continue
+        has_accepted = Interest.query.filter_by(
+            meeting_id=meeting.id, status="accepted"
+        ).first() is not None
+        if normalize_dt(meeting.expires_at) > now or has_accepted:
+            owned_meetings.append(meeting)
     owned_meeting_ids = [row.id for row in owned_meetings]
-    incoming = (Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all()
-                if owned_meeting_ids else [])
-    outgoing = (Interest.query.filter(Interest.user_id == user.id,
-                                      Interest.meeting_id.in_(active_meeting_ids)).all()
-                if active_meeting_ids else [])
+    incoming = []
+    if owned_meeting_ids:
+        for interest in Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all():
+            meeting = db.session.get(Meeting, interest.meeting_id)
+            if interest.status == "accepted" or normalize_dt(meeting.expires_at) > now:
+                incoming.append(interest)
+    outgoing = []
+    for interest in Interest.query.filter_by(user_id=user.id).all():
+        meeting = db.session.get(Meeting, interest.meeting_id)
+        if not meeting or effective_meeting_status(meeting) == "cancelled":
+            continue
+        if interest.status == "accepted" or normalize_dt(meeting.expires_at) > now:
+            outgoing.append(interest)
     return jsonify(
         owned=[{
             "meeting_id": meeting.id,
@@ -1554,9 +1620,21 @@ def decide_interest(interest_id):
         if accepted_count > 5:
             db.session.rollback()
             return jsonify(error="В группе может быть не больше 6 человек вместе с создателем"), 409
+    if decision == "accepted":
+        state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+        if not state:
+            db.session.add(MeetingState(meeting_id=meeting.id, status="active"))
+        member_ids = {meeting.owner_id, interest.user_id}
+        Presence.query.filter(Presence.user_id.in_(member_ids)).update(
+            {"active_until": utcnow()}, synchronize_session=False
+        )
     db.session.commit()
     result_text = "принят" if decision == "accepted" else "отклонён"
-    notify_user(interest.user_id, f"Ваш отклик на встречу «{meeting.description}» {result_text}")
+    notify_user(
+        interest.user_id,
+        f"Ваш отклик на встречу «{meeting.description}» {result_text}",
+        telegram=True,
+    )
     return jsonify(ok=True, interest=interest_payload(interest, user))
 
 
@@ -1621,10 +1699,17 @@ def room_payload(meeting, user):
             "thanked_by_me": any(row.giver_id == user.id and row.receiver_id == uid for row in thanks),
         })
     my_late = any(event.kind == "late" and event.user_id == user.id for event in events)
+    completion_ids = {
+        event.user_id for event in raw_events if event.kind == "complete"
+    }
+    status = effective_meeting_status(meeting)
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
-                         "is_owner": meeting.owner_id == user.id, "status": state.status if state else "active",
-                         "my_late": my_late},
+                         "is_owner": meeting.owner_id == user.id, "status": status,
+                         "my_late": my_late,
+                         "my_completion_confirmed": user.id in completion_ids,
+                         "completion_confirmed_count": len(completion_ids & member_ids),
+                         "completion_required_count": len(member_ids)},
             "places": [{
                 "id": p.id,
                 "title": p.title,
@@ -1872,10 +1957,13 @@ def meeting_lifecycle(meeting_id):
     if action not in {"late", "cancel", "complete", "no_show", "leave"}:
         return jsonify(error="Неизвестное действие"), 400
     state = state_for(meeting)
+    if state.status == "completed" and not completed_by_all(meeting):
+        state.status = "active"
+        db.session.commit()
     if state.status != "active":
         return jsonify(error="Встреча уже завершена или отменена"), 409
     target_id = data.get("target_user_id")
-    if action in {"cancel", "complete"} and meeting.owner_id != user.id:
+    if action == "cancel" and meeting.owner_id != user.id:
         return jsonify(error="Это действие доступно создателю встречи"), 403
     if action == "leave":
         if meeting.owner_id == user.id:
@@ -1889,7 +1977,11 @@ def meeting_lifecycle(meeting_id):
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
                                     kind="leave", note="Участник отказался от встречи"))
         db.session.commit()
-        notify_user(meeting.owner_id, f"{user.name} отказался от встречи «{meeting.description}»")
+        notify_user(
+            meeting.owner_id,
+            f"{user.name} отказался от встречи «{meeting.description}»",
+            telegram=True,
+        )
         return jsonify(ok=True, left=True)
     if action == "no_show":
         try:
@@ -1902,9 +1994,30 @@ def meeting_lifecycle(meeting_id):
         state.status = "cancelled"
         meeting.expires_at = utcnow()
     elif action == "complete":
-        state.status = "completed"
-        meeting.expires_at = utcnow()
-        reward_completed_invites(accepted_user_ids(meeting))
+        if len(accepted_user_ids(meeting)) < 2:
+            return jsonify(error="Сначала подтвердите участника встречи"), 409
+        existing = MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=user.id, kind="complete"
+        ).first()
+        if not existing:
+            db.session.add(MeetingEvent(
+                meeting_id=meeting.id, user_id=user.id, kind="complete",
+                note="Подтвердил, что встреча состоялась",
+            ))
+            db.session.flush()
+        if completed_by_all(meeting):
+            state.status = "completed"
+            meeting.expires_at = utcnow()
+            reward_completed_invites(accepted_user_ids(meeting))
+        else:
+            state.status = "active"
+            for member_id in accepted_user_ids(meeting) - {user.id}:
+                notify_user(
+                    member_id,
+                    f"{user.name} отметил, что встреча состоялась. Подтвердите результат в приложении.",
+                    kind="meeting_confirmation",
+                    dedupe_key=f"meeting-confirmation:{meeting.id}:{member_id}",
+                )
     elif action == "late":
         existing_late = MeetingEvent.query.filter_by(
             meeting_id=meeting.id, user_id=user.id, kind="late"
@@ -1917,18 +2030,30 @@ def meeting_lifecycle(meeting_id):
     elif action == "no_show":
         MeetingEvent.query.filter_by(meeting_id=meeting.id, user_id=user.id,
                                      target_user_id=target_id, kind="no_show").delete()
-    db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
-                                kind=action, note=str(data.get("note", "")).strip()[:180] or None))
+    if action != "complete":
+        db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
+                                    kind=action, note=str(data.get("note", "")).strip()[:180] or None))
     db.session.commit()
-    if action in {"cancel", "complete", "late", "no_show"}:
+    if action in {"cancel", "late", "no_show"} or (
+        action == "complete" and completed_by_all(meeting)
+    ):
         action_text = {
             "cancel": "Встреча отменена создателем",
-            "complete": "Встреча завершена — можно оставить благодарность и короткий след",
+            "complete": (
+                "Встреча подтверждена обоими участниками"
+                if completed_by_all(meeting)
+                else f"{user.name} ждёт вашего подтверждения встречи"
+            ),
             "late": f"{user.name} сообщает, что опаздывает",
             "no_show": "По встрече отмечена неявка участника",
         }[action]
         for member_id in accepted_user_ids(meeting) - {user.id}:
-            notify_user(member_id, f"{action_text}: «{meeting.description}»", kind=f"meeting_{action}")
+            notify_user(
+                member_id,
+                f"{action_text}: «{meeting.description}»",
+                kind=f"meeting_{action}",
+                telegram=action in {"cancel", "late"},
+            )
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
