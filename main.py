@@ -493,6 +493,68 @@ def completed_by_all(meeting):
     return member_ids.issubset(confirmed_ids)
 
 
+def feedback_rating(feedback):
+    if not feedback:
+        return None
+    match = re.fullmatch(r"rating:([1-5])", feedback.trace or "")
+    return int(match.group(1)) if match else None
+
+
+def meeting_has_report(meeting_id):
+    return UserReport.query.filter_by(meeting_id=meeting_id).first() is not None
+
+
+def chat_cleanup_deadline(meeting):
+    terminal_events = (MeetingEvent.query.filter(
+        MeetingEvent.meeting_id == meeting.id,
+        MeetingEvent.kind.in_(("complete", "leave")),
+    ).order_by(MeetingEvent.created_at).all())
+    dates = [normalize_dt(event.created_at) for event in terminal_events]
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if state and state.status == "cancelled":
+        dates.append(normalize_dt(state.updated_at))
+    return min(dates) + timedelta(hours=24) if dates else None
+
+
+def chat_expired(meeting):
+    deadline = chat_cleanup_deadline(meeting)
+    return bool(deadline and deadline <= utcnow())
+
+
+def chat_closed_for(meeting, user_id):
+    if MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user_id).first():
+        return True
+    if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=user_id).first():
+        return True
+    if MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=user_id, kind="leave"
+    ).first():
+        return True
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    return bool((state and state.status == "cancelled") or chat_expired(meeting))
+
+
+def purge_chat_if_ready(meeting):
+    """Delete chat text, unless a complaint requires evidence for moderation."""
+    if meeting_has_report(meeting.id):
+        return False
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    should_purge = bool(state and state.status == "cancelled")
+    should_purge = should_purge or MeetingEvent.query.filter_by(
+        meeting_id=meeting.id, kind="leave"
+    ).first() is not None
+    member_ids = accepted_user_ids(meeting)
+    rated_ids = {
+        row.user_id for row in MeetingFeedback.query.filter_by(meeting_id=meeting.id).all()
+        if feedback_rating(row) is not None
+    }
+    should_purge = should_purge or (bool(member_ids) and member_ids.issubset(rated_ids))
+    should_purge = should_purge or chat_expired(meeting)
+    if should_purge:
+        ChatMessage.query.filter_by(meeting_id=meeting.id).delete(synchronize_session=False)
+    return should_purge
+
+
 def effective_meeting_status(meeting):
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     if not state:
@@ -1520,6 +1582,7 @@ def interest_payload(interest, viewer):
 
 def meeting_list_summary(meeting, viewer):
     """Return one shared summary for every representation of the same meeting."""
+    purge_chat_if_ready(meeting)
     member_ids = {meeting.owner_id}
     member_ids.update(row.user_id for row in Interest.query.filter_by(
         meeting_id=meeting.id, status="accepted"
@@ -1531,17 +1594,23 @@ def meeting_list_summary(meeting, viewer):
         person = db.session.get(User, user_id)
         if person and person.name not in people:
             people.append(person.name)
-    latest = (ChatMessage.query.filter_by(meeting_id=meeting.id)
-              .order_by(ChatMessage.id.desc()).first())
-    confirmed_place = (MeetingPlace.query.filter_by(meeting_id=meeting.id, confirmed=1)
-                       .order_by(MeetingPlace.id.desc()).first())
     my_completion_confirmed = MeetingEvent.query.filter_by(
         meeting_id=meeting.id, user_id=viewer.id, kind="complete"
     ).first() is not None
+    latest = None if my_completion_confirmed else (
+        ChatMessage.query.filter_by(meeting_id=meeting.id)
+        .order_by(ChatMessage.id.desc()).first()
+    )
+    confirmed_place = (MeetingPlace.query.filter_by(meeting_id=meeting.id, confirmed=1)
+                       .order_by(MeetingPlace.id.desc()).first())
+    my_feedback = MeetingFeedback.query.filter_by(
+        meeting_id=meeting.id, user_id=viewer.id
+    ).first()
     return {
         "people": people,
         "meeting_status": effective_meeting_status(meeting),
         "my_completion_confirmed": my_completion_confirmed,
+        "needs_feedback": my_completion_confirmed and feedback_rating(my_feedback) is None,
         "confirmed_place": confirmed_place.title if confirmed_place else None,
         "latest_message": {
             "id": latest.id,
@@ -1558,10 +1627,14 @@ def meeting_list_summary(meeting, viewer):
 def list_interests():
     user = current_user()
     now = utcnow()
+    chat_cleanup_needed = False
     all_meetings = Meeting.query.order_by(Meeting.id.desc()).all()
     owned_meetings = []
     for meeting in all_meetings:
+        chat_cleanup_needed = purge_chat_if_ready(meeting) or chat_cleanup_needed
         if meeting.owner_id != user.id or effective_meeting_status(meeting) == "cancelled":
+            continue
+        if chat_closed_for(meeting, user.id):
             continue
         has_accepted = Interest.query.filter_by(
             meeting_id=meeting.id, status="accepted"
@@ -1573,15 +1646,23 @@ def list_interests():
     if owned_meeting_ids:
         for interest in Interest.query.filter(Interest.meeting_id.in_(owned_meeting_ids)).all():
             meeting = db.session.get(Meeting, interest.meeting_id)
-            if interest.status == "accepted" or normalize_dt(meeting.expires_at) > now:
+            chat_cleanup_needed = purge_chat_if_ready(meeting) or chat_cleanup_needed
+            if not chat_closed_for(meeting, user.id) and (
+                    interest.status == "accepted" or normalize_dt(meeting.expires_at) > now):
                 incoming.append(interest)
     outgoing = []
     for interest in Interest.query.filter_by(user_id=user.id).all():
         meeting = db.session.get(Meeting, interest.meeting_id)
+        if meeting:
+            chat_cleanup_needed = purge_chat_if_ready(meeting) or chat_cleanup_needed
         if not meeting or effective_meeting_status(meeting) == "cancelled":
+            continue
+        if chat_closed_for(meeting, user.id):
             continue
         if interest.status == "accepted" or normalize_dt(meeting.expires_at) > now:
             outgoing.append(interest)
+    if chat_cleanup_needed:
+        db.session.commit()
     return jsonify(
         owned=[{
             "meeting_id": meeting.id,
@@ -1652,6 +1733,10 @@ def meeting_room_or_error(meeting_id):
     meeting = db.get_or_404(Meeting, meeting_id)
     if not meeting_member(meeting, current_user()):
         return None, (jsonify(error="Чат откроется после подтверждения участия"), 403)
+    purge_chat_if_ready(meeting)
+    if chat_closed_for(meeting, current_user().id):
+        db.session.commit()
+        return None, (jsonify(error="Эта встреча закрыта, переписка удалена"), 410)
     return meeting, None
 
 
@@ -1671,7 +1756,12 @@ def room_payload(meeting, user):
             )
             agreed.confirmed = 1
             db.session.commit()
-    messages = ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
+    my_completion_confirmed = MeetingEvent.query.filter_by(
+        meeting_id=meeting.id, user_id=user.id, kind="complete"
+    ).first() is not None
+    messages = [] if my_completion_confirmed else (
+        ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
+    )
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     raw_events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id.desc()).all()
     event_keys, events = set(), []
@@ -1681,7 +1771,6 @@ def room_payload(meeting, user):
             event_keys.add(key)
             events.append(event)
     events.reverse()
-    feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id).order_by(MeetingFeedback.id).all()
     thanks = MeetingThanks.query.filter_by(meeting_id=meeting.id).all()
     member_ids = accepted_user_ids(meeting)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
@@ -1707,11 +1796,13 @@ def room_payload(meeting, user):
         event.user_id for event in raw_events if event.kind == "complete"
     }
     status = effective_meeting_status(meeting)
+    my_feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
                          "is_owner": meeting.owner_id == user.id, "status": status,
                          "my_late": my_late,
                          "my_completion_confirmed": user.id in completion_ids,
+                         "needs_feedback": user.id in completion_ids and feedback_rating(my_feedback) is None,
                          "completion_confirmed_count": len(completion_ids & member_ids),
                          "completion_required_count": len(member_ids)},
             "places": [{
@@ -1733,7 +1824,7 @@ def room_payload(meeting, user):
                          for m in messages],
             "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
                         "note": e.note or ""} for e in events],
-            "traces": [{"name": db.session.get(User, f.user_id).name, "text": f.trace} for f in feedback],
+            "traces": [],
             "thanks": [{"giver_id": row.giver_id, "receiver_id": row.receiver_id} for row in thanks],
             "participants": participant_payload,
             "photos_revealed": photos_revealed,
@@ -1927,6 +2018,10 @@ def send_message(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if effective_meeting_status(meeting) != "active" or MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=current_user().id, kind="complete"
+    ).first():
+        return jsonify(error="Эта переписка уже закрыта"), 409
     if not consume_action(current_user().id, "message", 12, 60):
         return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
     text = str(json_body().get("text", "")).strip()[:500]
@@ -1980,6 +2075,7 @@ def meeting_lifecycle(meeting_id):
         interest.status = "rejected"
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
                                     kind="leave", note="Участник отказался от встречи"))
+        purge_chat_if_ready(meeting)
         db.session.commit()
         notify_user(
             meeting.owner_id,
@@ -2037,6 +2133,9 @@ def meeting_lifecycle(meeting_id):
     if action != "complete":
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                     kind=action, note=str(data.get("note", "")).strip()[:180] or None))
+    if action == "cancel":
+        db.session.flush()
+        purge_chat_if_ready(meeting)
     db.session.commit()
     if action in {"cancel", "late", "no_show"} or (
         action == "complete" and completed_by_all(meeting)
@@ -2067,20 +2166,29 @@ def leave_feedback(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
-    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
-    if not state or state.status != "completed":
-        return jsonify(error="След можно оставить после завершения встречи"), 409
-    trace = str(json_body().get("trace", "")).strip()[:180]
-    if len(trace) < 2:
-        return jsonify(error="Напишите короткое впечатление"), 400
+    completed = MeetingEvent.query.filter_by(
+        meeting_id=meeting.id, user_id=current_user().id, kind="complete"
+    ).first()
+    if not completed:
+        return jsonify(error="Оценку можно поставить после завершения встречи"), 409
+    try:
+        rating = int(json_body().get("rating"))
+    except (TypeError, ValueError):
+        rating = 0
+    if rating not in range(1, 6):
+        return jsonify(error="Поставьте оценку от 1 до 5"), 400
     feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=current_user().id).first()
     if not feedback:
-        feedback = MeetingFeedback(meeting_id=meeting.id, user_id=current_user().id, trace=trace)
+        feedback = MeetingFeedback(
+            meeting_id=meeting.id, user_id=current_user().id, trace=f"rating:{rating}"
+        )
         db.session.add(feedback)
     else:
-        feedback.trace = trace
+        feedback.trace = f"rating:{rating}"
+    db.session.flush()
+    purge_chat_if_ready(meeting)
     db.session.commit()
-    return jsonify(ok=True, room=room_payload(meeting, current_user()))
+    return jsonify(ok=True, closed=True)
 
 
 @app.post("/api/meetings/<int:meeting_id>/thanks")
@@ -2148,7 +2256,7 @@ def report_user(meeting_id):
         else:
             moderation.hidden_until = utcnow() + timedelta(hours=24)
     db.session.commit()
-    return jsonify(ok=True)
+    return jsonify(ok=True, closed=True)
 
 
 @app.get("/api/admin/reports")
