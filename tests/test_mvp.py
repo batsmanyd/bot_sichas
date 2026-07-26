@@ -124,6 +124,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(pending_completion.status_code, 200)
         self.assertEqual(pending_completion.get_json()["room"]["meeting"]["status"], "active")
         self.assertTrue(pending_completion.get_json()["room"]["meeting"]["my_completion_confirmed"])
+        pending_list = self.second.get("/api/interests").get_json()["outgoing"][0]
+        self.assertEqual(pending_list["meeting_status"], "active")
+        self.assertTrue(pending_list["my_completion_confirmed"])
         self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
             "trace": "Пока рано",
         }).status_code, 409)
@@ -666,7 +669,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.0 · отдельное пространство встречи", frontend)
+        self.assertIn("0.17.1 · завершённая встреча уходит в историю", frontend)
+        self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
+        self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)

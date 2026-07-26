@@ -1535,9 +1535,13 @@ def meeting_list_summary(meeting, viewer):
               .order_by(ChatMessage.id.desc()).first())
     confirmed_place = (MeetingPlace.query.filter_by(meeting_id=meeting.id, confirmed=1)
                        .order_by(MeetingPlace.id.desc()).first())
+    my_completion_confirmed = MeetingEvent.query.filter_by(
+        meeting_id=meeting.id, user_id=viewer.id, kind="complete"
+    ).first() is not None
     return {
         "people": people,
         "meeting_status": effective_meeting_status(meeting),
+        "my_completion_confirmed": my_completion_confirmed,
         "confirmed_place": confirmed_place.title if confirmed_place else None,
         "latest_message": {
             "id": latest.id,
