@@ -127,26 +127,32 @@ class MvpFlowTest(unittest.TestCase):
         pending_list = self.second.get("/api/interests").get_json()["outgoing"][0]
         self.assertEqual(pending_list["meeting_status"], "active")
         self.assertTrue(pending_list["my_completion_confirmed"])
-        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
-            "trace": "Пока рано",
-        }).status_code, 409)
+        response = self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
+            "rating": 5,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertTrue(response.get_json()["closed"])
+        self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 410)
+        self.assertEqual(self.second.get("/api/interests").get_json()["outgoing"], [])
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
         }).status_code, 200)
-        response = self.second.post(f"/api/meetings/{meeting_id}/feedback", json={
-            "trace": "Хорошо прогулялись",
+        response = self.first.post(f"/api/meetings/{meeting_id}/report", json={
+            "target_user_id": second_user.id, "reason": "Нарушил договорённость", "block": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.get_json()["room"]["traces"][0]["text"], "Хорошо прогулялись")
-        response = self.second.post(f"/api/meetings/{meeting_id}/report", json={
+        self.assertTrue(response.get_json()["closed"])
+        self.assertEqual(self.first.get(f"/api/meetings/{meeting_id}/room").status_code, 410)
+        self.assertEqual(main.ChatMessage.query.count(), 1)
+        response = self.first.post(f"/api/meetings/{meeting_id}/report", json={
             "target_user_id": first_user.id, "reason": "Нарушил договорённость", "block": True,
         })
-        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.status_code, 410, response.get_json())
         self.assertEqual(main.UserReport.query.count(), 1)
         self.assertEqual(main.UserBlock.query.count(), 1)
-        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/report", json={
-            "target_user_id": first_user.id, "reason": "Повторная жалоба",
-        }).status_code, 409)
+        self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/report", json={
+            "target_user_id": second_user.id, "reason": "Повторная жалоба",
+        }).status_code, 410)
         self.assertEqual(self.second.get("/api/admin/reports").status_code, 403)
         self.assertEqual(self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
@@ -158,6 +164,49 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(feed, [])
         self.assertEqual(self.first.delete("/api/presence").status_code, 200)
         self.assertFalse(self.first.get("/api/presence").get_json()["active"])
+
+    def test_chat_is_deleted_after_ratings_and_after_24_hours(self):
+        self.login(self.first, 120)
+        self.login(self.second, 121)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+
+        def accepted_meeting(description):
+            meeting_id = self.first.post("/api/meetings", json={
+                **point, "category": "walk", "description": description, "format": "one",
+            }).get_json()["id"]
+            self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+            interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+            self.first.post(
+                f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+            )
+            return meeting_id
+
+        meeting_id = accepted_meeting("Проверка удаления после оценок")
+        self.second.post(
+            f"/api/meetings/{meeting_id}/messages", json={"text": "Удалить после оценок"}
+        )
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        self.first.post(f"/api/meetings/{meeting_id}/feedback", json={"rating": 5})
+        self.assertEqual(main.ChatMessage.query.filter_by(meeting_id=meeting_id).count(), 1)
+        self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        self.second.post(f"/api/meetings/{meeting_id}/feedback", json={"rating": 4})
+        self.assertEqual(main.ChatMessage.query.filter_by(meeting_id=meeting_id).count(), 0)
+        self.assertEqual(self.first.get("/api/interests").get_json()["owned"], [])
+        self.assertEqual(self.second.get("/api/interests").get_json()["outgoing"], [])
+
+        expired_id = accepted_meeting("Проверка удаления через сутки")
+        self.second.post(
+            f"/api/meetings/{expired_id}/messages", json={"text": "Удалить через сутки"}
+        )
+        self.first.post(f"/api/meetings/{expired_id}/lifecycle", json={"action": "complete"})
+        completion = main.MeetingEvent.query.filter_by(
+            meeting_id=expired_id, kind="complete"
+        ).one()
+        completion.created_at = main.utcnow() - timedelta(hours=25)
+        main.db.session.commit()
+        self.second.get("/api/interests")
+        self.assertEqual(main.ChatMessage.query.filter_by(meeting_id=expired_id).count(), 0)
+        self.assertEqual(self.second.get(f"/api/meetings/{expired_id}/room").status_code, 410)
 
     def test_validation(self):
         self.login(self.first, 1)
@@ -669,9 +718,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.1 · завершённая встреча уходит в историю", frontend)
+        self.assertIn("0.17.2 · чат удаляется после встречи", frontend)
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
         self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
+        self.assertIn("function rateMeeting(rating)", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
