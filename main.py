@@ -1351,6 +1351,25 @@ def feed():
         for meeting in meetings:
             if user and meeting.owner_id == user.id:
                 continue
+            if effective_meeting_status(meeting) != "active":
+                continue
+            accepted_count = Interest.query.filter_by(
+                meeting_id=meeting.id, status="accepted"
+            ).count()
+            # A confirmed one-to-one meeting has moved into its private room and
+            # must no longer remain as a public marker for either participant.
+            if meeting.format == "one" and accepted_count:
+                continue
+            # A participant who has already closed this meeting must never see
+            # the old public marker again, even while another participant is
+            # still deciding how to finish it.
+            if user and (
+                chat_closed_for(meeting, user.id)
+                or MeetingEvent.query.filter_by(
+                    meeting_id=meeting.id, user_id=user.id, kind="complete"
+                ).first()
+            ):
+                continue
             starts_at = normalize_dt(meeting.starts_at)
             is_now = starts_at <= now + timedelta(minutes=5)
             if time_mode == "now" and not is_now:
