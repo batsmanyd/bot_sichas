@@ -253,12 +253,12 @@ class MvpFlowTest(unittest.TestCase):
         self.login(self.second, 133)
         point = {"latitude": 53.9023, "longitude": 27.5619}
         self.second.post("/api/presence", json={**point, "category": "cafe"})
-        meeting_id = self.first.post("/api/meetings", json={
+        meeting_id = self.second.post("/api/meetings", json={
             **point, "category": "cafe", "description": "Старая встреча", "format": "one",
         }).get_json()["id"]
-        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
-        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
-        self.first.post(
+        self.first.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.second.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
         )
         first_user = main.User.query.filter_by(telegram_id="test-132").one()
@@ -280,6 +280,23 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(feed, [])
         self.assertEqual(main.Presence.query.filter_by(user_id=second_user.id).count(), 0)
         self.assertEqual(self.first.get("/api/notifications").get_json()["items"], [])
+
+    def test_confirmed_one_to_one_meeting_disappears_from_public_feed(self):
+        self.login(self.first, 134)
+        self.login(self.second, 135)
+        self.login(self.third, 136)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.second.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе или чай", "format": "one",
+        }).get_json()["id"]
+        self.first.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.second.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.second.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+        feed_url = "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe"
+        self.assertEqual(self.first.get(feed_url).get_json()["items"], [])
+        self.assertEqual(self.third.get(feed_url).get_json()["items"], [])
 
     def test_validation(self):
         self.login(self.first, 1)
@@ -791,7 +808,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.3 · закрытая встреча исчезает полностью", frontend)
+        self.assertIn("0.17.4 · встреча исчезает с карты после подтверждения", frontend)
+        self.assertIn("function emptyMeetingsHtml()", frontend)
+        self.assertIn("Активных встреч нет", frontend)
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
         self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
         self.assertIn("function rateMeeting(rating)", frontend)
