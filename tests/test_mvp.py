@@ -134,6 +134,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertTrue(response.get_json()["closed"])
         self.assertEqual(self.second.get(f"/api/meetings/{meeting_id}/room").status_code, 410)
         self.assertEqual(self.second.get("/api/interests").get_json()["outgoing"], [])
+        self.assertEqual(main.Presence.query.filter_by(user_id=second_user.id).count(), 0)
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
         }).status_code, 200)
@@ -157,6 +158,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.second.post(
             f"/api/interests/{interest_id}/decision", json={"decision": "rejected"}
         ).status_code, 403)
+        self.assertEqual(self.first.post(
+            "/api/presence", json={**point_one, "category": "cafe"}
+        ).status_code, 200)
         presence = main.Presence.query.one()
         presence.active_until = main.utcnow() - timedelta(seconds=1)
         main.db.session.commit()
@@ -207,6 +211,42 @@ class MvpFlowTest(unittest.TestCase):
         self.second.get("/api/interests")
         self.assertEqual(main.ChatMessage.query.filter_by(meeting_id=expired_id).count(), 0)
         self.assertEqual(self.second.get(f"/api/meetings/{expired_id}/room").status_code, 410)
+
+    def test_closed_meeting_removes_stale_presence_and_related_notifications(self):
+        self.login(self.first, 130)
+        self.login(self.second, 131)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        self.first.post("/api/presence", json={**point, "category": "cafe"})
+        self.second.post("/api/presence", json={**point, "category": "cafe"})
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе или чай", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+        first_user = main.User.query.filter_by(telegram_id="test-130").one()
+        second_user = main.User.query.filter_by(telegram_id="test-131").one()
+        # Reproduce a stale public status and old chat notifications from production.
+        for user in (first_user, second_user):
+            presence = main.Presence.query.filter_by(user_id=user.id).one()
+            presence.active_until = main.utcnow() + timedelta(days=1)
+        main.db.session.add(main.UserNotification(
+            user_id=first_user.id, kind="info", text=f"{second_user.name}: Ты где?"
+        ))
+        main.db.session.add(main.UserNotification(
+            user_id=first_user.id, kind="presence_reminder", text="Оставить статус включённым?"
+        ))
+        main.db.session.commit()
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        response = self.first.post(f"/api/meetings/{meeting_id}/feedback", json={"rating": 5})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(main.Presence.query.filter(
+            main.Presence.user_id.in_({first_user.id, second_user.id})
+        ).count(), 0)
+        notices = self.first.get("/api/notifications").get_json()["items"]
+        self.assertEqual([item["text"] for item in notices], ["Оставить статус включённым?"])
 
     def test_validation(self):
         self.login(self.first, 1)
@@ -718,7 +758,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.2 · чат удаляется после встречи", frontend)
+        self.assertIn("0.17.3 · закрытая встреча исчезает полностью", frontend)
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
         self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
         self.assertIn("function rateMeeting(rating)", frontend)
