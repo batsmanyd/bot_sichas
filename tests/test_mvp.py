@@ -722,6 +722,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
         self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
         self.assertIn("function rateMeeting(rating)", frontend)
+        self.assertIn("demoRoom.meeting.needs_feedback=true", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
