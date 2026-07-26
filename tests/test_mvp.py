@@ -248,6 +248,39 @@ class MvpFlowTest(unittest.TestCase):
         notices = self.first.get("/api/notifications").get_json()["items"]
         self.assertEqual([item["text"] for item in notices], ["Оставить статус включённым?"])
 
+    def test_existing_closed_meeting_is_cleaned_on_next_open(self):
+        self.login(self.first, 132)
+        self.login(self.second, 133)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        self.second.post("/api/presence", json={**point, "category": "cafe"})
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Старая встреча", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+        first_user = main.User.query.filter_by(telegram_id="test-132").one()
+        second_user = main.User.query.filter_by(telegram_id="test-133").one()
+        main.db.session.add(main.MeetingFeedback(
+            meeting_id=meeting_id, user_id=first_user.id, trace="rating:5",
+            created_at=main.utcnow(),
+        ))
+        presence = main.Presence.query.filter_by(user_id=second_user.id).one()
+        presence.active_until = main.utcnow() + timedelta(days=1)
+        presence.updated_at = main.utcnow() - timedelta(minutes=10)
+        main.db.session.add(main.UserNotification(
+            user_id=first_user.id, kind="info", text=f"{second_user.name}: Ты где?"
+        ))
+        main.db.session.commit()
+        feed = self.first.get(
+            "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe"
+        ).get_json()["items"]
+        self.assertEqual(feed, [])
+        self.assertEqual(main.Presence.query.filter_by(user_id=second_user.id).count(), 0)
+        self.assertEqual(self.first.get("/api/notifications").get_json()["items"], [])
+
     def test_validation(self):
         self.login(self.first, 1)
         response = self.first.post("/api/presence", json={"category": "bad", "latitude": 0, "longitude": 0})
