@@ -555,6 +555,45 @@ def purge_chat_if_ready(meeting):
     return should_purge
 
 
+def close_member_presences(meeting):
+    """A closed meeting must not leave either participant publicly open."""
+    member_ids = accepted_user_ids(meeting)
+    if member_ids:
+        Presence.query.filter(Presence.user_id.in_(member_ids)).delete(
+            synchronize_session=False
+        )
+
+
+def purge_meeting_notifications(meeting, user_ids=None):
+    """Remove legacy in-app chat/meeting notices without deleting unrelated reminders."""
+    member_ids = accepted_user_ids(meeting)
+    target_ids = set(user_ids or member_ids)
+    if not target_ids:
+        return 0
+    member_names = [
+        user.name for user_id in member_ids
+        if (user := db.session.get(User, user_id)) is not None
+    ]
+    notices = UserNotification.query.filter(
+        UserNotification.user_id.in_(target_ids),
+        UserNotification.created_at >= meeting.created_at,
+        UserNotification.kind != "presence_reminder",
+        UserNotification.kind != "thanks",
+    ).all()
+    removed = 0
+    for notice in notices:
+        related = (
+            meeting.description in notice.text
+            or notice.kind.startswith("meeting_")
+            or any(notice.text.startswith(f"{name}:") for name in member_names)
+            or any(notice.text.startswith(f"{name} ") for name in member_names)
+        )
+        if related:
+            db.session.delete(notice)
+            removed += 1
+    return removed
+
+
 def effective_meeting_status(meeting):
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     if not state:
@@ -2076,6 +2115,8 @@ def meeting_lifecycle(meeting_id):
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
                                     kind="leave", note="Участник отказался от встречи"))
         purge_chat_if_ready(meeting)
+        close_member_presences(meeting)
+        purge_meeting_notifications(meeting)
         db.session.commit()
         notify_user(
             meeting.owner_id,
@@ -2136,6 +2177,10 @@ def meeting_lifecycle(meeting_id):
     if action == "cancel":
         db.session.flush()
         purge_chat_if_ready(meeting)
+        close_member_presences(meeting)
+        purge_meeting_notifications(meeting)
+    elif action == "complete":
+        close_member_presences(meeting)
     db.session.commit()
     if action in {"cancel", "late", "no_show"} or (
         action == "complete" and completed_by_all(meeting)
@@ -2187,6 +2232,8 @@ def leave_feedback(meeting_id):
         feedback.trace = f"rating:{rating}"
     db.session.flush()
     purge_chat_if_ready(meeting)
+    close_member_presences(meeting)
+    purge_meeting_notifications(meeting, {current_user().id})
     db.session.commit()
     return jsonify(ok=True, closed=True)
 
