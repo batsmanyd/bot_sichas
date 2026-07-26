@@ -555,13 +555,15 @@ def purge_chat_if_ready(meeting):
     return should_purge
 
 
-def close_member_presences(meeting):
+def close_member_presences(meeting, stale_before=None):
     """A closed meeting must not leave either participant publicly open."""
     member_ids = accepted_user_ids(meeting)
-    if member_ids:
-        Presence.query.filter(Presence.user_id.in_(member_ids)).delete(
-            synchronize_session=False
-        )
+    if not member_ids:
+        return 0
+    query = Presence.query.filter(Presence.user_id.in_(member_ids))
+    if stale_before is not None:
+        query = query.filter(Presence.updated_at <= stale_before)
+    return query.delete(synchronize_session=False)
 
 
 def purge_meeting_notifications(meeting, user_ids=None):
@@ -592,6 +594,54 @@ def purge_meeting_notifications(meeting, user_ids=None):
             db.session.delete(notice)
             removed += 1
     return removed
+
+
+def closed_at_for(meeting, user_id):
+    feedback = MeetingFeedback.query.filter_by(
+        meeting_id=meeting.id, user_id=user_id
+    ).first()
+    if feedback:
+        return normalize_dt(feedback.created_at)
+    report = UserReport.query.filter_by(
+        meeting_id=meeting.id, reporter_id=user_id
+    ).first()
+    if report:
+        return normalize_dt(report.created_at)
+    leave = MeetingEvent.query.filter_by(
+        meeting_id=meeting.id, user_id=user_id, kind="leave"
+    ).first()
+    if leave:
+        return normalize_dt(leave.created_at)
+    state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+    if state and state.status == "cancelled":
+        return normalize_dt(state.updated_at)
+    if chat_expired(meeting):
+        return chat_cleanup_deadline(meeting)
+    return None
+
+
+def reconcile_closed_meetings(user):
+    """Clean records closed before this release when the user next opens the app."""
+    meeting_ids = {
+        row.meeting_id for row in Interest.query.filter_by(user_id=user.id).all()
+    }
+    meeting_ids.update(
+        row.id for row in Meeting.query.filter_by(owner_id=user.id).all()
+    )
+    changed = False
+    for meeting_id in meeting_ids:
+        meeting = db.session.get(Meeting, meeting_id)
+        if not meeting or not chat_closed_for(meeting, user.id):
+            continue
+        closed_at = closed_at_for(meeting, user.id)
+        if closed_at:
+            changed = bool(close_member_presences(
+                meeting, stale_before=closed_at
+            )) or changed
+        changed = bool(purge_meeting_notifications(meeting, {user.id})) or changed
+        changed = purge_chat_if_ready(meeting) or changed
+    if changed:
+        db.session.commit()
 
 
 def effective_meeting_status(meeting):
@@ -1249,6 +1299,7 @@ def feed():
     agreed_places = []
     blocked_ids = set()
     if user:
+        reconcile_closed_meetings(user)
         blocked_ids = {b.blocked_id for b in UserBlock.query.filter_by(blocker_id=user.id).all()}
         blocked_ids |= {b.blocker_id for b in UserBlock.query.filter_by(blocked_id=user.id).all()}
     proposed_owner_ids = set()
@@ -1445,6 +1496,7 @@ def get_presence():
 @login_required
 def list_notifications():
     user = current_user()
+    reconcile_closed_meetings(user)
     items = UserNotification.query.filter_by(user_id=user.id).order_by(
         UserNotification.id.desc()).limit(100).all()
     return jsonify(
