@@ -718,12 +718,14 @@ def safe_point(lat, lon, identifier):
 
 
 def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
-    if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
-        return False
-    db.session.add(UserNotification(
-        user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
-    ))
-    db.session.commit()
+    persistent = kind in {"presence_reminder", "meeting_confirmation"}
+    if persistent:
+        if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
+            return False
+        db.session.add(UserNotification(
+            user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
+        ))
+        db.session.commit()
     if not telegram or not BOT_TOKEN:
         return True
     user = db.session.get(User, user_id)
@@ -1516,17 +1518,44 @@ def get_presence():
 def list_notifications():
     user = current_user()
     reconcile_closed_meetings(user)
+    now = utcnow()
+    presence_active = Presence.query.filter(
+        Presence.user_id == user.id, Presence.active_until > now
+    ).first() is not None
     items = UserNotification.query.filter_by(user_id=user.id).order_by(
-        UserNotification.id.desc()).limit(100).all()
+        UserNotification.id.desc()).all()
+    active_items = []
+    for item in items:
+        keep = item.kind == "presence_reminder" and presence_active
+        if item.kind == "meeting_confirmation" and item.dedupe_key:
+            try:
+                meeting_id = int(item.dedupe_key.split(":")[1])
+            except (IndexError, ValueError):
+                meeting_id = 0
+            meeting = db.session.get(Meeting, meeting_id)
+            keep = bool(
+                meeting
+                and meeting_member(meeting, user)
+                and effective_meeting_status(meeting) == "active"
+                and not MeetingEvent.query.filter_by(
+                    meeting_id=meeting_id, user_id=user.id, kind="complete"
+                ).first()
+            )
+        if keep:
+            active_items.append(item)
+        else:
+            db.session.delete(item)
+    db.session.commit()
+    active_items = active_items[:10]
     return jsonify(
-        unread=sum(1 for item in items if not item.read_at),
+        unread=len(active_items),
         items=[{
             "id": item.id,
             "kind": item.kind,
             "text": item.text,
-            "read": bool(item.read_at),
+            "read": False,
             "created_at": normalize_dt(item.created_at).isoformat(),
-        } for item in items],
+        } for item in active_items],
     )
 
 
@@ -1888,6 +1917,7 @@ def room_payload(meeting, user):
     participant_payload = []
     for uid in member_ids:
         participant = db.session.get(User, uid)
+        profile = UserProfile.query.filter_by(user_id=uid).first()
         selfie = ProfileSelfie.query.filter_by(user_id=uid).first()
         visibility = selfie.visibility if selfie else "hidden"
         photo_visible = bool(selfie and (
@@ -1895,6 +1925,9 @@ def room_payload(meeting, user):
         ))
         participant_payload.append({
             "id": uid, "name": participant.name, "mine": uid == user.id,
+            "age": profile.age if profile else None,
+            "gender": profile.gender if profile else None,
+            "about": selfie.about if selfie else "",
             "picture": decrypt_selfie(selfie.image) if photo_visible else None,
             "photo_visible": photo_visible, "photo_visibility": visibility,
             "photo_consented": uid in consented_ids,
