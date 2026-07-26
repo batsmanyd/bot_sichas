@@ -246,7 +246,7 @@ class MvpFlowTest(unittest.TestCase):
             main.Presence.user_id.in_({first_user.id, second_user.id})
         ).count(), 0)
         notices = self.first.get("/api/notifications").get_json()["items"]
-        self.assertEqual([item["text"] for item in notices], ["Оставить статус включённым?"])
+        self.assertEqual(notices, [])
 
     def test_existing_closed_meeting_is_cleaned_on_next_open(self):
         self.login(self.first, 132)
@@ -646,7 +646,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(owner_interests["owned"][0]["people"], ["Тест 109"])
         self.assertEqual(guest_interests["outgoing"][0]["people"], ["Тест 108"])
 
-    def test_thanks_no_show_trust_and_notification_history(self):
+    def test_thanks_no_show_trust_without_notification_history(self):
         self.login(self.first, 104)
         self.login(self.second, 105)
         point = {"latitude": 53.9023, "longitude": 27.5619}
@@ -674,9 +674,8 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(trust["thanks"], 1)
         self.assertEqual(trust["no_shows"], 1)
         notifications = self.second.get("/api/notifications").get_json()
-        self.assertGreaterEqual(notifications["unread"], 1)
-        self.assertEqual(self.second.post("/api/notifications/read", json={}).status_code, 200)
-        self.assertEqual(self.second.get("/api/notifications").get_json()["unread"], 0)
+        self.assertEqual(notifications["unread"], 0)
+        self.assertEqual(notifications["items"], [])
 
     def test_telegram_mini_app_signature(self):
         original_token = main.BOT_TOKEN
@@ -808,7 +807,12 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.4 · встреча исчезает с карты после подтверждения", frontend)
+        self.assertIn("0.17.5 · человек и действия сразу в чате", frontend)
+        self.assertIn('id="roomPersonCard"', frontend)
+        self.assertIn("Открыть фото друг другу", frontend)
+        self.assertIn('id="notificationPanel"', frontend)
+        self.assertNotIn("Отметить прочитанными", frontend)
+        self.assertNotIn("Участники и управление встречей", frontend)
         self.assertIn("function emptyMeetingsHtml()", frontend)
         self.assertIn("Активных встреч нет", frontend)
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
