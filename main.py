@@ -29,7 +29,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "0.17.8"
+APP_VERSION = "0.17.9"
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
@@ -821,7 +821,8 @@ def safe_point(lat, lon, identifier):
     return round(lat + lat_offset, 4), round(lon + lon_offset, 4)
 
 
-def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
+def notify_user(user_id, text, kind="info", dedupe_key=None):
+    """Keep product notifications inside the app; never duplicate them to Telegram."""
     persistent = kind in {"presence_reminder", "meeting_confirmation"}
     if persistent:
         if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
@@ -830,14 +831,22 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
             user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
         ))
         db.session.commit()
-    if not telegram or not BOT_TOKEN:
-        return True
-    user = db.session.get(User, user_id)
-    if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
-        return True
-    telegram_id = user.telegram_id
+    return True
 
-    def deliver():
+
+def notify_admins_of_report(report, meeting, reporter, target):
+    """Send only new moderation reports to the configured Telegram administrators."""
+    if not BOT_TOKEN or not ADMIN_TELEGRAM_IDS:
+        return
+    text = (
+        f"🚨 Новая жалоба #{report.id}\n"
+        f"Встреча: «{meeting.description}» (#{meeting.id})\n"
+        f"От: {reporter.name} (ID {reporter.id})\n"
+        f"На: {target.name} (ID {target.id})\n"
+        f"Причина: {report.reason}"
+    )
+
+    def deliver(telegram_id):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -845,10 +854,10 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
                 timeout=5,
             ).raise_for_status()
         except requests.RequestException:
-            app.logger.warning("Telegram notification failed for user %s", user_id)
+            app.logger.warning("Telegram report notification failed for admin %s", telegram_id)
 
-    threading.Thread(target=deliver, daemon=True).start()
-    return True
+    for telegram_id in ADMIN_TELEGRAM_IDS:
+        threading.Thread(target=deliver, args=(telegram_id,), daemon=True).start()
 
 
 def process_presence_reminders():
@@ -861,7 +870,6 @@ def process_presence_reminders():
             "Вы всё ещё открыты для общения. Оставить статус включённым или выключить его в приложении?",
             kind="presence_reminder",
             dedupe_key=f"presence-reminder:{presence.id}:{started}",
-            telegram=True,
         )
 
 
@@ -1779,7 +1787,6 @@ def propose_meeting_to_presence(presence_id):
     notify_user(
         presence.user_id,
         f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}",
-        telegram=True,
     )
     return jsonify(ok=True, meeting_id=meeting.id, already_sent=False), 201
 
@@ -1811,7 +1818,6 @@ def express_interest(meeting_id):
         notify_user(
             meeting.owner_id,
             f"Новый отклик на встречу «{meeting.description}» от {user.name}",
-            telegram=True,
         )
     return jsonify(ok=True)
 
@@ -1982,7 +1988,6 @@ def decide_interest(interest_id):
     notify_user(
         interest.user_id,
         f"Ваш отклик на встречу «{meeting.description}» {result_text}",
-        telegram=True,
     )
     return jsonify(ok=True, interest=interest_payload(interest, user))
 
@@ -2372,7 +2377,6 @@ def meeting_lifecycle(meeting_id):
         notify_user(
             meeting.owner_id,
             f"{user.name} отказался от встречи «{meeting.description}»",
-            telegram=True,
         )
         return jsonify(ok=True, left=True)
     if action == "no_show":
@@ -2416,7 +2420,6 @@ def meeting_lifecycle(meeting_id):
             no_show.user_id,
             f"{user.name} оспорил отметку о неявке на встречу «{meeting.description}».",
             kind="meeting_no_show_disputed",
-            telegram=True,
         )
         return jsonify(ok=True, room=room_payload(meeting, user))
     if action == "cancel":
@@ -2461,8 +2464,7 @@ def meeting_lifecycle(meeting_id):
                     f"{user.name} отметил, что встреча состоялась. Подтвердите результат в приложении.",
                     kind="meeting_confirmation",
                     dedupe_key=f"meeting-confirmation:{meeting.id}:{member_id}",
-                    telegram=True,
-                )
+                        )
     elif action == "late":
         existing_late = MeetingEvent.query.filter_by(
             meeting_id=meeting.id, user_id=user.id, kind="late"
@@ -2504,7 +2506,6 @@ def meeting_lifecycle(meeting_id):
                 member_id,
                 f"{action_text}: «{meeting.description}»",
                 kind=f"meeting_{action}",
-                telegram=action in {"cancel", "late", "no_show", "not_happened", "reschedule"},
             )
     return jsonify(ok=True, room=room_payload(meeting, user))
 
@@ -2569,8 +2570,7 @@ def thank_participant(meeting_id):
         emit_meeting(meeting, "thanks")
         notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
                     kind="thanks",
-                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}",
-                    telegram=True)
+                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}")
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
@@ -2594,8 +2594,10 @@ def report_user(meeting_id):
         return jsonify(error="Опишите причину жалобы"), 400
     if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=reporter.id, target_id=target_id).first():
         return jsonify(error="Вы уже отправили жалобу на этого участника"), 409
-    db.session.add(UserReport(meeting_id=meeting.id, reporter_id=reporter.id,
-                              target_id=target_id, reason=reason))
+    report = UserReport(
+        meeting_id=meeting.id, reporter_id=reporter.id, target_id=target_id, reason=reason,
+    )
+    db.session.add(report)
     if data.get("block") and not UserBlock.query.filter_by(blocker_id=reporter.id, blocked_id=target_id).first():
         db.session.add(UserBlock(blocker_id=reporter.id, blocked_id=target_id))
     recent = utcnow() - timedelta(hours=24)
@@ -2610,6 +2612,7 @@ def report_user(meeting_id):
         else:
             moderation.hidden_until = utcnow() + timedelta(hours=24)
     db.session.commit()
+    notify_admins_of_report(report, meeting, reporter, db.session.get(User, target_id))
     return jsonify(ok=True, closed=True)
 
 
