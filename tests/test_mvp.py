@@ -1,9 +1,11 @@
 import hashlib
 import hmac
 import json
+import threading
 import time
 import unittest
 from datetime import timedelta
+from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
 import main
@@ -27,6 +29,52 @@ class MvpFlowTest(unittest.TestCase):
     def login(self, client, number):
         response = client.post("/auth/test", json={"user": str(number)})
         self.assertEqual(response.status_code, 200, response.get_json())
+
+    def test_telegram_is_reserved_for_admin_reports(self):
+        reporter = main.User(telegram_id="reporter", name="Юрий")
+        target = main.User(telegram_id="target", name="Участник")
+        main.db.session.add_all([reporter, target])
+        main.db.session.flush()
+        meeting = main.Meeting(
+            owner_id=reporter.id,
+            category="cafe",
+            description="Выпить кофе или чай",
+            format="one",
+            latitude=53.9,
+            longitude=27.56,
+            starts_at=main.utcnow(),
+            expires_at=main.utcnow() + timedelta(hours=1),
+        )
+        main.db.session.add(meeting)
+        main.db.session.flush()
+        report = main.UserReport(
+            meeting_id=meeting.id,
+            reporter_id=reporter.id,
+            target_id=target.id,
+            reason="Нарушение правил",
+        )
+        main.db.session.add(report)
+        main.db.session.commit()
+
+        delivered = threading.Event()
+        response = Mock()
+        response.raise_for_status.return_value = None
+
+        def fake_post(*_args, **_kwargs):
+            delivered.set()
+            return response
+
+        with patch.object(main, "BOT_TOKEN", "test-token"), \
+                patch.object(main, "ADMIN_TELEGRAM_IDS", {"612864724"}), \
+                patch.object(main.requests, "post", side_effect=fake_post) as post:
+            main.notify_user(target.id, "Обычное действие встречи")
+            self.assertEqual(post.call_count, 0)
+            main.notify_admins_of_report(report, meeting, reporter, target)
+            self.assertTrue(delivered.wait(1))
+            self.assertEqual(post.call_count, 1)
+            payload = post.call_args.kwargs["json"]
+            self.assertEqual(payload["chat_id"], "612864724")
+            self.assertIn("Новая жалоба", payload["text"])
 
     def test_real_two_user_flow(self):
         self.assertEqual(self.first.post("/api/presence", json={}).status_code, 401)
