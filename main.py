@@ -501,7 +501,11 @@ def feedback_rating(feedback):
 
 
 def meeting_has_report(meeting_id):
-    return UserReport.query.filter_by(meeting_id=meeting_id).first() is not None
+    evidence_since = utcnow() - timedelta(days=30)
+    return UserReport.query.filter(
+        UserReport.meeting_id == meeting_id,
+        UserReport.created_at >= evidence_since,
+    ).first() is not None
 
 
 def chat_cleanup_deadline(meeting):
@@ -668,8 +672,41 @@ def trust_payload(user_id):
                 meeting_id=meeting_id, user_id=user_id, status="accepted").first():
             completed += 1
     thanks = MeetingThanks.query.filter_by(receiver_id=user_id).count()
-    no_shows = MeetingEvent.query.filter_by(target_user_id=user_id, kind="no_show").count()
-    score = max(20, min(100, 70 + min(completed * 4, 20) + min(thanks * 3, 15) - min(no_shows * 15, 45)))
+    no_show_events = MeetingEvent.query.filter_by(
+        target_user_id=user_id, kind="no_show"
+    ).all()
+    dispute_window = utcnow() - timedelta(hours=24)
+    no_shows = 0
+    for event in no_show_events:
+        disputed = MeetingEvent.query.filter_by(
+            meeting_id=event.meeting_id,
+            user_id=user_id,
+            target_user_id=event.user_id,
+            kind="no_show_disputed",
+        ).first()
+        if not disputed and normalize_dt(event.created_at) <= dispute_window:
+            no_shows += 1
+
+    received_ratings = []
+    for feedback in MeetingFeedback.query.all():
+        rating = feedback_rating(feedback)
+        meeting = db.session.get(Meeting, feedback.meeting_id)
+        if rating is None or not meeting or meeting.format != "one":
+            continue
+        member_ids = accepted_user_ids(meeting)
+        if len(member_ids) == 2 and user_id in member_ids and feedback.user_id != user_id:
+            received_ratings.append(rating)
+    rating_count = len(received_ratings)
+    average_rating = (
+        round(sum(received_ratings) / rating_count, 1)
+        if rating_count >= 3 else None
+    )
+    rating_adjustment = round((average_rating - 3) * 5) if average_rating is not None else 0
+    score = max(20, min(
+        100,
+        70 + min(completed * 4, 20) + min(thanks * 3, 15)
+        + rating_adjustment - min(no_shows * 15, 45),
+    ))
     if completed < 3 and no_shows == 0:
         level = "Новый участник"
     elif completed >= 8 and thanks >= 3 and no_shows == 0:
@@ -685,6 +722,8 @@ def trust_payload(user_id):
         "completed_meetings": completed,
         "thanks": thanks,
         "no_shows": no_shows,
+        "average_rating": average_rating,
+        "rating_count": rating_count,
         "develops_club": develops_club,
     }
 
@@ -1935,6 +1974,16 @@ def room_payload(meeting, user):
             "thanked_by_me": any(row.giver_id == user.id and row.receiver_id == uid for row in thanks),
         })
     my_late = any(event.kind == "late" and event.user_id == user.id for event in events)
+    no_show_against_me = next((
+        event for event in raw_events
+        if event.kind == "no_show" and event.target_user_id == user.id
+    ), None)
+    no_show_disputed = bool(no_show_against_me and MeetingEvent.query.filter_by(
+        meeting_id=meeting.id,
+        user_id=user.id,
+        target_user_id=no_show_against_me.user_id,
+        kind="no_show_disputed",
+    ).first())
     completion_ids = {
         event.user_id for event in raw_events if event.kind == "complete"
     }
@@ -1944,6 +1993,7 @@ def room_payload(meeting, user):
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
                          "is_owner": meeting.owner_id == user.id, "status": status,
                          "my_late": my_late,
+                         "can_dispute_no_show": bool(no_show_against_me and not no_show_disputed),
                          "my_completion_confirmed": user.id in completion_ids,
                          "needs_feedback": user.id in completion_ids and feedback_rating(my_feedback) is None,
                          "completion_confirmed_count": len(completion_ids & member_ids),
@@ -1966,6 +2016,7 @@ def room_payload(meeting, user):
                           "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
                          for m in messages],
             "events": [{"kind": e.kind, "name": db.session.get(User, e.user_id).name,
+                        "target_user_id": e.target_user_id,
                         "note": e.note or ""} for e in events],
             "traces": [],
             "thanks": [{"giver_id": row.giver_id, "receiver_id": row.receiver_id} for row in thanks],
@@ -2047,6 +2098,13 @@ def propose_place(meeting_id):
         ))
     db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
     db.session.commit()
+    for member_id in accepted_user_ids(meeting) - {current_user().id}:
+        notify_user(
+            member_id,
+            f"{current_user().name} предложил место «{title}» для встречи «{meeting.description}».",
+            kind="place_proposed",
+            telegram=True,
+        )
     maybe_confirm_place(meeting, place)
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
@@ -2140,6 +2198,7 @@ def maybe_confirm_place(meeting, place, force=False):
             f"Место встречи согласовано: {place.title}",
             kind="place_confirmed",
             dedupe_key=f"place-confirmed-{meeting.id}-{place.id}-{member_id}",
+            telegram=True,
         )
     return True
 
@@ -2172,6 +2231,13 @@ def send_message(meeting_id):
         return jsonify(error="Напишите сообщение"), 400
     db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
     db.session.commit()
+    for member_id in accepted_user_ids(meeting) - {current_user().id}:
+        notify_user(
+            member_id,
+            f"{current_user().name}: {text[:180]}",
+            kind="chat_message",
+            telegram=True,
+        )
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
@@ -2196,7 +2262,7 @@ def meeting_lifecycle(meeting_id):
         return error
     user, data = current_user(), json_body()
     action = data.get("action")
-    if action not in {"late", "cancel", "complete", "no_show", "leave"}:
+    if action not in {"late", "cancel", "complete", "no_show", "dispute_no_show", "leave"}:
         return jsonify(error="Неизвестное действие"), 400
     state = state_for(meeting)
     if state.status == "completed" and not completed_by_all(meeting):
@@ -2235,6 +2301,40 @@ def meeting_lifecycle(meeting_id):
             return jsonify(error="Укажите участника, который не пришёл"), 400
         if target_id == user.id or target_id not in accepted_user_ids(meeting):
             return jsonify(error="Некорректный участник"), 400
+        note = str(data.get("note", "")).strip()[:180]
+        if len(note) < 5:
+            return jsonify(error="Коротко укажите, что произошло"), 400
+        if MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=user.id,
+            target_user_id=target_id, kind="no_show",
+        ).first():
+            return jsonify(error="Неявка уже отмечена"), 409
+    if action == "dispute_no_show":
+        no_show = MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, target_user_id=user.id, kind="no_show"
+        ).order_by(MeetingEvent.id.desc()).first()
+        if not no_show:
+            return jsonify(error="Нет отметки о неявке для оспаривания"), 409
+        if MeetingEvent.query.filter_by(
+            meeting_id=meeting.id, user_id=user.id,
+            target_user_id=no_show.user_id, kind="no_show_disputed",
+        ).first():
+            return jsonify(error="Отметка уже оспорена"), 409
+        reason = str(data.get("note", "")).strip()[:180]
+        if len(reason) < 5:
+            return jsonify(error="Коротко укажите причину оспаривания"), 400
+        db.session.add(MeetingEvent(
+            meeting_id=meeting.id, user_id=user.id,
+            target_user_id=no_show.user_id, kind="no_show_disputed", note=reason,
+        ))
+        db.session.commit()
+        notify_user(
+            no_show.user_id,
+            f"{user.name} оспорил отметку о неявке на встречу «{meeting.description}».",
+            kind="meeting_no_show_disputed",
+            telegram=True,
+        )
+        return jsonify(ok=True, room=room_payload(meeting, user))
     if action == "cancel":
         state.status = "cancelled"
         meeting.expires_at = utcnow()
@@ -2262,6 +2362,7 @@ def meeting_lifecycle(meeting_id):
                     f"{user.name} отметил, что встреча состоялась. Подтвердите результат в приложении.",
                     kind="meeting_confirmation",
                     dedupe_key=f"meeting-confirmation:{meeting.id}:{member_id}",
+                    telegram=True,
                 )
     elif action == "late":
         existing_late = MeetingEvent.query.filter_by(
@@ -2272,9 +2373,6 @@ def meeting_lifecycle(meeting_id):
                 db.session.delete(event)
             db.session.commit()
             return jsonify(ok=True, room=room_payload(meeting, user))
-    elif action == "no_show":
-        MeetingEvent.query.filter_by(meeting_id=meeting.id, user_id=user.id,
-                                     target_user_id=target_id, kind="no_show").delete()
     if action != "complete":
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                     kind=action, note=str(data.get("note", "")).strip()[:180] or None))
@@ -2304,7 +2402,7 @@ def meeting_lifecycle(meeting_id):
                 member_id,
                 f"{action_text}: «{meeting.description}»",
                 kind=f"meeting_{action}",
-                telegram=action in {"cancel", "late"},
+                telegram=action in {"cancel", "late", "no_show"},
             )
     return jsonify(ok=True, room=room_payload(meeting, user))
 
@@ -2367,7 +2465,8 @@ def thank_participant(meeting_id):
         db.session.commit()
         notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
                     kind="thanks",
-                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}")
+                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}",
+                    telegram=True)
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
@@ -2423,6 +2522,40 @@ def admin_reports():
                            "target": db.session.get(User, item.target_id).name,
                            "reason": item.reason,
                            "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
+
+
+@app.post("/api/admin/reports/<int:report_id>/decision")
+@login_required
+def decide_admin_report(report_id):
+    admin = current_user()
+    if admin.telegram_id not in ADMIN_TELEGRAM_IDS:
+        return jsonify(error="Нет доступа"), 403
+    report = db.get_or_404(UserReport, report_id)
+    decision = str(json_body().get("decision", "")).strip()
+    if decision not in {"dismissed", "confirmed"}:
+        return jsonify(error="Выберите решение по жалобе"), 400
+    meeting = db.session.get(Meeting, report.meeting_id)
+    if decision == "confirmed":
+        moderation = UserModeration.query.filter_by(user_id=report.target_id).first()
+        hidden_until = utcnow() + timedelta(days=30)
+        if not moderation:
+            moderation = UserModeration(
+                user_id=report.target_id,
+                hidden_until=hidden_until,
+                reason=f"Подтверждённая жалоба #{report.id}",
+            )
+            db.session.add(moderation)
+        else:
+            moderation.hidden_until = max(
+                normalize_dt(moderation.hidden_until), hidden_until
+            )
+            moderation.reason = f"Подтверждённая жалоба #{report.id}"
+    db.session.delete(report)
+    db.session.flush()
+    if meeting:
+        purge_chat_if_ready(meeting)
+    db.session.commit()
+    return jsonify(ok=True, decision=decision)
 
 
 @app.get("/api/admin/traffic")

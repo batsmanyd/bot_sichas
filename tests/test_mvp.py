@@ -117,6 +117,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertFalse(late_response.get_json()["room"]["meeting"]["my_late"])
         self.assertEqual(self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "no_show", "target_user_id": second_user.id,
+            "note": "Не пришёл и не предупредил",
         }).status_code, 200)
         pending_completion = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "complete",
@@ -646,7 +647,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(owner_interests["owned"][0]["people"], ["Тест 109"])
         self.assertEqual(guest_interests["outgoing"][0]["people"], ["Тест 108"])
 
-    def test_thanks_no_show_trust_without_notification_history(self):
+    def test_no_show_dispute_and_thanks_trust(self):
         self.login(self.first, 104)
         self.login(self.second, 105)
         point = {"latitude": 53.9023, "longitude": 27.5619}
@@ -657,13 +658,32 @@ class MvpFlowTest(unittest.TestCase):
         interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
         self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
         second_user = main.User.query.filter_by(telegram_id="test-105").one()
-        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+        missing_reason = self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
             "action": "no_show", "target_user_id": second_user.id,
         })
-        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
+        self.assertEqual(missing_reason.status_code, 400)
+        marked = self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "no_show", "target_user_id": second_user.id,
+            "note": "Не пришёл и не предупредил",
+        })
+        self.assertEqual(marked.status_code, 200, marked.get_json())
         pending_trust = main.trust_payload(second_user.id)
         self.assertEqual(pending_trust["completed_meetings"], 0)
-        self.assertEqual(pending_trust["level"], "Есть замечания")
+        self.assertEqual(pending_trust["level"], "Новый участник")
+        self.assertEqual(pending_trust["no_shows"], 0)
+        no_show = main.MeetingEvent.query.filter_by(kind="no_show").one()
+        no_show.created_at = main.utcnow() - timedelta(hours=25)
+        main.db.session.commit()
+        self.assertEqual(main.trust_payload(second_user.id)["no_shows"], 1)
+        room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
+        self.assertTrue(room["meeting"]["can_dispute_no_show"])
+        disputed = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "dispute_no_show", "note": "Встречу заранее перенесли в чате",
+        })
+        self.assertEqual(disputed.status_code, 200, disputed.get_json())
+        self.assertFalse(disputed.get_json()["room"]["meeting"]["can_dispute_no_show"])
+        self.assertEqual(main.trust_payload(second_user.id)["no_shows"], 0)
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
         self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={"action": "complete"})
         thanked = self.first.post(f"/api/meetings/{meeting_id}/thanks", json={
             "target_user_id": second_user.id,
@@ -672,7 +692,7 @@ class MvpFlowTest(unittest.TestCase):
         trust = main.trust_payload(second_user.id)
         self.assertEqual(trust["completed_meetings"], 1)
         self.assertEqual(trust["thanks"], 1)
-        self.assertEqual(trust["no_shows"], 1)
+        self.assertEqual(trust["no_shows"], 0)
         notifications = self.second.get("/api/notifications").get_json()
         self.assertEqual(notifications["unread"], 0)
         self.assertEqual(notifications["items"], [])
@@ -807,7 +827,12 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
         self.assertIn("await loadInterests(true)", frontend)
-        self.assertIn("0.17.5 · человек и действия сразу в чате", frontend)
+        self.assertNotIn("Версия приложения", frontend)
+        self.assertNotIn("Имитировать реальную встречу", frontend)
+        self.assertIn('id="cityLabel" class="city">Минск</div>', frontend)
+        self.assertIn("Участник не пришёл", frontend)
+        self.assertIn("Оспорить неявку", frontend)
+        self.assertIn("Сказать спасибо", frontend)
         self.assertIn('id="roomPersonCard"', frontend)
         self.assertIn("Открыть фото друг другу", frontend)
         self.assertIn('id="notificationPanel"', frontend)
