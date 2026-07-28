@@ -18,6 +18,8 @@ class MvpFlowTest(unittest.TestCase):
         main.db.session.remove()
         main.Model.metadata.drop_all(main.engine)
         main.Model.metadata.create_all(main.engine)
+        main.REALTIME_REVISIONS.clear()
+        main.REALTIME_EVENTS.clear()
         self.first = main.app.test_client()
         self.second = main.app.test_client()
         self.third = main.app.test_client()
@@ -849,6 +851,53 @@ class MvpFlowTest(unittest.TestCase):
         finally:
             main.BOT_TOKEN, main.telegram_api = original_token, original_api
 
+    def test_realtime_reschedule_and_neutral_finish(self):
+        self.login(self.first, 201)
+        self.login(self.second, 202)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Выпить кофе", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+        first_user = main.User.query.filter_by(telegram_id="test-201").one()
+        second_user = main.User.query.filter_by(telegram_id="test-202").one()
+        before_first = main.REALTIME_REVISIONS.get(first_user.id, 0)
+        before_second = main.REALTIME_REVISIONS.get(second_user.id, 0)
+
+        new_time = main.utcnow() + timedelta(hours=1)
+        moved = self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "reschedule", "starts_at": new_time.isoformat(),
+        })
+        self.assertEqual(moved.status_code, 200, moved.get_json())
+        self.assertGreater(main.REALTIME_REVISIONS[first_user.id], before_first)
+        self.assertGreater(main.REALTIME_REVISIONS[second_user.id], before_second)
+        self.assertFalse(moved.get_json()["room"]["meeting"]["can_mark_no_show"])
+        self.assertEqual(self.second.post(
+            f"/api/meetings/{meeting_id}/lifecycle",
+            json={"action": "no_show", "target_user_id": first_user.id, "note": "Не пришёл"},
+        ).status_code, 409)
+
+        closed = self.second.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "not_happened",
+        })
+        self.assertEqual(closed.status_code, 200, closed.get_json())
+        self.assertEqual(closed.get_json()["room"]["meeting"]["status"], "cancelled")
+        self.assertEqual(main.trust_payload(first_user.id)["no_shows"], 0)
+        self.assertEqual(main.trust_payload(second_user.id)["no_shows"], 0)
+
+    def test_realtime_stream_requires_login_and_starts_immediately(self):
+        self.assertEqual(self.first.get("/api/events").status_code, 401)
+        self.login(self.first, 203)
+        response = self.first.get("/api/events", buffered=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "text/event-stream")
+        self.assertIn(b"retry: 1500", next(response.response))
+        response.close()
+
     def test_frontend_processes_handoff_even_when_telegram_session_already_exists(self):
         with open("index.html", encoding="utf-8") as source:
             frontend = source.read()
@@ -856,7 +905,12 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("if(tg?.initData&&(!data.authenticated||mustPassHandoff))", frontend)
         self.assertIn("data-presence", frontend)
         self.assertIn("reportParticipant", frontend)
-        self.assertIn("activeRoom&&$('roomDialog').open?2500", frontend)
+        self.assertIn("activeRoom&&$('roomDialog').open?10000", frontend)
+        self.assertIn("new EventSource('/api/events')", frontend)
+        self.assertIn("Связь установлена", frontend)
+        self.assertIn('id="finishMeetingDialog"', frontend)
+        self.assertIn("Перенесли на другое время", frontend)
+        self.assertIn("Доставлено ✓", frontend)
         self.assertIn("scheduleLiveRefresh()", frontend)
         self.assertIn("groupedMeetings(items)", frontend)
         self.assertIn("cache:'no-store'", frontend)
