@@ -15,7 +15,10 @@ from urllib.parse import parse_qsl, quote, urlencode
 import jwt
 import requests
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask import (
+    Flask, Response, jsonify, redirect, request, send_from_directory, session,
+    stream_with_context,
+)
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
     Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
@@ -26,7 +29,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "0.17.7"
+APP_VERSION = "0.17.8"
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
@@ -62,6 +65,9 @@ device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-de
 DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
 GEOCODE_LOCK = threading.Lock()
 last_geocode_request_at = 0.0
+REALTIME_CONDITION = threading.Condition()
+REALTIME_REVISIONS = {}
+REALTIME_EVENTS = {}
 
 
 engine_options = {"pool_pre_ping": True}
@@ -410,6 +416,17 @@ def normalize_dt(value):
     return value
 
 
+def emit_realtime(user_ids, kind="changed", meeting_id=None):
+    """Wake connected clients after the database transaction is committed."""
+    payload = {"kind": kind, "meeting_id": meeting_id, "at": int(time.time())}
+    with REALTIME_CONDITION:
+        for user_id in set(user_ids):
+            revision = REALTIME_REVISIONS.get(user_id, 0) + 1
+            REALTIME_REVISIONS[user_id] = revision
+            REALTIME_EVENTS[user_id] = {**payload, "revision": revision}
+        REALTIME_CONDITION.notify_all()
+
+
 def current_user():
     user_id = session.get("user_id")
     return db.session.get(User, user_id) if user_id else None
@@ -422,6 +439,35 @@ def login_required(view):
             return jsonify(error="Нужна регистрация через Telegram"), 401
         return view(*args, **kwargs)
     return wrapped
+
+
+@app.get("/api/events")
+@login_required
+def realtime_events():
+    user_id = current_user().id
+
+    @stream_with_context
+    def stream():
+        revision = REALTIME_REVISIONS.get(user_id, 0)
+        yield "retry: 1500\n\n"
+        while True:
+            with REALTIME_CONDITION:
+                REALTIME_CONDITION.wait_for(
+                    lambda: REALTIME_REVISIONS.get(user_id, 0) != revision,
+                    timeout=15,
+                )
+                next_revision = REALTIME_REVISIONS.get(user_id, 0)
+                event = REALTIME_EVENTS.get(user_id)
+            if next_revision != revision and event:
+                revision = next_revision
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            else:
+                yield ": heartbeat\n\n"
+
+    response = Response(stream(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache, no-transform"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 def json_body():
@@ -789,11 +835,19 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
     user = db.session.get(User, user_id)
     if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
         return True
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": user.telegram_id, "text": text}, timeout=5).raise_for_status()
-    except requests.RequestException:
-        app.logger.warning("Telegram notification failed for user %s", user_id)
+    telegram_id = user.telegram_id
+
+    def deliver():
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": telegram_id, "text": text},
+                timeout=5,
+            ).raise_for_status()
+        except requests.RequestException:
+            app.logger.warning("Telegram notification failed for user %s", user_id)
+
+    threading.Thread(target=deliver, daemon=True).start()
     return True
 
 
@@ -1721,6 +1775,7 @@ def propose_meeting_to_presence(presence_id):
     db.session.flush()
     db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
     db.session.commit()
+    emit_realtime({presence.user_id, user.id}, "interest", meeting.id)
     notify_user(
         presence.user_id,
         f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}",
@@ -1752,6 +1807,7 @@ def express_interest(meeting_id):
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
         db.session.commit()
+        emit_realtime({meeting.owner_id, user.id}, "interest", meeting.id)
         notify_user(
             meeting.owner_id,
             f"Новый отклик на встречу «{meeting.description}» от {user.name}",
@@ -1921,6 +1977,7 @@ def decide_interest(interest_id):
             {"active_until": utcnow()}, synchronize_session=False
         )
     db.session.commit()
+    emit_realtime({meeting.owner_id, interest.user_id}, f"interest_{decision}", meeting.id)
     result_text = "принят" if decision == "accepted" else "отклонён"
     notify_user(
         interest.user_id,
@@ -2020,8 +2077,10 @@ def room_payload(meeting, user):
     my_feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
                          "latitude": meeting.latitude, "longitude": meeting.longitude,
+                         "starts_at": normalize_dt(meeting.starts_at).isoformat(),
                          "is_owner": meeting.owner_id == user.id, "status": status,
                          "my_late": my_late,
+                         "can_mark_no_show": utcnow() >= normalize_dt(meeting.starts_at),
                          "can_dispute_no_show": bool(no_show_against_me and not no_show_disputed),
                          "my_completion_confirmed": user.id in completion_ids,
                          "needs_feedback": user.id in completion_ids and feedback_rating(my_feedback) is None,
@@ -2073,6 +2132,7 @@ def consent_to_photo(meeting_id):
     if not consent:
         db.session.add(PhotoConsent(meeting_id=meeting.id, user_id=user.id))
         db.session.commit()
+        emit_meeting(meeting, "photo_consent")
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
@@ -2113,6 +2173,7 @@ def propose_place(meeting_id):
             ))
             db.session.commit()
             maybe_confirm_place(meeting, existing_place)
+            emit_meeting(meeting, "place_vote")
         return jsonify(
             ok=True, already_exists=True,
             room=room_payload(meeting, current_user()),
@@ -2127,13 +2188,7 @@ def propose_place(meeting_id):
         ))
     db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
     db.session.commit()
-    for member_id in accepted_user_ids(meeting) - {current_user().id}:
-        notify_user(
-            member_id,
-            f"{current_user().name} предложил место «{title}» для встречи «{meeting.description}».",
-            kind="place_proposed",
-            telegram=True,
-        )
+    emit_meeting(meeting, "place_proposed")
     maybe_confirm_place(meeting, place)
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
@@ -2205,6 +2260,7 @@ def vote_place(place_id):
     db.session.commit()
     if not vote:
         maybe_confirm_place(meeting, place)
+    emit_meeting(meeting, "place_vote")
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
 
 
@@ -2221,14 +2277,7 @@ def maybe_confirm_place(meeting, place, force=False):
     )
     place.confirmed = 1
     db.session.commit()
-    for member_id in member_ids:
-        notify_user(
-            member_id,
-            f"Место встречи согласовано: {place.title}",
-            kind="place_confirmed",
-            dedupe_key=f"place-confirmed-{meeting.id}-{place.id}-{member_id}",
-            telegram=True,
-        )
+    emit_meeting(meeting, "place_confirmed")
     return True
 
 
@@ -2240,6 +2289,7 @@ def confirm_place(place_id):
     if meeting.owner_id != current_user().id:
         return jsonify(error="Место подтверждает создатель встречи"), 403
     maybe_confirm_place(meeting, place, force=True)
+    emit_meeting(meeting, "place_confirmed")
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
 
 
@@ -2260,13 +2310,7 @@ def send_message(meeting_id):
         return jsonify(error="Напишите сообщение"), 400
     db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
     db.session.commit()
-    for member_id in accepted_user_ids(meeting) - {current_user().id}:
-        notify_user(
-            member_id,
-            f"{current_user().name}: {text[:180]}",
-            kind="chat_message",
-            telegram=True,
-        )
+    emit_meeting(meeting, "chat_message")
     return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
 
 
@@ -2283,6 +2327,10 @@ def accepted_user_ids(meeting):
         meeting_id=meeting.id, status="accepted").all()}
 
 
+def emit_meeting(meeting, kind="meeting_changed"):
+    emit_realtime(accepted_user_ids(meeting), kind, meeting.id)
+
+
 @app.post("/api/meetings/<int:meeting_id>/lifecycle")
 @login_required
 def meeting_lifecycle(meeting_id):
@@ -2291,7 +2339,10 @@ def meeting_lifecycle(meeting_id):
         return error
     user, data = current_user(), json_body()
     action = data.get("action")
-    if action not in {"late", "cancel", "complete", "no_show", "dispute_no_show", "leave"}:
+    if action not in {
+        "late", "cancel", "complete", "no_show", "dispute_no_show", "leave",
+        "not_happened", "reschedule",
+    }:
         return jsonify(error="Неизвестное действие"), 400
     state = state_for(meeting)
     if state.status == "completed" and not completed_by_all(meeting):
@@ -2317,6 +2368,7 @@ def meeting_lifecycle(meeting_id):
         close_member_presences(meeting)
         purge_meeting_notifications(meeting)
         db.session.commit()
+        emit_realtime({meeting.owner_id, user.id}, "meeting_left", meeting.id)
         notify_user(
             meeting.owner_id,
             f"{user.name} отказался от встречи «{meeting.description}»",
@@ -2324,6 +2376,8 @@ def meeting_lifecycle(meeting_id):
         )
         return jsonify(ok=True, left=True)
     if action == "no_show":
+        if utcnow() < normalize_dt(meeting.starts_at):
+            return jsonify(error="Неявку можно отметить только после назначенного времени"), 409
         try:
             target_id = int(target_id)
         except (TypeError, ValueError):
@@ -2357,6 +2411,7 @@ def meeting_lifecycle(meeting_id):
             target_user_id=no_show.user_id, kind="no_show_disputed", note=reason,
         ))
         db.session.commit()
+        emit_meeting(meeting, "no_show_disputed")
         notify_user(
             no_show.user_id,
             f"{user.name} оспорил отметку о неявке на встречу «{meeting.description}».",
@@ -2367,6 +2422,21 @@ def meeting_lifecycle(meeting_id):
     if action == "cancel":
         state.status = "cancelled"
         meeting.expires_at = utcnow()
+    elif action == "not_happened":
+        state.status = "cancelled"
+        meeting.expires_at = utcnow()
+        data["note"] = "Встреча не состоялась по договорённости"
+    elif action == "reschedule":
+        try:
+            starts_at = datetime.fromisoformat(str(data.get("starts_at", "")).replace("Z", "+00:00"))
+            starts_at = normalize_dt(starts_at)
+        except (TypeError, ValueError):
+            return jsonify(error="Выберите новое время встречи"), 400
+        if starts_at < utcnow() + timedelta(minutes=5) or starts_at > utcnow() + timedelta(days=7):
+            return jsonify(error="Новое время должно быть от 5 минут до 7 дней вперёд"), 400
+        meeting.starts_at = starts_at
+        meeting.expires_at = starts_at + timedelta(minutes=60)
+        data["note"] = f"Новое время: {starts_at.isoformat()}"
     elif action == "complete":
         if len(accepted_user_ids(meeting)) < 2:
             return jsonify(error="Сначала подтвердите участника встречи"), 409
@@ -2405,7 +2475,7 @@ def meeting_lifecycle(meeting_id):
     if action != "complete":
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
                                     kind=action, note=str(data.get("note", "")).strip()[:180] or None))
-    if action == "cancel":
+    if action in {"cancel", "not_happened"}:
         db.session.flush()
         purge_chat_if_ready(meeting)
         close_member_presences(meeting)
@@ -2413,7 +2483,8 @@ def meeting_lifecycle(meeting_id):
     elif action == "complete":
         close_member_presences(meeting)
     db.session.commit()
-    if action in {"cancel", "late", "no_show"} or (
+    emit_meeting(meeting, f"meeting_{action}")
+    if action in {"cancel", "late", "no_show", "not_happened", "reschedule"} or (
         action == "complete" and completed_by_all(meeting)
     ):
         action_text = {
@@ -2425,13 +2496,15 @@ def meeting_lifecycle(meeting_id):
             ),
             "late": f"{user.name} сообщает, что опаздывает",
             "no_show": "По встрече отмечена неявка участника",
+            "not_happened": "Встреча не состоялась по договорённости",
+            "reschedule": "Встреча перенесена на другое время",
         }[action]
         for member_id in accepted_user_ids(meeting) - {user.id}:
             notify_user(
                 member_id,
                 f"{action_text}: «{meeting.description}»",
                 kind=f"meeting_{action}",
-                telegram=action in {"cancel", "late", "no_show"},
+                telegram=action in {"cancel", "late", "no_show", "not_happened", "reschedule"},
             )
     return jsonify(ok=True, room=room_payload(meeting, user))
 
@@ -2466,6 +2539,7 @@ def leave_feedback(meeting_id):
     close_member_presences(meeting)
     purge_meeting_notifications(meeting, {current_user().id})
     db.session.commit()
+    emit_meeting(meeting, "feedback")
     return jsonify(ok=True, closed=True)
 
 
@@ -2492,6 +2566,7 @@ def thank_participant(meeting_id):
             meeting_id=meeting.id, giver_id=user.id, receiver_id=receiver_id,
         ))
         db.session.commit()
+        emit_meeting(meeting, "thanks")
         notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
                     kind="thanks",
                     dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}",
