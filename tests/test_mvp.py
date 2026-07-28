@@ -282,6 +282,40 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(main.Presence.query.filter_by(user_id=second_user.id).count(), 0)
         self.assertEqual(self.first.get("/api/notifications").get_json()["items"], [])
 
+    def test_stale_accepted_meeting_is_closed_after_24_hours(self):
+        self.login(self.first, 137)
+        self.login(self.second, 138)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "cafe", "description": "Старая тестовая встреча",
+            "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(
+            f"/api/interests/{interest_id}/decision", json={"decision": "accepted"}
+        )
+        meeting = main.db.session.get(main.Meeting, meeting_id)
+        meeting.starts_at = main.utcnow() - timedelta(hours=25)
+        main.db.session.add(main.ChatMessage(
+            meeting_id=meeting_id,
+            user_id=main.User.query.filter_by(telegram_id="test-137").one().id,
+            text="Старое тестовое сообщение",
+        ))
+        main.db.session.commit()
+
+        self.assertEqual(self.first.get("/api/interests").get_json()["owned"], [])
+        self.assertEqual(self.second.get("/api/interests").get_json()["outgoing"], [])
+        self.assertEqual(self.first.get(f"/api/meetings/{meeting_id}/room").status_code, 410)
+        self.assertEqual(main.ChatMessage.query.filter_by(meeting_id=meeting_id).count(), 0)
+
+    def test_version_endpoint_matches_visible_build(self):
+        response = self.first.get("/api/version")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["version"], main.APP_VERSION)
+        page = self.first.get("/").get_data(as_text=True)
+        self.assertIn(f"Версия <span id=\"appVersion\">{main.APP_VERSION}</span>", page)
+
     def test_confirmed_one_to_one_meeting_disappears_from_public_feed(self):
         self.login(self.first, 134)
         self.login(self.second, 135)
