@@ -26,6 +26,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_VERSION = "0.17.7"
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
@@ -625,7 +626,7 @@ def closed_at_for(meeting, user_id):
 
 
 def reconcile_closed_meetings(user):
-    """Clean records closed before this release when the user next opens the app."""
+    """Close stale accepted meetings and clean records when the user next opens the app."""
     meeting_ids = {
         row.meeting_id for row in Interest.query.filter_by(user_id=user.id).all()
     }
@@ -635,7 +636,25 @@ def reconcile_closed_meetings(user):
     changed = False
     for meeting_id in meeting_ids:
         meeting = db.session.get(Meeting, meeting_id)
-        if not meeting or not chat_closed_for(meeting, user.id):
+        if not meeting:
+            continue
+        has_accepted = Interest.query.filter_by(
+            meeting_id=meeting.id, status="accepted"
+        ).first() is not None
+        stale_deadline = normalize_dt(meeting.starts_at) + timedelta(hours=24)
+        state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
+        raw_status = state.status if state else "active"
+        if has_accepted and raw_status == "active" and stale_deadline <= utcnow():
+            if not state:
+                state = MeetingState(meeting_id=meeting.id, status="cancelled")
+                db.session.add(state)
+            else:
+                state.status = "cancelled"
+            meeting.expires_at = utcnow()
+            changed = bool(close_member_presences(
+                meeting, stale_before=stale_deadline
+            )) or True
+        if not chat_closed_for(meeting, user.id):
             continue
         closed_at = closed_at_for(meeting, user.id)
         if closed_at:
@@ -933,7 +952,16 @@ def security_headers(response):
 @app.get("/health")
 def health():
     db.session.execute(db.select(db.literal(1)))
-    return jsonify(ok=True, telegram_bot_configured=telegram_bot_configured)
+    return jsonify(
+        ok=True,
+        version=APP_VERSION,
+        telegram_bot_configured=telegram_bot_configured,
+    )
+
+
+@app.get("/api/version")
+def api_version():
+    return jsonify(version=APP_VERSION)
 
 
 @app.get("/api/session")
@@ -1804,6 +1832,7 @@ def meeting_list_summary(meeting, viewer):
 @login_required
 def list_interests():
     user = current_user()
+    reconcile_closed_meetings(user)
     now = utcnow()
     chat_cleanup_needed = False
     all_meetings = Meeting.query.order_by(Meeting.id.desc()).all()
