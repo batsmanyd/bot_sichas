@@ -24,6 +24,8 @@
 - `SELFIE_ENCRYPTION_KEY_VERSION` — версия текущего ключа, например `v1`;
 - `PUBLIC_URL` — публичный адрес Railway без завершающего `/`;
 - `TELEGRAM_BOT_TOKEN` — токен `@vmeste_rjadom_bot` (старое имя `BOT_TOKEN` тоже поддерживается);
+- `ADMIN_TELEGRAM_IDS` — Telegram ID администраторов через запятую, без имён пользователей;
+- `ENABLE_SSE=false` — SSE не используется как основной production-механизм синхронизации;
 - `ALLOW_TEST_AUTH=false`.
 
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
