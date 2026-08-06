@@ -16,7 +16,7 @@ import jwt
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from flask import (
-    Flask, Response, jsonify, redirect, request, send_from_directory, session,
+    Flask, Response, abort, jsonify, redirect, request, send_from_directory, session,
     stream_with_context,
 )
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -30,7 +30,9 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_VERSION = "0.17.8"
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"} or bool(os.getenv("RAILWAY_ENVIRONMENT"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8080").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
@@ -39,7 +41,23 @@ ALLOW_TEST_AUTH = os.getenv("ALLOW_TEST_AUTH", "false").lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
 
-database_url = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}")
+if IS_PRODUCTION:
+    missing_configuration = [
+        name for name, value in {
+            "SECRET_KEY": os.getenv("SECRET_KEY"),
+            "SELFIE_ENCRYPTION_KEY": os.getenv("SELFIE_ENCRYPTION_KEY"),
+            "DATABASE_URL": os.getenv("DATABASE_URL"),
+            "PUBLIC_URL": os.getenv("PUBLIC_URL"),
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+        }.items() if not str(value or "").strip()
+    ]
+    if missing_configuration:
+        raise RuntimeError(
+            "Missing required production configuration: "
+            + ", ".join(sorted(missing_configuration))
+        )
+
+database_url = os.getenv("DATABASE_URL") or f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}"
 if database_url.startswith("postgres://"):
     database_url = "postgresql+psycopg://" + database_url[len("postgres://"):]
 elif database_url.startswith("postgresql://"):
@@ -48,18 +66,23 @@ elif database_url.startswith("postgresql://"):
 secret_seed = os.getenv("SECRET_KEY") or CLIENT_SECRET or BOT_TOKEN
 if not secret_seed:
     secret_seed = secrets.token_hex(32)
+selfie_key_seed = os.getenv("SELFIE_ENCRYPTION_KEY") or f"{secret_seed}|development-selfie-key"
+SELFIE_ENCRYPTION_KEY_VERSION = (
+    os.getenv("SELFIE_ENCRYPTION_KEY_VERSION", "v1").strip() or "v1"
+)
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = hashlib.sha256(f"{secret_seed}|seichas-session".encode()).hexdigest()
 selfie_cipher = Fernet(base64.urlsafe_b64encode(
-    hashlib.sha256(f"{app.secret_key}|selfie-storage-v1".encode()).digest()
+    hashlib.sha256(selfie_key_seed.encode()).digest()
 ))
 app.config.update(
     SESSION_COOKIE_SECURE=PUBLIC_URL.startswith("https://") and not app.testing,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    MAX_CONTENT_LENGTH=1_000_000,
 )
 device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-device-auth-v1")
 DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
@@ -129,7 +152,7 @@ def utcnow():
 
 
 def encrypt_selfie(value):
-    return "enc:" + selfie_cipher.encrypt(value.encode()).decode()
+    return f"enc:{SELFIE_ENCRYPTION_KEY_VERSION}:" + selfie_cipher.encrypt(value.encode()).decode()
 
 
 def decrypt_selfie(value):
@@ -138,7 +161,13 @@ def decrypt_selfie(value):
     if not value.startswith("enc:"):
         return value  # Existing records are migrated when the profile is next saved.
     try:
-        return selfie_cipher.decrypt(value[4:].encode()).decode()
+        encrypted_value = value[4:]
+        if ":" in encrypted_value:
+            version, encrypted_value = encrypted_value.split(":", 1)
+            if version != SELFIE_ENCRYPTION_KEY_VERSION:
+                app.logger.error("Stored selfie uses an unavailable encryption key version")
+                return None
+        return selfie_cipher.decrypt(encrypted_value.encode()).decode()
     except InvalidToken:
         app.logger.error("Stored selfie could not be decrypted")
         return None
@@ -1000,6 +1029,16 @@ def security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "script-src 'self' 'unsafe-inline' https://telegram.org https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+        "img-src 'self' data: https://*.tile.openstreetmap.org; "
+        "connect-src 'self' https://nominatim.openstreetmap.org;"
+    )
+    response.headers["Permissions-Policy"] = "camera=(self), geolocation=(self), microphone=()"
+    if PUBLIC_URL.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -2735,12 +2774,23 @@ def ios_app_icon():
     return response
 
 
+PUBLIC_FILES = {
+    "legal.html",
+    "manifest.webmanifest",
+    "favicon-32.png",
+    "apple-touch-icon.png",
+    "app-icon-192.png",
+    "app-icon-512.png",
+    "demo-user.svg",
+    "demo-anna.svg",
+}
+
+
 @app.get("/<path:path>")
-def static_files(path):
-    full_path = os.path.join(BASE_DIR, path)
-    if os.path.isfile(full_path):
-        return send_from_directory(BASE_DIR, path)
-    return send_from_directory(BASE_DIR, "index.html")
+def public_files(path):
+    if path not in PUBLIC_FILES:
+        abort(404)
+    return send_from_directory(BASE_DIR, path)
 
 
 with app.app_context():
