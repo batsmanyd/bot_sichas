@@ -1028,6 +1028,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(response.headers["X-Request-ID"], supplied)
         generated = self.first.get("/health", headers={"X-Request-ID": "bad value"}).headers["X-Request-ID"]
         self.assertRegex(generated, r"^[0-9a-f]{32}$")
+        with open("main.py", encoding="utf-8") as source:
+            backend = source.read()
+        self.assertNotIn('app.logger.warning("Reverse geocoding failed for %s"', backend)
+        self.assertNotIn('app.logger.warning("Telegram notification failed for user %s"', backend)
 
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
@@ -1054,6 +1058,47 @@ class MvpFlowTest(unittest.TestCase):
         main.REALTIME_REVISIONS.clear()
         main.REALTIME_EVENTS.clear()
         self.assertEqual(self.first.get("/api/sync-state").get_json()["user"], stored)
+
+    def test_two_user_room_revisions_cover_chat_place_vote_and_reschedule(self):
+        self.login(self.first, 340)
+        self.login(self.second, 341)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        baseline = self.first.get("/api/sync-state").get_json()["feed"]
+        self.first.post("/api/location", json=point)
+        after_location = self.first.get("/api/sync-state").get_json()["feed"]
+        self.assertGreater(after_location, baseline)
+        self.first.post("/api/presence", json={**point, "category": "cafe"})
+        after_presence = self.first.get("/api/sync-state").get_json()["feed"]
+        self.assertGreater(after_presence, after_location)
+        self.first.delete("/api/presence")
+        self.assertGreater(self.first.get("/api/sync-state").get_json()["feed"], after_presence)
+
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Полная синхронизация", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+
+        def room_revision(client):
+            return client.get(f"/api/sync-state?room_id={meeting_id}").get_json()["room"]
+
+        revision = room_revision(self.second)
+        self.first.post(f"/api/meetings/{meeting_id}/messages", json={"text": "Проверка синхронизации"})
+        self.assertGreater(room_revision(self.second), revision)
+        revision = room_revision(self.second)
+        place_response = self.first.post(f"/api/meetings/{meeting_id}/places", json={"title": "Парк"})
+        place_id = place_response.get_json()["room"]["places"][0]["id"]
+        self.assertGreater(room_revision(self.second), revision)
+        revision = room_revision(self.first)
+        self.second.post(f"/api/places/{place_id}/vote", json={})
+        self.assertGreater(room_revision(self.first), revision)
+        revision = room_revision(self.second)
+        moved_to = (main.utcnow() + timedelta(hours=1)).isoformat()
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "reschedule", "starts_at": moved_to,
+        })
+        self.assertGreater(room_revision(self.second), revision)
 
     def test_user_cannot_have_two_active_confirmed_meetings(self):
         self.login(self.first, 302)
