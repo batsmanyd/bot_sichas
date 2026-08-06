@@ -1208,7 +1208,7 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
                 timeout=5,
             ).raise_for_status()
         except requests.RequestException:
-            app.logger.warning("Telegram notification failed for user %s", user_id)
+            app.logger.warning("Telegram user notification delivery failed")
 
     threading.Thread(target=deliver, daemon=True).start()
     return True
@@ -2722,7 +2722,7 @@ def reverse_geocode():
             house_number = address.get("house_number")
             title = f"{title}, {house_number}" if house_number else title
     except (requests.RequestException, ValueError):
-        app.logger.warning("Reverse geocoding failed for %s", coordinate_key)
+        app.logger.warning("Reverse geocoding failed")
     title = str(title).strip()[:120] or "Точка на карте"
     db.session.add(GeocodeCache(coordinate_key=coordinate_key, title=title))
     db.session.commit()
