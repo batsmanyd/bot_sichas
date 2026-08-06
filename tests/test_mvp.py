@@ -318,7 +318,9 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.get("/api/version")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["version"], main.APP_VERSION)
-        page = self.first.get("/").get_data(as_text=True)
+        page_response = self.first.get("/")
+        page = page_response.get_data(as_text=True)
+        page_response.close()
         self.assertIn(f"Версия <span id=\"appVersion\">{main.APP_VERSION}</span>", page)
 
     def test_confirmed_one_to_one_meeting_disappears_from_public_feed(self):
@@ -968,7 +970,9 @@ class MvpFlowTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.first.get(path).status_code, 404)
-        self.assertEqual(self.first.get("/manifest.webmanifest").status_code, 200)
+        manifest_response = self.first.get("/manifest.webmanifest")
+        self.assertEqual(manifest_response.status_code, 200)
+        manifest_response.close()
 
     def test_production_configuration_fails_fast_without_secrets(self):
         environment = os.environ.copy()
@@ -1219,7 +1223,7 @@ class MvpFlowTest(unittest.TestCase):
                 headers={"X-CSRF-Token": csrf},
             )
             self.assertEqual(decided.status_code, 200, decided.get_json())
-            self.assertEqual(main.UserReport.query.get(report_id).status, "confirmed")
+            self.assertEqual(main.db.session.get(main.UserReport, report_id).status, "confirmed")
             self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 1)
             blocked = self.third.post(
                 f"/api/admin/reports/{report_id}/action",
