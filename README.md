@@ -29,8 +29,9 @@
 - `ALLOW_TEST_AUTH=false`.
 
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
-завершает запуск, если отсутствует обязательная конфигурация, и никогда не
-генерирует временный ключ автоматически.
+завершает запуск, если отсутствует обязательная конфигурация, используется не
+PostgreSQL/HTTPS, включён тестовый вход или схема БД не находится на Alembic
+revision `0007_runtime_guards`. Временный production-ключ не генерируется.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
 
@@ -39,5 +40,9 @@
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+Destructive PostgreSQL concurrency tests разрешены только для отдельной
+одноразовой БД, когда `DATABASE_URL` точно совпадает с `TEST_POSTGRES_URL` и
+явно задано `ALLOW_DESTRUCTIVE_TEST_DB=true`.
 
 Railway запускает приложение командой из `Procfile`.
