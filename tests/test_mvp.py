@@ -1,6 +1,9 @@
 import hashlib
 import hmac
 import json
+import os
+import subprocess
+import sys
 import time
 import unittest
 from datetime import timedelta
@@ -954,6 +957,35 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(frontend.count("$('locateMe').onclick=locateMe"), 1)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
+
+    def test_private_repository_files_are_not_public(self):
+        for path in (
+            "/main.py", "/.git/config", "/tests/test_mvp.py", "/sichas.db",
+            "/static/../main.py", "/%2e%2e/main.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.first.get(path).status_code, 404)
+        self.assertEqual(self.first.get("/manifest.webmanifest").status_code, 200)
+
+    def test_production_configuration_fails_fast_without_secrets(self):
+        environment = os.environ.copy()
+        for name in (
+            "SECRET_KEY", "SELFIE_ENCRYPTION_KEY", "DATABASE_URL", "PUBLIC_URL",
+            "TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "RAILWAY_ENVIRONMENT",
+        ):
+            environment.pop(name, None)
+        environment["APP_ENV"] = "production"
+        process = subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("Missing required production configuration", process.stderr)
+        self.assertNotIn("audit-local-only-not-production", process.stderr)
 
 
 if __name__ == "__main__":
