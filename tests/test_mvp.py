@@ -987,6 +987,209 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("Missing required production configuration", process.stderr)
         self.assertNotIn("audit-local-only-not-production", process.stderr)
 
+    def test_sync_revisions_are_durable_and_cover_presence_and_meeting(self):
+        self.login(self.first, 301)
+        user = main.User.query.filter_by(telegram_id="test-301").one()
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        before = self.first.get("/api/sync-state").get_json()
+        self.first.post("/api/presence", json={**point, "category": "cafe"})
+        after_presence = self.first.get("/api/sync-state").get_json()
+        self.assertGreater(after_presence["feed"], before["feed"])
+        self.assertGreater(after_presence["user"], before["user"])
+        self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Аудит ревизий", "format": "one",
+        })
+        after_meeting = self.first.get("/api/sync-state").get_json()
+        self.assertGreater(after_meeting["feed"], after_presence["feed"])
+        stored = main.SyncRevision.query.filter_by(key=f"user:{user.id}").one().revision
+        main.REALTIME_REVISIONS.clear()
+        main.REALTIME_EVENTS.clear()
+        self.assertEqual(self.first.get("/api/sync-state").get_json()["user"], stored)
+
+    def test_user_cannot_have_two_active_confirmed_meetings(self):
+        self.login(self.first, 302)
+        self.login(self.second, 303)
+        self.login(self.third, 304)
+        point = {"latitude": 53.9023, "longitude": 27.5619,
+                 "category": "cafe", "description": "Одна активная встреча", "format": "one"}
+        first_meeting = self.first.post("/api/meetings", json=point).get_json()["id"]
+        second_meeting = self.second.post("/api/meetings", json=point).get_json()["id"]
+        self.third.post(f"/api/meetings/{first_meeting}/interest", json={})
+        self.third.post(f"/api/meetings/{second_meeting}/interest", json={})
+        first_interest = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        second_interest = self.second.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.assertEqual(self.first.post(
+            f"/api/interests/{first_interest}/decision", json={"decision": "accepted"}
+        ).status_code, 200)
+        conflict = self.second.post(
+            f"/api/interests/{second_interest}/decision", json={"decision": "accepted"}
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.get_json()["code"], "ACTIVE_MEETING_CONFLICT")
+
+    def test_operation_id_replays_meeting_and_message(self):
+        self.login(self.first, 305)
+        operation_id = "meeting-operation-305"
+        payload = {"latitude": 53.9023, "longitude": 27.5619,
+                   "category": "cafe", "description": "Идемпотентная встреча", "format": "one"}
+        headers = {"X-Operation-ID": operation_id}
+        created = self.first.post("/api/meetings", json=payload, headers=headers)
+        replayed = self.first.post("/api/meetings", json=payload, headers=headers)
+        self.assertEqual((created.status_code, replayed.status_code), (201, 201))
+        self.assertEqual(created.get_json()["id"], replayed.get_json()["id"])
+        self.assertTrue(replayed.get_json()["replayed"])
+        self.assertEqual(main.Meeting.query.count(), 1)
+
+    def test_notifications_respect_read_at(self):
+        self.login(self.first, 306)
+        user = main.User.query.filter_by(telegram_id="test-306").one()
+        main.db.session.add(main.UserNotification(
+            user_id=user.id, kind="moderation_warning", text="Тестовое предупреждение",
+            dedupe_key="warning:306",
+        ))
+        main.db.session.commit()
+        before = self.first.get("/api/notifications").get_json()
+        self.assertEqual(before["unread"], 1)
+        self.assertFalse(before["items"][0]["read"])
+        self.first.post("/api/notifications/read", json={})
+        after = self.first.get("/api/notifications").get_json()
+        self.assertEqual(after["unread"], 0)
+        self.assertTrue(after["items"][0]["read"])
+
+    def test_room_returns_latest_one_hundred_messages(self):
+        self.login(self.first, 307)
+        self.login(self.second, 308)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "talk", "description": "Последние сообщения", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        first_user = main.User.query.filter_by(telegram_id="test-307").one()
+        for number in range(120):
+            main.db.session.add(main.ChatMessage(
+                meeting_id=meeting_id, user_id=first_user.id, text=f"Сообщение {number + 1}"
+            ))
+        main.db.session.commit()
+        messages = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()["messages"]
+        self.assertEqual(len(messages), 100)
+        self.assertEqual(messages[0]["text"], "Сообщение 21")
+        self.assertEqual(messages[-1]["text"], "Сообщение 120")
+
+    def test_admin_report_outbox_and_audit(self):
+        original_admins, original_api = main.ADMIN_TELEGRAM_IDS, main.telegram_api
+        main.ADMIN_TELEGRAM_IDS = {"test-999"}
+        sent = []
+        main.telegram_api = lambda method, payload: sent.append((method, payload)) or {"ok": True}
+        try:
+            self.login(self.first, 309)
+            self.login(self.second, 310)
+            point = {"latitude": 53.9023, "longitude": 27.5619}
+            meeting_id = self.first.post("/api/meetings", json={
+                **point, "category": "walk", "description": "Жалоба для админки", "format": "one",
+            }).get_json()["id"]
+            self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+            interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+            self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+            target = main.User.query.filter_by(telegram_id="test-310").one()
+            reported = self.first.post(f"/api/meetings/{meeting_id}/report", json={
+                "target_user_id": target.id, "category": "safety", "reason": "Нарушил правила безопасности",
+            })
+            self.assertEqual(reported.status_code, 200, reported.get_json())
+            report_id = reported.get_json()["report_id"]
+            self.assertEqual(main.NotificationOutbox.query.count(), 1)
+            main.process_notification_outbox()
+            main.process_notification_outbox()
+            self.assertEqual(len(sent), 1)
+            self.assertIn(f"Новая жалоба #{report_id}", sent[0][1]["text"])
+
+            self.login(self.third, 999)
+            dashboard = self.third.get("/api/admin/dashboard")
+            self.assertEqual(dashboard.status_code, 200)
+            csrf = dashboard.get_json()["csrf_token"]
+            reports = self.third.get("/api/admin/reports").get_json()["items"]
+            self.assertEqual(reports[0]["reporter"][:2], "u_")
+            self.assertNotIn("picture", reports[0])
+            decided = self.third.post(
+                f"/api/admin/reports/{report_id}/action",
+                json={"action": "confirm", "reason": "Подтверждено модератором"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(decided.status_code, 200, decided.get_json())
+            self.assertEqual(main.UserReport.query.get(report_id).status, "confirmed")
+            self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 1)
+        finally:
+            main.ADMIN_TELEGRAM_IDS, main.telegram_api = original_admins, original_api
+
+    def test_admin_access_and_csrf_are_server_enforced(self):
+        self.login(self.first, 311)
+        self.assertEqual(self.first.get("/admin").status_code, 403)
+        self.assertEqual(self.first.get("/api/admin/dashboard").status_code, 403)
+
+    def test_regular_bot_text_gets_one_neutral_reply_and_no_outbox(self):
+        original_token, original_api = main.BOT_TOKEN, main.telegram_api
+        main.BOT_TOKEN = "123456:test-token"
+        sent = []
+        main.telegram_api = lambda method, payload: sent.append((method, payload)) or {"ok": True}
+        try:
+            response = self.first.post("/telegram/webhook", json={"message": {
+                "chat": {"id": 401}, "from": {"id": 401, "first_name": "Тест"},
+                "text": "Обычное сообщение",
+            }}, headers={"X-Telegram-Bot-Api-Secret-Token": main.TELEGRAM_WEBHOOK_SECRET})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("Бот не принимает сообщения", sent[0][1]["text"])
+            self.assertEqual(main.NotificationOutbox.query.count(), 0)
+        finally:
+            main.BOT_TOKEN, main.telegram_api = original_token, original_api
+
+    def test_third_independent_report_triggers_exactly_once(self):
+        owner = self.first
+        reporters = [self.second, self.third, main.app.test_client()]
+        self.login(owner, 320)
+        for client, number in zip(reporters, (321, 322, 323)):
+            self.login(client, number)
+        meeting_id = owner.post("/api/meetings", json={
+            "latitude": 53.9023, "longitude": 27.5619, "category": "talk",
+            "description": "Групповая модерация", "format": "group",
+        }).get_json()["id"]
+        for client in reporters:
+            client.post(f"/api/meetings/{meeting_id}/interest", json={})
+        for item in owner.get("/api/interests").get_json()["incoming"]:
+            owner.post(f"/api/interests/{item['id']}/decision", json={"decision": "accepted"})
+        target = main.User.query.filter_by(telegram_id="test-320").one()
+        for index, client in enumerate(reporters, start=1):
+            response = client.post(f"/api/meetings/{meeting_id}/report", json={
+                "target_user_id": target.id,
+                "category": "safety",
+                "reason": f"Независимая жалоба номер {index}",
+            })
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["report_count"], index)
+            if index < 3:
+                self.assertIsNone(main.UserModeration.query.filter_by(user_id=target.id).first())
+        moderation = main.UserModeration.query.filter_by(user_id=target.id).one()
+        self.assertGreater(main.normalize_dt(moderation.hidden_until), main.utcnow())
+        self.assertEqual(main.UserReport.query.filter_by(target_id=target.id, auto_hidden=1).count(), 1)
+        self.assertEqual(main.independent_report_count(target.id), 3)
+
+    def test_room_chat_never_creates_admin_outbox(self):
+        self.login(self.first, 330)
+        self.login(self.second, 331)
+        meeting_id = self.first.post("/api/meetings", json={
+            "latitude": 53.9023, "longitude": 27.5619, "category": "talk",
+            "description": "Чат без Telegram", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        response = self.second.post(
+            f"/api/meetings/{meeting_id}/messages", json={"text": "Обычный room-chat"}
+        )
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertEqual(main.NotificationOutbox.query.count(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

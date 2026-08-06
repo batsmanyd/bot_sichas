@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from urllib.parse import parse_qsl, quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 import jwt
 import requests
@@ -22,8 +22,10 @@ from flask import (
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
     Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine, literal, select,
+    create_engine, distinct, func, literal, select, text as sql_text,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import declarative_base, relationship, scoped_session, sessionmaker
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -38,6 +40,9 @@ CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
 CALLBACK_URL = f"{PUBLIC_URL}/auth/telegram/callback"
 ALLOW_TEST_AUTH = os.getenv("ALLOW_TEST_AUTH", "false").lower() == "true"
+ENABLE_SSE = os.getenv(
+    "ENABLE_SSE", "true" if ALLOW_TEST_AUTH and not IS_PRODUCTION else "false"
+).lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
 
@@ -49,6 +54,7 @@ if IS_PRODUCTION:
             "DATABASE_URL": os.getenv("DATABASE_URL"),
             "PUBLIC_URL": os.getenv("PUBLIC_URL"),
             "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "ADMIN_TELEGRAM_IDS": os.getenv("ADMIN_TELEGRAM_IDS"),
         }.items() if not str(value or "").strip()
     ]
     if missing_configuration:
@@ -337,7 +343,14 @@ class UserReport(db.Model):
     meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
     reporter_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     target_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    category = db.Column(db.String(40), nullable=False, default="other", index=True)
     reason = db.Column(db.String(180), nullable=False)
+    status = db.Column(db.String(30), nullable=False, default="new", index=True)
+    moderator_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True)
+    decision = db.Column(db.String(40))
+    decision_reason = db.Column(db.String(180))
+    auto_hidden = db.Column(db.Integer, nullable=False, default=0)
+    reviewed_at = db.Column(db.DateTime(timezone=True))
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
@@ -424,7 +437,53 @@ class AuthHandoff(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class SyncRevision(db.Model):
+    __tablename__ = "sync_revision"
+    key = db.Column(db.String(120), primary_key=True)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ModerationAction(db.Model):
+    __tablename__ = "moderation_action"
+    id = db.Column(db.Integer, primary_key=True)
+    report_id = db.Column(db.Integer, db.ForeignKey("user_report.id"), index=True)
+    moderator_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    action = db.Column(db.String(40), nullable=False, index=True)
+    reason = db.Column(db.String(180))
+    metadata_json = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+
+class NotificationOutbox(db.Model):
+    __tablename__ = "notification_outbox"
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(40), nullable=False, index=True)
+    dedupe_key = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    payload_json = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    next_attempt_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+    delivered_at = db.Column(db.DateTime(timezone=True))
+    last_error = db.Column(db.String(180))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class OperationRecord(db.Model):
+    __tablename__ = "operation_record"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    operation_id = db.Column(db.String(80), nullable=False)
+    method = db.Column(db.String(10), nullable=False)
+    path = db.Column(db.String(180), nullable=False)
+    status_code = db.Column(db.Integer, nullable=False)
+    response_json = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "operation_id", name="uq_operation_user_id"),)
+
+
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
+REPORT_CATEGORIES = {"safety", "harassment", "spam", "no_show", "no_show_dispute", "other"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
     "shop": "🛍", "help": "🤝", "leisure": "🎬",
@@ -443,6 +502,221 @@ def normalize_dt(value):
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def bump_revision_keys(*keys):
+    """Atomically increment durable revisions in the caller's transaction."""
+    now = utcnow()
+    for key in sorted({str(key)[:120] for key in keys if key}):
+        values = {"key": key, "revision": 1, "updated_at": now}
+        if engine.dialect.name == "postgresql":
+            statement = postgresql_insert(SyncRevision).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=[SyncRevision.key],
+                set_={"revision": SyncRevision.revision + 1, "updated_at": now},
+            )
+        else:
+            statement = sqlite_insert(SyncRevision).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=[SyncRevision.key],
+                set_={"revision": SyncRevision.revision + 1, "updated_at": now},
+            )
+        db.session.execute(statement)
+
+
+def bump_sync(feed=False, user_ids=(), meeting_ids=(), notification_ids=(), admin=False):
+    keys = []
+    if feed:
+        keys.append("feed")
+    if admin:
+        keys.append("admin")
+    keys.extend(f"user:{user_id}" for user_id in set(user_ids))
+    keys.extend(f"room:{meeting_id}" for meeting_id in set(meeting_ids))
+    keys.extend(f"notifications:{user_id}" for user_id in set(notification_ids))
+    bump_revision_keys(*keys)
+
+
+def revision_value(key):
+    row = db.session.get(SyncRevision, key)
+    return row.revision if row else 0
+
+
+def request_operation_id():
+    value = str(request.headers.get("X-Operation-ID") or json_body().get("operation_id") or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", value):
+        return ""
+    return value
+
+
+def replay_operation(user, operation_id):
+    if not operation_id:
+        return None
+    record = OperationRecord.query.filter_by(user_id=user.id, operation_id=operation_id).first()
+    if not record:
+        return None
+    if record.method != request.method or record.path != request.path:
+        return jsonify(error="Operation ID уже использован для другого действия",
+                       code="OPERATION_ID_CONFLICT"), 409
+    payload = json.loads(record.response_json)
+    payload["replayed"] = True
+    return jsonify(payload), record.status_code
+
+
+def remember_operation(user, operation_id, payload, status_code):
+    if operation_id:
+        db.session.add(OperationRecord(
+            user_id=user.id,
+            operation_id=operation_id,
+            method=request.method,
+            path=request.path,
+            status_code=status_code,
+            response_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        ))
+
+
+def admin_user():
+    user = current_user()
+    return user if user and user.telegram_id in ADMIN_TELEGRAM_IDS else None
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not admin_user():
+            return jsonify(error="Нет доступа"), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def admin_csrf_token():
+    if not session.get("admin_csrf"):
+        session["admin_csrf"] = secrets.token_urlsafe(32)
+    return session["admin_csrf"]
+
+
+def verify_admin_csrf():
+    received = request.headers.get("X-CSRF-Token", "")
+    expected = str(session.get("admin_csrf") or "")
+    if not expected or not secrets.compare_digest(received, expected):
+        return False
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    allowed = {urlparse(PUBLIC_URL).netloc, urlparse(request.host_url).netloc}
+    return urlparse(origin).netloc in allowed
+
+
+def anonymized_user_id(user_id):
+    return "u_" + hmac.new(
+        app.secret_key.encode(), f"admin-user:{user_id}".encode(), hashlib.sha256
+    ).hexdigest()[:12]
+
+
+def independent_report_count(target_id, since=None):
+    query = db.session.query(func.count(distinct(UserReport.reporter_id))).filter(
+        UserReport.target_id == target_id,
+        UserReport.category != "no_show_dispute",
+    )
+    if since:
+        query = query.filter(UserReport.created_at >= since)
+    return int(query.scalar() or 0)
+
+
+def queue_admin_report(report, report_count):
+    payload = {
+        "report_id": report.id,
+        "category": report.category,
+        "created_at": normalize_dt(report.created_at).isoformat(),
+        "report_count": report_count,
+        "status": report.status,
+    }
+    db.session.add(NotificationOutbox(
+        kind="admin_report",
+        dedupe_key=f"admin-report:{report.id}",
+        payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        status="pending",
+        next_attempt_at=utcnow(),
+    ))
+
+
+def process_notification_outbox(limit=20):
+    now = utcnow()
+    query = NotificationOutbox.query.filter(
+        NotificationOutbox.status.in_(("pending", "failed")),
+        NotificationOutbox.next_attempt_at <= now,
+    ).order_by(NotificationOutbox.id).limit(limit)
+    if engine.dialect.name == "postgresql":
+        query = query.with_for_update(skip_locked=True)
+    rows = query.all()
+    for row in rows:
+        row.status = "sending"
+        row.attempts += 1
+        try:
+            payload = json.loads(row.payload_json)
+            if row.kind != "admin_report":
+                raise ValueError("Unsupported outbox event")
+            message = (
+                f"Новая жалоба #{payload['report_id']}\n"
+                f"Категория: {payload['category']}\n"
+                f"Дата: {payload['created_at']}\n"
+                f"Жалоб на пользователя: {payload['report_count']}\n"
+                f"Статус: {payload['status']}"
+            )
+            for telegram_id in sorted(ADMIN_TELEGRAM_IDS):
+                telegram_api("sendMessage", {
+                    "chat_id": telegram_id,
+                    "text": message,
+                    "reply_markup": {"inline_keyboard": [[{
+                        "text": "Открыть жалобу",
+                        "url": f"{PUBLIC_URL}/admin?report={payload['report_id']}",
+                    }]]},
+                })
+            row.status = "sent"
+            row.delivered_at = utcnow()
+            row.last_error = None
+        except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+            row.status = "failed"
+            row.last_error = type(error).__name__[:180]
+            row.next_attempt_at = utcnow() + timedelta(seconds=min(3600, 2 ** min(row.attempts, 10)))
+            app.logger.warning("Admin report notification delivery failed for outbox %s", row.id)
+    db.session.commit()
+    return len(rows)
+
+
+def notification_outbox_loop():
+    while True:
+        time.sleep(5)
+        try:
+            with app.app_context():
+                process_notification_outbox()
+        except Exception:
+            app.logger.exception("Notification outbox worker failed")
+
+
+def lock_user_actions(user_ids):
+    if engine.dialect.name == "postgresql":
+        for user_id in sorted(set(user_ids)):
+            db.session.execute(sql_text("SELECT pg_advisory_xact_lock(:user_id)"), {"user_id": int(user_id)})
+
+
+def active_confirmed_meeting_ids(user_id, exclude_meeting_id=None):
+    candidate_ids = {
+        row.id for row in Meeting.query.filter_by(owner_id=user_id).all()
+        if Interest.query.filter_by(meeting_id=row.id, status="accepted").first()
+    }
+    candidate_ids.update(
+        row.meeting_id for row in Interest.query.filter_by(user_id=user_id, status="accepted").all()
+    )
+    result = set()
+    for meeting_id in candidate_ids:
+        if meeting_id == exclude_meeting_id:
+            continue
+        meeting = db.session.get(Meeting, meeting_id)
+        if meeting and effective_meeting_status(meeting) == "active":
+            result.add(meeting_id)
+    return result
 
 
 def emit_realtime(user_ids, kind="changed", meeting_id=None):
@@ -473,6 +747,8 @@ def login_required(view):
 @app.get("/api/events")
 @login_required
 def realtime_events():
+    if not ENABLE_SSE:
+        return jsonify(error="SSE отключён; используйте /api/sync-state"), 404
     user_id = current_user().id
 
     @stream_with_context
@@ -604,7 +880,11 @@ def chat_expired(meeting):
 def chat_closed_for(meeting, user_id):
     if MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user_id).first():
         return True
-    if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=user_id).first():
+    if UserReport.query.filter(
+        UserReport.meeting_id == meeting.id,
+        UserReport.reporter_id == user_id,
+        UserReport.category != "no_show_dispute",
+    ).first():
         return True
     if MeetingEvent.query.filter_by(
             meeting_id=meeting.id, user_id=user_id, kind="leave"
@@ -682,8 +962,10 @@ def closed_at_for(meeting, user_id):
     ).first()
     if feedback:
         return normalize_dt(feedback.created_at)
-    report = UserReport.query.filter_by(
-        meeting_id=meeting.id, reporter_id=user_id
+    report = UserReport.query.filter(
+        UserReport.meeting_id == meeting.id,
+        UserReport.reporter_id == user_id,
+        UserReport.category != "no_show_dispute",
     ).first()
     if report:
         return normalize_dt(report.created_at)
@@ -778,6 +1060,15 @@ def trust_payload(user_id):
             target_user_id=event.user_id,
             kind="no_show_disputed",
         ).first()
+        if disputed:
+            dispute_report = UserReport.query.filter_by(
+                meeting_id=event.meeting_id,
+                reporter_id=user_id,
+                target_id=event.user_id,
+                category="no_show_dispute",
+            ).first()
+            if dispute_report and dispute_report.status == "dismissed":
+                disputed = None
         if not disputed and normalize_dt(event.created_at) <= dispute_window:
             no_shows += 1
 
@@ -858,11 +1149,15 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
         db.session.add(UserNotification(
             user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
         ))
+        bump_sync(user_ids={user_id}, notification_ids={user_id})
         db.session.commit()
     if not telegram or not BOT_TOKEN:
         return True
     user = db.session.get(User, user_id)
     if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
+        return True
+    # Administrator Telegram accounts receive only complaint outbox messages.
+    if user.telegram_id in ADMIN_TELEGRAM_IDS:
         return True
     telegram_id = user.telegram_id
 
@@ -1068,6 +1363,7 @@ def api_session():
         mini_app_configured=bool(BOT_TOKEN),
         oidc_configured=oidc_configured(),
         test_auth_enabled=ALLOW_TEST_AUTH,
+        sse_enabled=ENABLE_SSE,
         is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
         profile_completed=bool(profile and selfie),
         user={
@@ -1077,6 +1373,26 @@ def api_session():
             "picture": user.picture,
             "trust": trust_payload(user.id),
         } if user else None,
+    )
+
+
+@app.get("/api/sync-state")
+@login_required
+def sync_state():
+    user = current_user()
+    room_id = request.args.get("room_id", type=int)
+    room_revision = 0
+    if room_id:
+        meeting = db.session.get(Meeting, room_id)
+        if not meeting or not meeting_member(meeting, user):
+            return jsonify(error="Нет доступа к встрече"), 403
+        room_revision = revision_value(f"room:{room_id}")
+    return jsonify(
+        feed=revision_value("feed"),
+        user=revision_value(f"user:{user.id}"),
+        notifications=revision_value(f"notifications:{user.id}"),
+        room=room_revision,
+        room_id=room_id,
     )
 
 
@@ -1228,18 +1544,28 @@ def telegram_webhook():
         if start_payload.startswith(("login_", "invite_")):
             web_app_url = f"{PUBLIC_URL}/?handoff={quote(start_payload, safe='')}"
         try:
-            telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "Бот теперь используется только для безопасного входа и уведомлений приложения «Сейчас».",
-                "reply_markup": {"remove_keyboard": True},
-            })
-            telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "Нажмите кнопку ниже, чтобы открыть приложение.",
-                "reply_markup": {"inline_keyboard": [[{
-                    "text": "Открыть «Сейчас»", "web_app": {"url": web_app_url},
-                }]]},
-            })
+            if message_text.startswith("/start"):
+                telegram_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "Откройте приложение «Сейчас» кнопкой ниже.",
+                    "reply_markup": {"inline_keyboard": [[{
+                        "text": "Открыть приложение", "web_app": {"url": web_app_url},
+                    }]]},
+                })
+            else:
+                sender = message.get("from") or {}
+                user = upsert_telegram_user(sender)
+                if consume_action(user.id, "bot_text_reply", 1, 60):
+                    db.session.commit()
+                    telegram_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": (
+                            "Бот не принимает сообщения. Для общения используйте приложение, "
+                            "для жалобы — кнопку «Пожаловаться» внутри встречи или профиля."
+                        ),
+                    })
+                else:
+                    db.session.rollback()
         except requests.RequestException:
             app.logger.exception("Telegram webhook reply failed")
     return jsonify(ok=True)
@@ -1608,6 +1934,7 @@ def location():
     if not valid_coordinates(data.get("latitude"), data.get("longitude")):
         return jsonify(error="Некорректная геолокация"), 400
     user.latitude, user.longitude = float(data["latitude"]), float(data["longitude"])
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True)
 
@@ -1632,6 +1959,7 @@ def set_presence():
     presence.updated_at = utcnow()
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(presence)
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True, active_until=None,
                    reminder_due_at=(normalize_dt(presence.updated_at) + timedelta(hours=1)).isoformat())
@@ -1642,6 +1970,7 @@ def set_presence():
 def stop_presence():
     user = current_user()
     Presence.query.filter_by(user_id=user.id).delete()
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True)
 
@@ -1687,6 +2016,7 @@ def list_notifications():
     active_items = []
     for item in items:
         keep = item.kind == "presence_reminder" and presence_active
+        keep = keep or item.kind == "moderation_warning"
         if item.kind == "meeting_confirmation" and item.dedupe_key:
             try:
                 meeting_id = int(item.dedupe_key.split(":")[1])
@@ -1707,13 +2037,14 @@ def list_notifications():
             db.session.delete(item)
     db.session.commit()
     active_items = active_items[:10]
+    unread_items = [item for item in active_items if item.read_at is None]
     return jsonify(
-        unread=len(active_items),
+        unread=len(unread_items),
         items=[{
             "id": item.id,
             "kind": item.kind,
             "text": item.text,
-            "read": False,
+            "read": item.read_at is not None,
             "created_at": normalize_dt(item.created_at).isoformat(),
         } for item in active_items],
     )
@@ -1722,8 +2053,10 @@ def list_notifications():
 @app.post("/api/notifications/read")
 @login_required
 def read_notifications():
-    UserNotification.query.filter_by(user_id=current_user().id, read_at=None).update(
+    user_id = current_user().id
+    UserNotification.query.filter_by(user_id=user_id, read_at=None).update(
         {"read_at": utcnow()}, synchronize_session=False)
+    bump_sync(user_ids={user_id}, notification_ids={user_id})
     db.session.commit()
     return jsonify(ok=True)
 
@@ -1733,6 +2066,11 @@ def read_notifications():
 def create_meeting():
     user = current_user()
     data = json_body()
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
     category = data.get("category")
     description = str(data.get("description", "")).strip()[:180]
     meeting_format = data.get("format", "one")
@@ -1756,6 +2094,12 @@ def create_meeting():
         return jsonify(error="Выберите время встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
+    lock_user_actions({user.id})
+    if active_confirmed_meeting_ids(user.id):
+        return jsonify(
+            error="Сначала завершите текущую подтверждённую встречу",
+            code="ACTIVE_MEETING_CONFLICT",
+        ), 409
     active_owned = Meeting.query.filter(Meeting.owner_id == user.id, Meeting.expires_at > utcnow()).all()
     for previous in active_owned:
         if Interest.query.filter_by(meeting_id=previous.id, status="accepted").first():
@@ -1779,8 +2123,12 @@ def create_meeting():
     )
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(meeting)
+    db.session.flush()
+    payload = {"ok": True, "id": meeting.id}
+    bump_sync(feed=True, user_ids={user.id}, meeting_ids={meeting.id})
+    remember_operation(user, operation_id, payload, 201)
     db.session.commit()
-    return jsonify(ok=True, id=meeting.id), 201
+    return jsonify(payload), 201
 
 
 @app.post("/api/presences/<int:presence_id>/interest")
@@ -1813,6 +2161,8 @@ def propose_meeting_to_presence(presence_id):
     db.session.add(meeting)
     db.session.flush()
     db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+    bump_sync(user_ids={presence.user_id, user.id}, meeting_ids={meeting.id},
+              notification_ids={presence.user_id})
     db.session.commit()
     emit_realtime({presence.user_id, user.id}, "interest", meeting.id)
     notify_user(
@@ -1845,6 +2195,8 @@ def express_interest(meeting_id):
     interest = Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+        bump_sync(user_ids={meeting.owner_id, user.id}, meeting_ids={meeting.id},
+                  notification_ids={meeting.owner_id})
         db.session.commit()
         emit_realtime({meeting.owner_id, user.id}, "interest", meeting.id)
         notify_user(
@@ -1989,8 +2341,15 @@ def list_interests():
 @login_required
 def decide_interest(interest_id):
     user = current_user()
-    interest = db.get_or_404(Interest, interest_id)
-    meeting = db.session.get(Meeting, interest.meeting_id)
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
+    interest = Interest.query.filter_by(id=interest_id).with_for_update().first()
+    if not interest:
+        abort(404)
+    meeting = Meeting.query.filter_by(id=interest.meeting_id).with_for_update().first()
     if meeting.owner_id != user.id:
         return jsonify(error="Решение принимает создатель встречи"), 403
     if interest.status != "pending":
@@ -1998,15 +2357,28 @@ def decide_interest(interest_id):
     decision = json_body().get("decision")
     if decision not in {"accepted", "rejected"}:
         return jsonify(error="Выберите принять или отклонить"), 400
+    if normalize_dt(meeting.expires_at) <= utcnow() or effective_meeting_status(meeting) != "active":
+        return jsonify(error="Встреча уже недоступна", code="MEETING_NOT_ACTIVE"), 409
+    lock_user_actions({meeting.owner_id, interest.user_id})
+    if decision == "accepted":
+        conflicting_users = [
+            member_id for member_id in (meeting.owner_id, interest.user_id)
+            if active_confirmed_meeting_ids(member_id, exclude_meeting_id=meeting.id)
+        ]
+        if conflicting_users:
+            return jsonify(
+                error="Участник уже находится в другой активной встрече",
+                code="ACTIVE_MEETING_CONFLICT",
+            ), 409
+        accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
+        if meeting.format == "one" and accepted_count:
+            return jsonify(error="Личная встреча уже занята", code="MEETING_CAPACITY_REACHED"), 409
+        if meeting.format == "group" and accepted_count >= 5:
+            return jsonify(error="Группа уже набрана", code="MEETING_CAPACITY_REACHED"), 409
     interest.status = decision
     if decision == "accepted" and meeting.format == "one":
         (Interest.query.filter_by(meeting_id=meeting.id, status="pending")
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
-    if decision == "accepted" and meeting.format == "group":
-        accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
-        if accepted_count > 5:
-            db.session.rollback()
-            return jsonify(error="В группе может быть не больше 6 человек вместе с создателем"), 409
     if decision == "accepted":
         state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
         if not state:
@@ -2015,6 +2387,12 @@ def decide_interest(interest_id):
         Presence.query.filter(Presence.user_id.in_(member_ids)).update(
             {"active_until": utcnow()}, synchronize_session=False
         )
+    db.session.flush()
+    payload = {"ok": True, "interest": interest_payload(interest, user)}
+    bump_sync(feed=decision == "accepted",
+              user_ids={meeting.owner_id, interest.user_id}, meeting_ids={meeting.id},
+              notification_ids={interest.user_id})
+    remember_operation(user, operation_id, payload, 200)
     db.session.commit()
     emit_realtime({meeting.owner_id, interest.user_id}, f"interest_{decision}", meeting.id)
     result_text = "принят" if decision == "accepted" else "отклонён"
@@ -2023,7 +2401,7 @@ def decide_interest(interest_id):
         f"Ваш отклик на встречу «{meeting.description}» {result_text}",
         telegram=True,
     )
-    return jsonify(ok=True, interest=interest_payload(interest, user))
+    return jsonify(payload)
 
 
 def meeting_member(meeting, user):
@@ -2062,9 +2440,12 @@ def room_payload(meeting, user):
     my_completion_confirmed = MeetingEvent.query.filter_by(
         meeting_id=meeting.id, user_id=user.id, kind="complete"
     ).first() is not None
-    messages = [] if my_completion_confirmed else (
-        ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
-    )
+    messages = []
+    if not my_completion_confirmed:
+        messages = list(reversed(
+            ChatMessage.query.filter_by(meeting_id=meeting.id)
+            .order_by(ChatMessage.id.desc()).limit(100).all()
+        ))
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     raw_events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id.desc()).all()
     event_keys, events = set(), []
@@ -2170,6 +2551,7 @@ def consent_to_photo(meeting_id):
     consent = PhotoConsent.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not consent:
         db.session.add(PhotoConsent(meeting_id=meeting.id, user_id=user.id))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
         db.session.commit()
         emit_meeting(meeting, "photo_consent")
     return jsonify(ok=True, room=room_payload(meeting, user))
@@ -2210,6 +2592,7 @@ def propose_place(meeting_id):
             db.session.add(PlaceVote(
                 place_id=existing_place.id, user_id=current_user().id
             ))
+            bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
             db.session.commit()
             maybe_confirm_place(meeting, existing_place)
             emit_meeting(meeting, "place_vote")
@@ -2226,6 +2609,7 @@ def propose_place(meeting_id):
             place_id=place.id, latitude=float(latitude), longitude=float(longitude), source="map",
         ))
     db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     emit_meeting(meeting, "place_proposed")
     maybe_confirm_place(meeting, place)
@@ -2296,6 +2680,7 @@ def vote_place(place_id):
         db.session.delete(vote)
     else:
         db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     if not vote:
         maybe_confirm_place(meeting, place)
@@ -2315,6 +2700,7 @@ def maybe_confirm_place(meeting, place, force=False):
         {"confirmed": 0}, synchronize_session=False
     )
     place.confirmed = 1
+    bump_sync(user_ids=member_ids, meeting_ids={meeting.id}, feed=True)
     db.session.commit()
     emit_meeting(meeting, "place_confirmed")
     return True
@@ -2347,10 +2733,21 @@ def send_message(meeting_id):
     text = str(json_body().get("text", "")).strip()[:500]
     if not text:
         return jsonify(error="Напишите сообщение"), 400
-    db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
+    user = current_user()
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
+    message = ChatMessage(meeting_id=meeting.id, user_id=user.id, text=text)
+    db.session.add(message)
+    db.session.flush()
+    payload = {"ok": True, "message_id": message.id, "room": room_payload(meeting, user)}
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
+    remember_operation(user, operation_id, payload, 201)
     db.session.commit()
     emit_meeting(meeting, "chat_message")
-    return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
+    return jsonify(payload), 201
 
 
 def state_for(meeting):
@@ -2390,8 +2787,10 @@ def meeting_lifecycle(meeting_id):
     if state.status != "active":
         return jsonify(error="Встреча уже завершена или отменена"), 409
     target_id = data.get("target_user_id")
-    if action == "cancel" and meeting.owner_id != user.id:
+    if action in {"cancel", "reschedule"} and meeting.owner_id != user.id:
         return jsonify(error="Это действие доступно создателю встречи"), 403
+    if action == "not_happened" and meeting.format == "group" and meeting.owner_id != user.id:
+        return jsonify(error="Групповую встречу закрывает создатель"), 403
     if action == "leave":
         if meeting.owner_id == user.id:
             return jsonify(error="Создатель может отменить встречу"), 400
@@ -2406,6 +2805,7 @@ def meeting_lifecycle(meeting_id):
         purge_chat_if_ready(meeting)
         close_member_presences(meeting)
         purge_meeting_notifications(meeting)
+        bump_sync(feed=True, user_ids={meeting.owner_id, user.id}, meeting_ids={meeting.id})
         db.session.commit()
         emit_realtime({meeting.owner_id, user.id}, "meeting_left", meeting.id)
         notify_user(
@@ -2449,6 +2849,18 @@ def meeting_lifecycle(meeting_id):
             meeting_id=meeting.id, user_id=user.id,
             target_user_id=no_show.user_id, kind="no_show_disputed", note=reason,
         ))
+        dispute_report = UserReport(
+            meeting_id=meeting.id,
+            reporter_id=user.id,
+            target_id=no_show.user_id,
+            category="no_show_dispute",
+            reason=reason,
+            status="new",
+        )
+        db.session.add(dispute_report)
+        db.session.flush()
+        queue_admin_report(dispute_report, independent_report_count(no_show.user_id))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id}, admin=True)
         db.session.commit()
         emit_meeting(meeting, "no_show_disputed")
         notify_user(
@@ -2509,7 +2921,9 @@ def meeting_lifecycle(meeting_id):
         if existing_late:
             for event in existing_late:
                 db.session.delete(event)
+            bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
             db.session.commit()
+            emit_meeting(meeting, "meeting_late")
             return jsonify(ok=True, room=room_payload(meeting, user))
     if action != "complete":
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
@@ -2521,6 +2935,10 @@ def meeting_lifecycle(meeting_id):
         purge_meeting_notifications(meeting)
     elif action == "complete":
         close_member_presences(meeting)
+    members_for_sync = accepted_user_ids(meeting)
+    bump_sync(feed=action in {"cancel", "not_happened", "complete", "reschedule"},
+              user_ids=members_for_sync, meeting_ids={meeting.id},
+              notification_ids=members_for_sync - {user.id})
     db.session.commit()
     emit_meeting(meeting, f"meeting_{action}")
     if action in {"cancel", "late", "no_show", "not_happened", "reschedule"} or (
@@ -2577,6 +2995,7 @@ def leave_feedback(meeting_id):
     purge_chat_if_ready(meeting)
     close_member_presences(meeting)
     purge_meeting_notifications(meeting, {current_user().id})
+    bump_sync(feed=True, user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     emit_meeting(meeting, "feedback")
     return jsonify(ok=True, closed=True)
@@ -2604,6 +3023,8 @@ def thank_participant(meeting_id):
         db.session.add(MeetingThanks(
             meeting_id=meeting.id, giver_id=user.id, receiver_id=receiver_id,
         ))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id},
+                  notification_ids={receiver_id})
         db.session.commit()
         emit_meeting(meeting, "thanks")
         notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
@@ -2620,6 +3041,11 @@ def report_user(meeting_id):
     if error:
         return error
     data, reporter = json_body(), current_user()
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(reporter, operation_id):
+        return replay
     if not consume_action(reporter.id, "report", 5, 86400):
         return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
     try:
@@ -2629,17 +3055,27 @@ def report_user(meeting_id):
     if target_id == reporter.id or target_id not in accepted_user_ids(meeting):
         return jsonify(error="Некорректный участник"), 400
     reason = str(data.get("reason", "")).strip()[:180]
+    category = str(data.get("category", "other")).strip().lower()
+    if category not in REPORT_CATEGORIES - {"no_show_dispute"}:
+        return jsonify(error="Некорректная категория жалобы"), 400
     if len(reason) < 3:
         return jsonify(error="Опишите причину жалобы"), 400
     if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=reporter.id, target_id=target_id).first():
         return jsonify(error="Вы уже отправили жалобу на этого участника"), 409
-    db.session.add(UserReport(meeting_id=meeting.id, reporter_id=reporter.id,
-                              target_id=target_id, reason=reason))
+    report = UserReport(
+        meeting_id=meeting.id,
+        reporter_id=reporter.id,
+        target_id=target_id,
+        category=category,
+        reason=reason,
+        status="new",
+    )
+    db.session.add(report)
     if data.get("block") and not UserBlock.query.filter_by(blocker_id=reporter.id, blocked_id=target_id).first():
         db.session.add(UserBlock(blocker_id=reporter.id, blocked_id=target_id))
+    db.session.flush()
     recent = utcnow() - timedelta(hours=24)
-    report_count = UserReport.query.filter(UserReport.target_id == target_id,
-                                           UserReport.created_at >= recent).count()
+    report_count = independent_report_count(target_id, recent)
     if report_count >= 3:
         moderation = UserModeration.query.filter_by(user_id=target_id).first()
         if not moderation:
@@ -2648,55 +3084,204 @@ def report_user(meeting_id):
             db.session.add(moderation)
         else:
             moderation.hidden_until = utcnow() + timedelta(hours=24)
+        report.auto_hidden = 1
+    queue_admin_report(report, report_count)
+    payload = {"ok": True, "closed": True, "report_id": report.id, "report_count": report_count}
+    bump_sync(feed=bool(data.get("block") or report.auto_hidden),
+              user_ids={reporter.id, target_id}, meeting_ids={meeting.id}, admin=True)
+    remember_operation(reporter, operation_id, payload, 200)
     db.session.commit()
-    return jsonify(ok=True, closed=True)
+    return jsonify(payload)
 
 
 @app.get("/api/admin/reports")
-@login_required
+@admin_required
 def admin_reports():
-    user = current_user()
-    if user.telegram_id not in ADMIN_TELEGRAM_IDS:
-        return jsonify(error="Нет доступа"), 403
-    reports = UserReport.query.order_by(UserReport.id.desc()).limit(200).all()
-    return jsonify(items=[{"id": item.id, "meeting_id": item.meeting_id,
-                           "reporter": db.session.get(User, item.reporter_id).name,
-                           "target_id": item.target_id,
-                           "target": db.session.get(User, item.target_id).name,
-                           "reason": item.reason,
-                           "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
+    query = UserReport.query
+    status = request.args.get("status", "").strip()
+    category = request.args.get("category", "").strip()
+    user_filter = request.args.get("user", "").strip()
+    date_filter = request.args.get("date", "").strip()
+    if status == "auto_hidden":
+        query = query.filter(UserReport.auto_hidden == 1)
+    elif status:
+        query = query.filter(UserReport.status == status)
+    if category:
+        query = query.filter(UserReport.category == category)
+    if date_filter:
+        try:
+            date_start = normalize_dt(datetime.fromisoformat(date_filter))
+            query = query.filter(
+                UserReport.created_at >= date_start,
+                UserReport.created_at < date_start + timedelta(days=1),
+            )
+        except ValueError:
+            return jsonify(error="Некорректная дата"), 400
+    reports = query.order_by(UserReport.id.desc()).limit(200).all()
+    if user_filter:
+        reports = [item for item in reports if user_filter in {
+            anonymized_user_id(item.reporter_id), anonymized_user_id(item.target_id), str(item.id),
+        }]
+    return jsonify(items=[admin_report_payload(item) for item in reports])
+
+
+def admin_report_payload(item):
+    meeting = db.session.get(Meeting, item.meeting_id)
+    actions = ModerationAction.query.filter_by(report_id=item.id).order_by(
+        ModerationAction.id.desc()).limit(10).all()
+    return {
+        "id": item.id,
+        "meeting_id": item.meeting_id,
+        "meeting_status": effective_meeting_status(meeting) if meeting else "deleted",
+        "category": item.category,
+        "reason": item.reason,
+        "status": item.status,
+        "decision": item.decision,
+        "decision_reason": item.decision_reason,
+        "auto_hidden": bool(item.auto_hidden),
+        "reporter": anonymized_user_id(item.reporter_id),
+        "target": anonymized_user_id(item.target_id),
+        "independent_reports": independent_report_count(item.target_id),
+        "trust": trust_payload(item.target_id),
+        "created_at": normalize_dt(item.created_at).isoformat(),
+        "reviewed_at": normalize_dt(item.reviewed_at).isoformat() if item.reviewed_at else None,
+        "history": [{
+            "action": action.action,
+            "reason": action.reason,
+            "created_at": normalize_dt(action.created_at).isoformat(),
+        } for action in actions],
+    }
+
+
+@app.get("/api/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    unresolved = {"new", "in_progress"}
+    return jsonify(
+        csrf_token=admin_csrf_token(),
+        revision=revision_value("admin"),
+        counts={
+            "new": UserReport.query.filter_by(status="new").count(),
+            "in_progress": UserReport.query.filter_by(status="in_progress").count(),
+            "auto_hidden": UserReport.query.filter_by(auto_hidden=1).count(),
+            "resolved_today": UserReport.query.filter(
+                UserReport.status.in_(("confirmed", "dismissed", "resolved")),
+                UserReport.reviewed_at >= today,
+            ).count(),
+            "unresolved": UserReport.query.filter(UserReport.status.in_(unresolved)).count(),
+        },
+    )
+
+
+@app.post("/api/admin/reports/<int:report_id>/evidence")
+@admin_required
+def admin_report_evidence(report_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    report = db.get_or_404(UserReport, report_id)
+    admin = admin_user()
+    db.session.add(ModerationAction(
+        report_id=report.id,
+        moderator_id=admin.id,
+        action="view_evidence",
+        reason="Просмотр ограниченного фрагмента чата",
+    ))
+    incident_at = normalize_dt(report.created_at)
+    messages = ChatMessage.query.filter(
+        ChatMessage.meeting_id == report.meeting_id,
+        ChatMessage.created_at >= incident_at - timedelta(hours=2),
+        ChatMessage.created_at <= incident_at + timedelta(hours=2),
+    ).order_by(ChatMessage.id.desc()).limit(20).all()
+    bump_sync(admin=True)
+    db.session.commit()
+    return jsonify(items=[{
+        "id": message.id,
+        "author": anonymized_user_id(message.user_id),
+        "text": message.text,
+        "created_at": normalize_dt(message.created_at).isoformat(),
+    } for message in reversed(messages)])
+
+
+def apply_admin_action(report, admin, action, reason):
+    now = utcnow()
+    if action == "take":
+        report.status = "in_progress"
+    elif action == "confirm":
+        report.status, report.decision, report.reviewed_at = "confirmed", "confirmed", now
+    elif action == "dismiss":
+        report.status, report.decision, report.reviewed_at = "dismissed", "dismissed", now
+    elif action == "warn":
+        report.status = "in_progress"
+        db.session.add(UserNotification(
+            user_id=report.target_id,
+            kind="moderation_warning",
+            text="Администратор вынес предупреждение по правилам безопасного общения.",
+            dedupe_key=f"moderation-warning:{report.id}",
+        ))
+    elif action in {"hide_24h", "hide_7d", "block"}:
+        duration = timedelta(hours=24) if action == "hide_24h" else (
+            timedelta(days=7) if action == "hide_7d" else timedelta(days=36500)
+        )
+        moderation = UserModeration.query.filter_by(user_id=report.target_id).first()
+        if not moderation:
+            moderation = UserModeration(user_id=report.target_id, hidden_until=now + duration, reason=reason)
+            db.session.add(moderation)
+        else:
+            moderation.hidden_until = max(normalize_dt(moderation.hidden_until), now + duration)
+            moderation.reason = reason
+        report.status = "in_progress"
+        report.decision = action
+    elif action == "restore":
+        UserModeration.query.filter_by(user_id=report.target_id).delete(synchronize_session=False)
+        report.decision = "restored"
+    elif action == "close":
+        report.status, report.decision, report.reviewed_at = "resolved", "closed", now
+    else:
+        return False
+    report.moderator_id = admin.id
+    report.decision_reason = reason or report.decision_reason
+    db.session.add(ModerationAction(
+        report_id=report.id,
+        moderator_id=admin.id,
+        action=action,
+        reason=reason or None,
+        metadata_json=json.dumps({"target": anonymized_user_id(report.target_id)}, separators=(",", ":")),
+    ))
+    bump_sync(feed=action in {"hide_24h", "hide_7d", "block", "restore"},
+              user_ids={report.target_id}, notification_ids={report.target_id} if action == "warn" else (),
+              admin=True)
+    return True
+
+
+@app.post("/api/admin/reports/<int:report_id>/action")
+@admin_required
+def admin_report_action(report_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    report = db.get_or_404(UserReport, report_id)
+    action = str(json_body().get("action", "")).strip()
+    reason = str(json_body().get("reason", "")).strip()[:180]
+    if action != "take" and len(reason) < 3:
+        return jsonify(error="Укажите причину решения"), 400
+    if not apply_admin_action(report, admin_user(), action, reason):
+        return jsonify(error="Неизвестное действие"), 400
+    db.session.commit()
+    return jsonify(ok=True, report=admin_report_payload(report))
 
 
 @app.post("/api/admin/reports/<int:report_id>/decision")
-@login_required
+@admin_required
 def decide_admin_report(report_id):
-    admin = current_user()
-    if admin.telegram_id not in ADMIN_TELEGRAM_IDS:
-        return jsonify(error="Нет доступа"), 403
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    admin = admin_user()
     report = db.get_or_404(UserReport, report_id)
     decision = str(json_body().get("decision", "")).strip()
     if decision not in {"dismissed", "confirmed"}:
         return jsonify(error="Выберите решение по жалобе"), 400
-    meeting = db.session.get(Meeting, report.meeting_id)
-    if decision == "confirmed":
-        moderation = UserModeration.query.filter_by(user_id=report.target_id).first()
-        hidden_until = utcnow() + timedelta(days=30)
-        if not moderation:
-            moderation = UserModeration(
-                user_id=report.target_id,
-                hidden_until=hidden_until,
-                reason=f"Подтверждённая жалоба #{report.id}",
-            )
-            db.session.add(moderation)
-        else:
-            moderation.hidden_until = max(
-                normalize_dt(moderation.hidden_until), hidden_until
-            )
-            moderation.reason = f"Подтверждённая жалоба #{report.id}"
-    db.session.delete(report)
-    db.session.flush()
-    if meeting:
-        purge_chat_if_ready(meeting)
+    reason = str(json_body().get("reason", f"Решение по жалобе #{report.id}"))[:180]
+    apply_admin_action(report, admin, "confirm" if decision == "confirmed" else "dismiss", reason)
     db.session.commit()
     return jsonify(ok=True, decision=decision)
 
@@ -2767,6 +3352,13 @@ def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
+@app.get("/admin")
+@admin_required
+def admin_page():
+    admin_csrf_token()
+    return send_from_directory(BASE_DIR, "admin.html")
+
+
 @app.get("/sichas-apple-icon-v2.png")
 def ios_app_icon():
     response = send_from_directory(BASE_DIR, "apple-touch-icon.png")
@@ -2793,21 +3385,23 @@ def public_files(path):
     return send_from_directory(BASE_DIR, path)
 
 
-with app.app_context():
-    db.create_all()
-    cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
-        {"phone_number": None}, synchronize_session=False
-    )
-    legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
-    if legacy_selfies or cleared_phones:
-        for legacy_selfie in legacy_selfies:
-            legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
-        db.session.commit()
-        app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
-                        len(legacy_selfies), cleared_phones)
+if os.getenv("ALEMBIC_RUNNING") != "1":
+    with app.app_context():
+        db.create_all()
+        cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
+            {"phone_number": None}, synchronize_session=False
+        )
+        legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
+        if legacy_selfies or cleared_phones:
+            for legacy_selfie in legacy_selfies:
+                legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
+            db.session.commit()
+            app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
+                            len(legacy_selfies), cleared_phones)
 
 if BOT_TOKEN and os.getenv("DATABASE_URL"):
     threading.Thread(target=presence_reminder_loop, name="presence-reminders", daemon=True).start()
+    threading.Thread(target=notification_outbox_loop, name="notification-outbox", daemon=True).start()
 
 
 if __name__ == "__main__":
