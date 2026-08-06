@@ -69,6 +69,8 @@ if IS_PRODUCTION:
     invalid_configuration = []
     if public_url.scheme != "https" or not public_url.netloc:
         invalid_configuration.append("PUBLIC_URL must be an absolute HTTPS URL")
+    if not str(os.getenv("DATABASE_URL") or "").startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        invalid_configuration.append("DATABASE_URL must use PostgreSQL in production")
     if ALLOW_TEST_AUTH:
         invalid_configuration.append("ALLOW_TEST_AUTH must be false")
     if any(not value.isdigit() or int(value) <= 0 for value in ADMIN_TELEGRAM_IDS):

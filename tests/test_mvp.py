@@ -1006,6 +1006,7 @@ class MvpFlowTest(unittest.TestCase):
             ({"ALLOW_TEST_AUTH": "true"}, "ALLOW_TEST_AUTH must be false"),
             ({"ALLOW_TEST_AUTH": "false", "PUBLIC_URL": "http://staging.invalid"}, "absolute HTTPS URL"),
             ({"ALLOW_TEST_AUTH": "false", "ADMIN_TELEGRAM_IDS": "admin-name"}, "positive numeric Telegram IDs"),
+            ({"ALLOW_TEST_AUTH": "false", "DATABASE_URL": "sqlite:///unsafe-production.db"}, "must use PostgreSQL"),
         )
         for updates, expected in cases:
             with self.subTest(expected=expected):
