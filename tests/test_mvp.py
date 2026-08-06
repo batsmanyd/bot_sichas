@@ -990,6 +990,52 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("Missing required production configuration", process.stderr)
         self.assertNotIn("audit-local-only-not-production", process.stderr)
 
+    def test_production_rejects_test_auth_and_invalid_admin_configuration(self):
+        base_environment = os.environ.copy()
+        base_environment.update({
+            "APP_ENV": "production",
+            "SECRET_KEY": "local-validation-session-key-not-production",
+            "SELFIE_ENCRYPTION_KEY": "local-validation-selfie-key-not-production",
+            "DATABASE_URL": "postgresql://invalid:invalid@127.0.0.1:1/never-connected",
+            "PUBLIC_URL": "https://staging.invalid",
+            "TELEGRAM_BOT_TOKEN": "local-validation-token-not-production",
+            "ADMIN_TELEGRAM_IDS": "123456789",
+            "ALEMBIC_RUNNING": "1",
+        })
+        cases = (
+            ({"ALLOW_TEST_AUTH": "true"}, "ALLOW_TEST_AUTH must be false"),
+            ({"ALLOW_TEST_AUTH": "false", "PUBLIC_URL": "http://staging.invalid"}, "absolute HTTPS URL"),
+            ({"ALLOW_TEST_AUTH": "false", "ADMIN_TELEGRAM_IDS": "admin-name"}, "positive numeric Telegram IDs"),
+        )
+        for updates, expected in cases:
+            with self.subTest(expected=expected):
+                environment = {**base_environment, **updates}
+                process = subprocess.run(
+                    [sys.executable, "-c", "import main"],
+                    cwd=os.path.dirname(os.path.dirname(__file__)),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn(expected, process.stderr)
+                self.assertNotIn(environment["SECRET_KEY"], process.stderr)
+
+    def test_request_id_is_validated_and_returned(self):
+        supplied = "audit-request-1234"
+        response = self.first.get("/health", headers={"X-Request-ID": supplied})
+        self.assertEqual(response.headers["X-Request-ID"], supplied)
+        generated = self.first.get("/health", headers={"X-Request-ID": "bad value"}).headers["X-Request-ID"]
+        self.assertRegex(generated, r"^[0-9a-f]{32}$")
+
+    def test_production_startup_uses_alembic_revision_guard(self):
+        with open("main.py", encoding="utf-8") as source:
+            backend = source.read()
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0007_runtime_guards"', backend)
+        self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
+        self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
+
     def test_sync_revisions_are_durable_and_cover_presence_and_meeting(self):
         self.login(self.first, 301)
         user = main.User.query.filter_by(telegram_id="test-301").one()
@@ -1129,6 +1175,23 @@ class MvpFlowTest(unittest.TestCase):
             self.assertEqual(decided.status_code, 200, decided.get_json())
             self.assertEqual(main.UserReport.query.get(report_id).status, "confirmed")
             self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 1)
+            blocked = self.third.post(
+                f"/api/admin/reports/{report_id}/action",
+                json={"action": "block", "reason": "Подтверждённая угроза безопасности"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(blocked.status_code, 200, blocked.get_json())
+            self.assertEqual(self.third.get("/api/admin/dashboard").get_json()["counts"]["blocked"], 1)
+            blocked_reports = self.third.get("/api/admin/reports?status=blocked").get_json()["items"]
+            self.assertEqual([item["id"] for item in blocked_reports], [report_id])
+            direct = self.third.get(f"/api/admin/reports/{report_id}")
+            self.assertEqual(direct.status_code, 200)
+            self.assertEqual(direct.get_json()["report"]["id"], report_id)
+            self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 2)
+            with open("admin.html", encoding="utf-8") as source:
+                admin_frontend = source.read()
+            self.assertIn("requestedReportId", admin_frontend)
+            self.assertIn("Заблокированные", admin_frontend)
         finally:
             main.ADMIN_TELEGRAM_IDS, main.telegram_api = original_admins, original_api
 
@@ -1177,6 +1240,17 @@ class MvpFlowTest(unittest.TestCase):
             })
             self.assertEqual(response.status_code, 200, response.get_json())
             self.assertEqual(response.get_json()["report_count"], index)
+            if index == 1:
+                first_reporter = main.User.query.filter_by(telegram_id="test-321").one()
+                main.db.session.add(main.UserReport(
+                    meeting_id=meeting_id,
+                    reporter_id=first_reporter.id,
+                    target_id=target.id,
+                    category="safety",
+                    reason="Повтор того же независимого заявителя",
+                ))
+                main.db.session.commit()
+                self.assertEqual(main.independent_report_count(target.id), 1)
             if index < 3:
                 self.assertIsNone(main.UserModeration.query.filter_by(user_id=target.id).first())
         moderation = main.UserModeration.query.filter_by(user_id=target.id).one()

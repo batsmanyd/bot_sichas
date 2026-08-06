@@ -2,12 +2,14 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -16,7 +18,7 @@ import jwt
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from flask import (
-    Flask, Response, abort, jsonify, redirect, request, send_from_directory, session,
+    Flask, Response, abort, g, jsonify, redirect, request, send_from_directory, session,
     stream_with_context,
 )
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -45,6 +47,7 @@ ENABLE_SSE = os.getenv(
 ).lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
+EXPECTED_SCHEMA_REVISION = "0007_runtime_guards"
 
 if IS_PRODUCTION:
     missing_configuration = [
@@ -62,6 +65,16 @@ if IS_PRODUCTION:
             "Missing required production configuration: "
             + ", ".join(sorted(missing_configuration))
         )
+    public_url = urlparse(PUBLIC_URL)
+    invalid_configuration = []
+    if public_url.scheme != "https" or not public_url.netloc:
+        invalid_configuration.append("PUBLIC_URL must be an absolute HTTPS URL")
+    if ALLOW_TEST_AUTH:
+        invalid_configuration.append("ALLOW_TEST_AUTH must be false")
+    if any(not value.isdigit() or int(value) <= 0 for value in ADMIN_TELEGRAM_IDS):
+        invalid_configuration.append("ADMIN_TELEGRAM_IDS must contain positive numeric Telegram IDs")
+    if invalid_configuration:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(invalid_configuration))
 
 database_url = os.getenv("DATABASE_URL") or f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}"
 if database_url.startswith("postgres://"):
@@ -90,6 +103,29 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     MAX_CONTENT_LENGTH=1_000_000,
 )
+
+
+class StructuredLogFormatter(logging.Formatter):
+    """Emit operational metadata without request bodies, query strings, or credentials."""
+
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        for key in ("request_id", "method", "path", "status_code", "duration_ms"):
+            value = getattr(record, key, None)
+            if value is not None:
+                payload[key] = value
+        if record.exc_info:
+            payload["exception"] = record.exc_info[0].__name__
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+if IS_PRODUCTION:
+    for handler in app.logger.handlers:
+        handler.setFormatter(StructuredLogFormatter())
 device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-device-auth-v1")
 DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
 GEOCODE_LOCK = threading.Lock()
@@ -347,7 +383,7 @@ class UserReport(db.Model):
     reason = db.Column(db.String(180), nullable=False)
     status = db.Column(db.String(30), nullable=False, default="new", index=True)
     moderator_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True)
-    decision = db.Column(db.String(40))
+    decision = db.Column(db.String(40), index=True)
     decision_reason = db.Column(db.String(180))
     auto_hidden = db.Column(db.Integer, nullable=False, default=0)
     reviewed_at = db.Column(db.DateTime(timezone=True))
@@ -385,7 +421,7 @@ class UserModeration(db.Model):
     __tablename__ = "user_moderation"
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
-    hidden_until = db.Column(db.DateTime(timezone=True), nullable=False)
+    hidden_until = db.Column(db.DateTime(timezone=True), nullable=False, index=True)
     reason = db.Column(db.String(180), nullable=False)
 
 
@@ -603,7 +639,7 @@ def verify_admin_csrf():
         return False
     origin = request.headers.get("Origin")
     if not origin:
-        return True
+        return not IS_PRODUCTION
     allowed = {urlparse(PUBLIC_URL).netloc, urlparse(request.host_url).netloc}
     return urlparse(origin).netloc in allowed
 
@@ -625,20 +661,22 @@ def independent_report_count(target_id, since=None):
 
 
 def queue_admin_report(report, report_count):
-    payload = {
-        "report_id": report.id,
-        "category": report.category,
-        "created_at": normalize_dt(report.created_at).isoformat(),
-        "report_count": report_count,
-        "status": report.status,
-    }
-    db.session.add(NotificationOutbox(
-        kind="admin_report",
-        dedupe_key=f"admin-report:{report.id}",
-        payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        status="pending",
-        next_attempt_at=utcnow(),
-    ))
+    for telegram_id in sorted(ADMIN_TELEGRAM_IDS):
+        payload = {
+            "report_id": report.id,
+            "category": report.category,
+            "created_at": normalize_dt(report.created_at).isoformat(),
+            "report_count": report_count,
+            "status": report.status,
+            "admin_telegram_id": telegram_id,
+        }
+        db.session.add(NotificationOutbox(
+            kind="admin_report",
+            dedupe_key=f"admin-report:{report.id}:{telegram_id}",
+            payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            status="pending",
+            next_attempt_at=utcnow(),
+        ))
 
 
 def process_notification_outbox(limit=20):
@@ -664,7 +702,8 @@ def process_notification_outbox(limit=20):
                 f"Жалоб на пользователя: {payload['report_count']}\n"
                 f"Статус: {payload['status']}"
             )
-            for telegram_id in sorted(ADMIN_TELEGRAM_IDS):
+            recipients = [payload["admin_telegram_id"]] if payload.get("admin_telegram_id") else sorted(ADMIN_TELEGRAM_IDS)
+            for telegram_id in recipients:
                 telegram_api("sendMessage", {
                     "chat_id": telegram_id,
                     "text": message,
@@ -1234,6 +1273,13 @@ def configure_telegram_bot():
 
 
 @app.before_request
+def assign_request_id():
+    supplied = str(request.headers.get("X-Request-ID") or "").strip()
+    g.request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", supplied) else uuid.uuid4().hex
+    g.request_started_at = time.perf_counter()
+
+
+@app.before_request
 def ensure_telegram_bot_configured():
     configure_telegram_bot()
 
@@ -1320,6 +1366,9 @@ def base64url_sha256(value):
 
 @app.after_request
 def security_headers(response):
+    request_id = getattr(g, "request_id", uuid.uuid4().hex)
+    duration_ms = round((time.perf_counter() - getattr(g, "request_started_at", time.perf_counter())) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -1334,6 +1383,16 @@ def security_headers(response):
     response.headers["Permissions-Policy"] = "camera=(self), geolocation=(self), microphone=()"
     if PUBLIC_URL.startswith("https://"):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    app.logger.info(
+        "request_complete",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
     return response
 
 
@@ -2095,6 +2154,8 @@ def create_meeting():
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
     lock_user_actions({user.id})
+    if replay := replay_operation(user, operation_id):
+        return replay
     if active_confirmed_meeting_ids(user.id):
         return jsonify(
             error="Сначала завершите текущую подтверждённую встречу",
@@ -2352,6 +2413,9 @@ def decide_interest(interest_id):
     meeting = Meeting.query.filter_by(id=interest.meeting_id).with_for_update().first()
     if meeting.owner_id != user.id:
         return jsonify(error="Решение принимает создатель встречи"), 403
+    lock_user_actions({meeting.owner_id, interest.user_id})
+    if replay := replay_operation(user, operation_id):
+        return replay
     if interest.status != "pending":
         return jsonify(error="По этому отклику решение уже принято"), 409
     decision = json_body().get("decision")
@@ -2359,7 +2423,6 @@ def decide_interest(interest_id):
         return jsonify(error="Выберите принять или отклонить"), 400
     if normalize_dt(meeting.expires_at) <= utcnow() or effective_meeting_status(meeting) != "active":
         return jsonify(error="Встреча уже недоступна", code="MEETING_NOT_ACTIVE"), 409
-    lock_user_actions({meeting.owner_id, interest.user_id})
     if decision == "accepted":
         conflicting_users = [
             member_id for member_id in (meeting.owner_id, interest.user_id)
@@ -2728,8 +2791,6 @@ def send_message(meeting_id):
             meeting_id=meeting.id, user_id=current_user().id, kind="complete"
     ).first():
         return jsonify(error="Эта переписка уже закрыта"), 409
-    if not consume_action(current_user().id, "message", 12, 60):
-        return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
     text = str(json_body().get("text", "")).strip()[:500]
     if not text:
         return jsonify(error="Напишите сообщение"), 400
@@ -2739,6 +2800,11 @@ def send_message(meeting_id):
         return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
     if replay := replay_operation(user, operation_id):
         return replay
+    lock_user_actions({user.id})
+    if replay := replay_operation(user, operation_id):
+        return replay
+    if not consume_action(user.id, "message", 12, 60):
+        return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
     message = ChatMessage(meeting_id=meeting.id, user_id=user.id, text=text)
     db.session.add(message)
     db.session.flush()
@@ -3046,14 +3112,17 @@ def report_user(meeting_id):
         return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
     if replay := replay_operation(reporter, operation_id):
         return replay
-    if not consume_action(reporter.id, "report", 5, 86400):
-        return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
     try:
         target_id = int(data.get("target_user_id"))
     except (TypeError, ValueError):
         return jsonify(error="Укажите участника"), 400
     if target_id == reporter.id or target_id not in accepted_user_ids(meeting):
         return jsonify(error="Некорректный участник"), 400
+    lock_user_actions({reporter.id, target_id})
+    if replay := replay_operation(reporter, operation_id):
+        return replay
+    if not consume_action(reporter.id, "report", 5, 86400):
+        return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
     reason = str(data.get("reason", "")).strip()[:180]
     category = str(data.get("category", "other")).strip().lower()
     if category not in REPORT_CATEGORIES - {"no_show_dispute"}:
@@ -3102,7 +3171,9 @@ def admin_reports():
     category = request.args.get("category", "").strip()
     user_filter = request.args.get("user", "").strip()
     date_filter = request.args.get("date", "").strip()
-    if status == "auto_hidden":
+    if status == "blocked":
+        query = query.filter(UserReport.decision == "block")
+    elif status == "auto_hidden":
         query = query.filter(UserReport.auto_hidden == 1)
     elif status:
         query = query.filter(UserReport.status == status)
@@ -3125,10 +3196,16 @@ def admin_reports():
     return jsonify(items=[admin_report_payload(item) for item in reports])
 
 
+@app.get("/api/admin/reports/<int:report_id>")
+@admin_required
+def admin_report(report_id):
+    return jsonify(report=admin_report_payload(db.get_or_404(UserReport, report_id)))
+
+
 def admin_report_payload(item):
     meeting = db.session.get(Meeting, item.meeting_id)
     actions = ModerationAction.query.filter_by(report_id=item.id).order_by(
-        ModerationAction.id.desc()).limit(10).all()
+        ModerationAction.id.desc()).limit(50).all()
     return {
         "id": item.id,
         "meeting_id": item.meeting_id,
@@ -3157,6 +3234,7 @@ def admin_report_payload(item):
 @admin_required
 def admin_dashboard():
     today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    effectively_blocked_at = utcnow() + timedelta(days=3650)
     unresolved = {"new", "in_progress"}
     return jsonify(
         csrf_token=admin_csrf_token(),
@@ -3165,6 +3243,11 @@ def admin_dashboard():
             "new": UserReport.query.filter_by(status="new").count(),
             "in_progress": UserReport.query.filter_by(status="in_progress").count(),
             "auto_hidden": UserReport.query.filter_by(auto_hidden=1).count(),
+            "blocked": UserModeration.query.filter(
+                UserModeration.hidden_until >= effectively_blocked_at
+            ).count(),
+            "confirmed": UserReport.query.filter_by(status="confirmed").count(),
+            "dismissed": UserReport.query.filter_by(status="dismissed").count(),
             "resolved_today": UserReport.query.filter(
                 UserReport.status.in_(("confirmed", "dismissed", "resolved")),
                 UserReport.reviewed_at >= today,
@@ -3385,19 +3468,38 @@ def public_files(path):
     return send_from_directory(BASE_DIR, path)
 
 
-if os.getenv("ALEMBIC_RUNNING") != "1":
-    with app.app_context():
-        db.create_all()
-        cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
-            {"phone_number": None}, synchronize_session=False
+def verify_production_schema():
+    """Fail before serving traffic when Alembic migrations were not applied."""
+    try:
+        with engine.connect() as connection:
+            versions = set(connection.execute(sql_text("SELECT version_num FROM alembic_version")).scalars())
+    except Exception as error:
+        raise RuntimeError(
+            "Database schema revision cannot be verified; run Alembic migrations before startup"
+        ) from error
+    if versions != {EXPECTED_SCHEMA_REVISION}:
+        raise RuntimeError(
+            f"Database schema is not at required revision {EXPECTED_SCHEMA_REVISION}; "
+            "run Alembic migrations before startup"
         )
-        legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
-        if legacy_selfies or cleared_phones:
-            for legacy_selfie in legacy_selfies:
-                legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
-            db.session.commit()
-            app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
-                            len(legacy_selfies), cleared_phones)
+
+
+if os.getenv("ALEMBIC_RUNNING") != "1":
+    if IS_PRODUCTION:
+        verify_production_schema()
+    else:
+        with app.app_context():
+            db.create_all()
+            cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
+                {"phone_number": None}, synchronize_session=False
+            )
+            legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
+            if legacy_selfies or cleared_phones:
+                for legacy_selfie in legacy_selfies:
+                    legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
+                db.session.commit()
+                app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
+                                len(legacy_selfies), cleared_phones)
 
 if BOT_TOKEN and os.getenv("DATABASE_URL"):
     threading.Thread(target=presence_reminder_loop, name="presence-reminders", daemon=True).start()
