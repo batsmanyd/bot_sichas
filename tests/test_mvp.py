@@ -12,6 +12,16 @@ from urllib.parse import urlencode
 import main
 
 
+def sample_photo():
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
 class MvpFlowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -429,15 +439,15 @@ class MvpFlowTest(unittest.TestCase):
         self.assertFalse(self.first.get("/api/session").get_json()["profile_completed"])
         self.assertEqual(self.first.post("/api/profile", json={
             "name": "Ю", "age": 17, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": True,
+            "selfie": sample_photo(), "selfie_visibility": "mutual", "terms_accepted": True,
         }).status_code, 400)
         self.assertEqual(self.first.post("/api/profile", json={
             "name": "Юрий", "age": 51, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": False,
+            "selfie": sample_photo(), "selfie_visibility": "mutual", "terms_accepted": False,
         }).status_code, 400)
         response = self.first.post("/api/profile", json={
             "name": "Юрий", "age": 85, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "hidden", "terms_accepted": True,
+            "selfie": sample_photo(), "selfie_visibility": "hidden", "terms_accepted": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["profile"]["city"], "Минск")
@@ -446,7 +456,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertNotIn("base64,test", stored_selfie.image)
         self.assertTrue(self.first.get("/api/session").get_json()["profile_completed"])
         profile = self.first.get("/api/profile").get_json()["profile"]
-        self.assertEqual(profile["selfie_preview"], "data:image/jpeg;base64,test")
+        self.assertEqual(profile["selfie_preview"], main.sanitized_photo(sample_photo()))
         self.assertEqual(profile["name"], "Юрий")
         self.assertEqual(profile["age"], 85)
         self.assertEqual(profile["gender"], "male")
@@ -458,7 +468,7 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/profile", json={
             "name": "Юрий", "age": 51, "gender": "male",
             "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,delete-me",
+            "selfie": sample_photo(),
             "selfie_visibility": "mutual", "terms_accepted": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
@@ -1358,7 +1368,7 @@ class MvpFlowTest(unittest.TestCase):
             self.assertEqual(client.post("/api/profile", json={
                 "name": f"Тест {number}", "age": 29, "gender": "female",
                 "about": "Помогаю в местных экологических акциях.",
-                "selfie": "data:image/jpeg;base64,/9j/QQ==", "terms_accepted": True,
+                "selfie": sample_photo(), "terms_accepted": True,
             }).status_code, 200)
         path = "/api/v2/good-deeds"
         payload = {

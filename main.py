@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse
 import jwt
 import requests
 import qrcode
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 from cryptography.fernet import Fernet, InvalidToken
 from flask import (
     has_request_context,
@@ -1342,7 +1342,7 @@ def assign_request_id():
 
 
 PUBLIC_RATE_LIMITS = {"/auth/handoff": 8, "/auth/telegram-mini-app": 20,
-                      "/auth/telegram/start": 20, "/auth/device": 40, "/api/traffic": 120}
+                      "/auth/telegram/start": 20, "/auth/device": 40, "/api/traffic": 120, "/api/profile": 30}
 PUBLIC_RATE_BUCKETS = OrderedDict()
 PUBLIC_RATE_LOCK = threading.Lock()
 RUNTIME_ERRORS = {"http_5xx": 0, "background_errors": 0}
@@ -1701,16 +1701,20 @@ def save_profile():
         return jsonify(error="Напишите одну короткую фразу о себе — минимум 20 символов"), 400
     if public_kind not in (None, "neutral", "avatar", "real"):
         return jsonify(error="Выберите тип публичного изображения"), 400
-    if any(value and not valid_photo(value) for value in (public_image, real_photo)):
-        return jsonify(error="Выберите корректное изображение"), 400
+    try:
+        if selfie_image:
+            selfie_image = sanitized_photo(selfie_image)
+        if public_image:
+            public_image = sanitized_photo(public_image)
+        if real_photo:
+            real_photo = sanitized_photo(real_photo)
+    except (ValueError, OSError, Image.DecompressionBombError):
+        return jsonify(error="Выберите корректное изображение JPEG, PNG или WebP"), 400
     if data.get("terms_accepted") is not True:
         return jsonify(error="Подтвердите правила безопасных встреч"), 400
     profile = UserProfile.query.filter_by(user_id=user.id).first()
     selfie = ProfileSelfie.query.filter_by(user_id=user.id).first()
-    if selfie_image:
-        if not selfie_image.startswith("data:image/jpeg;base64,") or len(selfie_image) > 700_000:
-            return jsonify(error="Не удалось обработать селфи. Сделайте новое фото"), 400
-    elif not selfie:
+    if not selfie_image and not selfie:
         return jsonify(error="Добавьте свежее селфи"), 400
     media = ProfileMedia.query.filter_by(user_id=user.id).first()
     if public_kind in ("avatar", "real") and not public_image and not (media and media.public_image):
@@ -3955,7 +3959,7 @@ def create_good_deed_v2():
     if not user:
         return jsonify(error="Нужна регистрация через Telegram"), 401
     if not user_profile_payload(user)["completed"]:
-        return jsonify(error="Сначала заполните профиль и пройдите селфи-проверку"), 409
+        return jsonify(error="Сначала заполните профиль и добавьте селфи"), 409
     data = json_body()
     direction = str(data.get("direction", "community"))
     if direction not in GOOD_DEED_DIRECTIONS:
@@ -4005,7 +4009,7 @@ def join_good_deed_v2(deed_id):
     if not user:
         return jsonify(error="Нужна регистрация через Telegram"), 401
     if not user_profile_payload(user)["completed"]:
-        return jsonify(error="Сначала заполните профиль и пройдите селфи-проверку"), 409
+        return jsonify(error="Сначала заполните профиль и добавьте селфи"), 409
     deed = GoodDeed.query.filter_by(id=deed_id).with_for_update().first()
     if deed is None:
         abort(404)
@@ -4530,7 +4534,7 @@ def private_task_action(task_id):
         if not isinstance(photos, list) or len(photos) > 3:
             return jsonify(error="Можно приложить до трёх фотографий"), 400
         try:
-            images = [sanitized_task_photo(photo) for photo in photos]
+            images = [sanitized_photo(photo) for photo in photos]
         except (ValueError, OSError, Image.DecompressionBombError):
             return jsonify(error="Загрузите корректное изображение JPEG, PNG или WebP"), 400
         if task.category == "public_photo" and not images:
@@ -4676,7 +4680,7 @@ def task_terms_payload(details):
             "fee_bps": details.fee_bps}
 
 
-def sanitized_task_photo(value):
+def sanitized_photo(value):
     if not valid_photo(value):
         raise ValueError("Invalid image")
     raw = base64.b64decode(value.split(",", 1)[1], validate=True)
