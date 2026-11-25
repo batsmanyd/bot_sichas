@@ -1,9 +1,9 @@
 # Технический аудит приложения «Сейчас»
 
-Дата аудита: 2026-08-05  
-Репозиторий: `https://github.com/batsmanyd/bot_sichas`  
-Ветка: `main`  
-Commit: `ca8bcd9a4998f8a264a3a447624e215f1ccb129a` (`Merge 0.17.8 realtime meeting room`)  
+Дата аудита: 2026-08-05\
+Репозиторий: `https://github.com/batsmanyd/bot_sichas`\
+Ветка: `main`\
+Commit: `ca8bcd9a4998f8a264a3a447624e215f1ccb129a` (`Merge 0.17.8 realtime meeting room`)\
 Состояние: локальный `main` был чистым и совпадал с `origin/main`. Код приложения, GitHub, Railway, production-БД, Telegram и внешние сервисы не изменялись.
 
 ## Краткий вывод
