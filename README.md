@@ -59,7 +59,9 @@ function New-SichasKey {
     try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     [Convert]::ToBase64String($bytes)
 }
-@("SECRET_KEY=$(New-SichasKey)", "SELFIE_ENCRYPTION_KEY=$(New-SichasKey)") | Set-Content .env -Encoding ascii
+if (-not (Test-Path .env)) {
+    @("SECRET_KEY=$(New-SichasKey)", "SELFIE_ENCRYPTION_KEY=$(New-SichasKey)") | Set-Content .env -Encoding ascii
+}
 docker compose up --build -d --wait
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
