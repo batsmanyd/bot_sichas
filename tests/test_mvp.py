@@ -947,7 +947,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("await loadInterests(true)", frontend)
         self.assertNotIn("Версия приложения", frontend)
         self.assertNotIn("Имитировать реальную встречу", frontend)
-        self.assertIn('id="cityLabel" class="city">Минск</div>', frontend)
+        self.assertIn('id="cityLabel" class="city">Рядом</div>', frontend)
         self.assertIn("Участник не пришёл", frontend)
         self.assertIn("Оспорить неявку", frontend)
         self.assertIn("Сказать спасибо", frontend)
@@ -979,7 +979,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("mapMeetings.filter(item=>!item.mine)", frontend)
         self.assertIn("agreedPlaces.map", frontend)
         self.assertIn("Место согласовано ✓", frontend)
-        self.assertIn("&time=now`);mapMeetings=data.items", frontend)
+        self.assertIn("feedQuery(currentLocation,{time:'now'})", frontend)
         self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
         self.assertIn("placePickerMap=L.map('placePickerMap',{zoomControl:true});placePickerMap.attributionControl.setPrefix(false)", frontend)
         self.assertIn("Ваша активная встреча", frontend)
@@ -1066,7 +1066,7 @@ class MvpFlowTest(unittest.TestCase):
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
             backend = source.read()
-        self.assertIn('EXPECTED_SCHEMA_REVISION = "0009_private_features"', backend)
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0010_release_controls"', backend)
         self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
         self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
 
@@ -1376,7 +1376,8 @@ class MvpFlowTest(unittest.TestCase):
         approval = f"/api/v2/admin/good-deeds/{deed_id}/decision"
         self.assertEqual(self.second.post(approval, json={"decision": "active"}).status_code, 403)
         with patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-603"}):
-            self.assertEqual(self.third.post(approval, json={"decision": "active"}).status_code, 200)
+            csrf = self.third.get(path).json["csrf_token"]
+            self.assertEqual(self.third.post(approval, json={"decision": "active"}, headers={"X-CSRF-Token": csrf}).status_code, 200)
         for _ in range(2):
             joined = self.second.post(f"{path}/{deed_id}/join", json={"joined": True})
             self.assertEqual(joined.get_json()["item"]["participants"], 1)
@@ -1442,6 +1443,8 @@ class MvpFlowTest(unittest.TestCase):
         user = main.User.query.filter_by(telegram_id="test-721").one()
         user_id = user.id
         user.telegram_id = "721"
+        main.db.session.add(main.UserProfile(user_id=user_id, age=29, gender="female"))
+        main.db.session.add(main.ProfileSelfie(user_id=user_id, image=main.encrypt_selfie("fixture"), about="Test profile"))
         main.db.session.commit()
         point = {"latitude": 53.9023, "longitude": 27.5619}
         watch = {**point, "category": "cafe", "radius": 3, "window": "hour"}
@@ -1534,6 +1537,131 @@ class MvpFlowTest(unittest.TestCase):
             data = self.first.get("/api/admin/traffic").json
         for key in ("press", "creator", "ads"):
             self.assertEqual(data["channels"][key], {"visits": 1, "registrations": 1})
+
+    def test_release_protects_api_profile_and_public_search_surface(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 901)
+        with patch.object(main, "ALLOW_TEST_AUTH", False):
+            self.assertEqual(self.first.post("/api/presence", json={"category":"walk"}).status_code, 403)
+            self.assertEqual(self.first.post("/api/meetings", json={"category":"walk"}).status_code, 403)
+        self.assertEqual(self.first.post("/api/location", headers={"Sec-Fetch-Site":"cross-site"},
+                                        json={"latitude":10, "longitude":10}).status_code, 403)
+        for loc in ("/about", "/about?lang=en", "/about/qr.png", "/sitemap.xml", "/robots.txt", "/service-worker.js"):
+            with self.subTest(loc=loc), self.first.get(loc) as response:
+                self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.first.get("/api/feed").headers["X-Robots-Tag"], "noindex, nofollow")
+        with self.first.get("/about?lang=en") as response:
+            self.assertIn(b'<html lang="en">', response.data)
+
+    def test_release_international_day_uses_user_zone(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        self.login(self.first, 902)
+        payload = {"category":"walk", "description":"Walk", "time_mode":"today",
+                   "starts_in_minutes":120, "latitude":40.7, "longitude":-74.0}
+        with patch.object(main, "utcnow", return_value=datetime(2026, 11, 25, 20, tzinfo=timezone.utc)):
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"Europe/Minsk"}).status_code, 400)
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"America/New_York"}).status_code, 201)
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"invalid"}).status_code, 400)
+
+    def test_release_closed_task_material_policy_and_audit(self):
+        from io import BytesIO
+        import base64
+        from unittest.mock import patch
+        from PIL import Image
+
+        admin = main.app.test_client()
+        company = main.app.test_client()
+        self.login(company, 915)
+        main.User.query.filter_by(telegram_id="test-915").update({"telegram_id":"915"})
+        main.db.session.commit()
+        for client, account in ((self.first, 911),(self.second,912),(self.third,913),(admin,914)):
+            self.login(client, account)
+        path = "/api/private/tasks"
+        settings = "/api/admin/release-settings"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS":"test-911,test-912",
+                                     "TASK_MODERATOR_TELEGRAM_IDS":"test-913"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-914"}):
+            self.assertEqual(self.third.get(settings).status_code, 403)
+            policy = {"categories":["public_photo"],"max_budget":100,"fee_bps":750,"enabled":True}
+            self.assertEqual(admin.post(settings,json=policy).status_code, 403)
+            csrf = admin.get(settings).json["csrf_token"]
+            self.assertEqual(company.get(path).status_code,403)
+            enrollment = "/api/admin/corporate-customers"
+            self.assertEqual(admin.post(enrollment,json={"account":"915","organization":"Example company"},
+                                        headers={"X-CSRF-Token":csrf}).status_code,200)
+            self.assertEqual(company.get(path).status_code,200)
+            self.assertEqual(admin.post(settings,json=policy,headers={"X-CSRF-Token":csrf}).status_code, 200)
+            payload = {"title":"Фото витрины", "description":"Фото товара с разрешения магазина",
+                       "category":"public_photo", "budget":80, "currency":"EUR", "city":"Warsaw",
+                       "country":"PL", "due_at":(main.utcnow()+timedelta(hours=3)).isoformat(),
+                       "requirements":"Снять товар крупным планом"}
+            self.assertEqual(self.first.post(path,json={**payload,"city":""}).status_code, 400)
+            self.assertEqual(self.first.post(path,json={**payload,"description":"Нужна слежка за человеком"}).status_code, 400)
+            item = self.first.post(path,json=payload).json["item"]
+            self.assertEqual(item["estimated_fee"], "6.00")
+            self.assertEqual(item["terms"]["city"], "Warsaw")
+            self.assertEqual(self.second.get(path).json["items"], [])
+            route = f"{path}/{item['id']}/action"
+            mod_csrf = self.third.get(path).json["csrf_token"]
+            self.assertEqual(self.third.post(route,json={"action":"approve"},headers={"X-CSRF-Token":mod_csrf}).status_code, 200)
+            self.assertEqual(len(self.second.get(path+"?city=Warsaw&country=PL").json["items"]),1)
+            self.assertEqual(self.second.get(path+"?city=London&country=GB").json["items"],[])
+            self.second.post(route,json={"action":"apply"})
+            applicant = self.first.get(path).json["items"][0]["applicants"][0]["id"]
+            self.first.post(route,json={"action":"assign","user_id":applicant})
+            self.assertEqual(self.second.post(route,json={"action":"submit","text":"Фото готово"}).status_code, 400)
+            photo = Image.new("RGB", (8,8))
+            metadata = photo.getexif()
+            metadata[270] = "private location"
+            buffer = BytesIO()
+            photo.save(buffer,format="JPEG",exif=metadata)
+            encoded = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+            response = self.second.post(route,json={"action":"submit","text":"Фото готово","photos":[encoded]})
+            self.assertEqual(response.status_code,200,response.json)
+            url = response.json["item"]["materials"][0]["url"]
+            with self.first.get(url) as material:
+                self.assertEqual(material.status_code,200)
+                self.assertEqual(dict(Image.open(BytesIO(material.data)).getexif()),{})
+            self.assertEqual(main.app.test_client().get(url).status_code,401)
+            self.assertEqual(company.get(url).status_code,404)
+            self.assertEqual(main.TaskMaterial.query.one().image[:4],"enc:")
+            self.assertEqual(self.first.post(route,json={"action":"accept"}).status_code,200)
+            stats = admin.get("/api/admin/release-metrics").json
+            self.assertEqual(stats["actual_revenue"],[])
+            self.assertEqual(stats["estimated_commission"],[{"currency":"EUR","amount":"6.0"}])
+            self.assertEqual(main.TaskActivity.query.filter_by(task_id=item["id"]).count(),6)
+
+    def test_release_repeat_invitation_is_private_and_idempotent(self):
+        self.login(self.first, 921)
+        self.login(self.second, 922)
+        self.login(self.third, 923)
+        first = main.User.query.filter_by(telegram_id="test-921").one()
+        second = main.User.query.filter_by(telegram_id="test-922").one()
+        now = main.utcnow()
+        old = main.Meeting(owner_id=first.id, category="talk", description="Знакомство", format="one",
+                           latitude=53.9, longitude=27.56, starts_at=now-timedelta(hours=2),
+                           expires_at=now-timedelta(hours=1))
+        main.db.session.add(old)
+        main.db.session.flush()
+        old_id, second_id = old.id, second.id
+        main.db.session.add(main.Interest(meeting_id=old_id,user_id=second_id,status="accepted"))
+        main.db.session.add(main.MeetingState(meeting_id=old_id,status="completed"))
+        for who in (first.id, second_id):
+            main.db.session.add(main.MeetingEvent(meeting_id=old_id,user_id=who,kind="complete"))
+        main.db.session.commit()
+        contacts=self.first.get("/api/meetings/previous-contacts").json["items"]
+        self.assertEqual([(x["user_id"],x["meeting_id"]) for x in contacts],[(second_id,old_id)])
+        path=f"/api/meetings/{old_id}/repeat"
+        self.assertEqual(self.third.post(path,json={"user_id":second_id}).status_code,404)
+        reply=self.first.post(path,json={"user_id":second_id})
+        self.assertEqual(reply.status_code,201)
+        new_id=reply.json["meeting_id"]
+        self.assertEqual(self.first.post(path,json={"user_id":second_id}).json["meeting_id"],new_id)
+        self.assertEqual(self.third.get("/api/feed?lat=0&lon=0&radius=3").json["items"],[])
+        self.assertEqual(self.third.post(f"/api/meetings/{new_id}/interest",json={}).status_code,404)
+        self.assertEqual(self.second.get("/api/interests").json["incoming"][0]["meeting_id"],new_id)
 
 
 if __name__ == "__main__":

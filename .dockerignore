@@ -11,3 +11,10 @@
 !migrations/
 !migrations/**
 **/__pycache__
+
+!about.html
+!about-en.html
+!offline.html
+!service-worker.js
+!scripts/
+!scripts/bootstrap_db.py

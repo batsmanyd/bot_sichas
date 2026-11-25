@@ -19,6 +19,20 @@
 <main class="shell">
   <header class="top"><div class="brand">Сейчас · Модерация<span>Жалобы и безопасность сообщества</span></div><div id="live" class="live">Обновляем</div></header>
   <section id="metrics" class="metrics"></section>
+  <details id="releaseControls"><summary>Управление поручениями и показатели</summary>
+    <div id="releaseMetrics" class="metrics"></div>
+    <form id="taskPolicy" class="filters"><label>Лимит суммы <input name="max_budget" type="number" min="1" max="100000" required></label>
+      <label>Комиссия, % <input name="fee" type="number" min="0" max="50" step="0.01" required></label>
+      <label><input name="enabled" type="checkbox"> Принимать новые поручения</label>
+      <fieldset><legend>Разрешённые категории</legend><div id="taskCategories"></div></fieldset>
+      <button>Сохранить</button><p id="taskPolicyStatus" role="status"></p>
+    </form>
+    <form id="corporateForm" class="filters"><label>Telegram ID <input name="account" inputmode="numeric" pattern="[0-9]+" required></label>
+      <label>Проверенная организация <input name="organization" maxlength="120"></label>
+      <button>Сохранить доступ</button><small>Пустое название отзывает доступ.</small>
+      <p id="corporateStatus" role="status"></p>
+    </form><div id="corporateCustomers"></div>
+  </details>
   <details><summary>Источники привлечения</summary><div id="trafficMetrics" class="metrics"></div>
     <form id="trafficLinkForm" class="filters"><select aria-label="Канал" name="medium"><option value="press">СМИ</option><option value="creator">Блогеры</option><option value="ads">Реклама</option></select>
       <input name="source" aria-label="Источник" placeholder="Источник" maxlength="60" pattern="[a-zA-Z0-9._-]+" required>
@@ -62,9 +76,55 @@ $('trafficLinkForm').onsubmit=event=>{
   $('trafficLink').value=url.href;
   $('trafficLink').select();
 };
-document.querySelector('details').addEventListener('toggle',event=>{
+document.querySelector('#trafficMetrics').closest('details').addEventListener('toggle',event=>{
   if(event.target.open)loadTrafficMetrics().catch(error=>{$('trafficMetrics').textContent=error.message});
 });
+async function loadReleaseControls(){
+  const [settings, stats]=await Promise.all([api('/api/admin/release-settings'),api('/api/admin/release-metrics')]);
+  csrf=settings.csrf_token;
+  const form=$('taskPolicy');
+  form.elements.max_budget.value=settings.policy.max_budget;
+  form.elements.fee.value=settings.policy.fee_bps/100;
+  form.elements.enabled.checked=settings.policy.enabled;
+  $('taskCategories').innerHTML=Object.entries(settings.categories).map(([key,label])=>
+    `<label><input type="checkbox" name="category" value="${esc(key)}" ${settings.policy.categories.includes(key)?'checked':''}> ${esc(label)}</label>`
+  ).join('<br>');
+  const metrics={registrations:'Регистрации',active_7d:'Активность за 7 дней',meetings:'Создано встреч',
+    completed_meetings:'Состоялось встреч',completed_repeat_meetings:'Повторные встречи',returning_7d:'Вернулись в течение 7 дней',responses:'Отклики',confirmed_responses:'Принятые отклики',
+    completed_good_deeds:'Завершённые акции',tasks:'Создано поручений',completed_tasks:'Принято поручений'};
+  $('releaseMetrics').innerHTML=Object.entries(metrics).map(([key,label])=>metric(label,stats[key])).join('')
+    +metric('Расчётная комиссия',stats.estimated_commission.map(item=>esc(item.amount+' '+item.currency)).join(', ')||'0')
+    +metric('Фактическая выручка','0')
+    +metric('Ошибки HTTP с запуска',stats.runtime_errors.http_5xx)
+    +metric('Ошибки фоновых задач с запуска',stats.runtime_errors.background_errors);
+}
+$('releaseControls').addEventListener('toggle',event=>{
+  if(event.target.open)Promise.all([loadReleaseControls(),loadCorporateCustomers()]).catch(error=>{$('taskPolicyStatus').textContent=error.message});
+});
+$('taskPolicy').onsubmit=async event=>{
+  event.preventDefault();
+  const form=event.target,data=new FormData(form);
+  try{
+    await api('/api/admin/release-settings',{method:'POST',body:JSON.stringify({
+      max_budget:Number(data.get('max_budget')),fee_bps:Math.round(Number(data.get('fee'))*100),
+      categories:data.getAll('category'),enabled:form.elements.enabled.checked
+    })});
+    $('taskPolicyStatus').textContent='Настройки сохранены';
+  }catch(error){$('taskPolicyStatus').textContent=error.message}
+};
+async function loadCorporateCustomers(){
+  const response=await api('/api/admin/corporate-customers');
+  csrf=response.csrf_token;
+  $('corporateCustomers').innerHTML=response.items.map(item=>`<p>${esc(item.organization)} · ${esc(item.account)}</p>`).join('');
+}
+$('corporateForm').onsubmit=async event=>{
+  event.preventDefault();
+  try{
+    await api('/api/admin/corporate-customers',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});
+    $('corporateStatus').textContent='Доступ обновлён';
+    await loadCorporateCustomers();
+  }catch(error){$('corporateStatus').textContent=error.message}
+};
 $('apply').onclick=loadReports;async function start(){await dashboard();await loadReports();if(requestedReportId){const data=await api(`/api/admin/reports/${requestedReportId}`);reports=[data.report,...reports.filter(item=>item.id!==data.report.id)];openReport(data.report.id)}}start().catch(error=>{$('reports').innerHTML=`<div class="empty error">${esc(error.message)}</div>`});setInterval(async()=>{try{const data=await api('/api/admin/dashboard');if(data.revision!==revision){csrf=data.csrf_token;revision=data.revision;await loadReports()}}catch(_){$('live').textContent='Нет связи'}},5000);
 </script>
 </body>

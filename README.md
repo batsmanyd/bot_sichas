@@ -31,7 +31,7 @@
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
 завершает запуск, если отсутствует обязательная конфигурация, используется не
 PostgreSQL/HTTPS, включён тестовый вход или схема БД не находится на Alembic
-revision `0009_private_features`. Временный production-ключ не генерируется.
+revision `0010_release_controls`. Временный production-ключ не генерируется.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
 
@@ -93,3 +93,7 @@ Invoke-RestMethod http://127.0.0.1:8080/health
 `docker compose down` останавливает локальное приложение. SQLite хранится в томе
 `app-data`. Сохраните исходный `.env` вместе с резервной копией БД. Для переноса
 данных старой версии сначала выполните [миграцию](docs/MIGRATIONS.md) на копии.
+
+## Кандидат 1.0.0
+
+[Эксплуатация и автоматический запуск на Windows](docs/OPERATIONS.md) · [миграции](docs/MIGRATIONS.md).
