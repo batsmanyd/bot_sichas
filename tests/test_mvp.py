@@ -1066,7 +1066,7 @@ class MvpFlowTest(unittest.TestCase):
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
             backend = source.read()
-        self.assertIn('EXPECTED_SCHEMA_REVISION = "0008_safety_good_deeds"', backend)
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0009_private_features"', backend)
         self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
         self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
 
@@ -1350,9 +1350,6 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(main.NotificationOutbox.query.count(), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     def test_good_deed_moderation_roster_completion_and_trace(self):
         from unittest.mock import patch
 
@@ -1403,3 +1400,141 @@ if __name__ == "__main__":
         self.assertEqual(main.GoodDeed.query.count(), 1)
         self.assertEqual(self.first.delete("/api/account", json={"confirmation": "УДАЛИТЬ"}).status_code, 200)
         self.assertEqual(main.GoodDeed.query.count(), 0)
+
+    def test_0181_today_schedule_respects_minsk_midnight(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        self.login(self.first, 701)
+        self.login(self.second, 702)
+        endpoint = "/api/meetings"
+        data = {"latitude": 53.9023, "longitude": 27.5619, "category": "cafe",
+                "description": "Кофе вечером", "time_mode": "today"}
+        with patch.object(main, "utcnow", return_value=datetime(2026, 11, 25, 18, tzinfo=timezone.utc)):
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": 179}).status_code, 201)
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": 180}).status_code, 400)
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": -1}).status_code, 400)
+            feed = "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe"
+            self.assertEqual(self.second.get(feed + "&time=hour").json["items"], [])
+            self.assertEqual(self.second.get(feed + "&time=today").json["items"][0]["time_mode"], "today")
+
+    def test_0181_pwa_referral_shares_telegram_token_and_claims_once(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        self.login(self.first, 711)
+        self.login(self.second, 712)
+        self.login(self.third, 713)
+        invitation = self.first.post("/api/invitations", json={}).json
+        token = parse_qs(urlsplit(invitation["pwa_url"]).query)["invite"][0]
+        self.assertTrue(invitation["telegram_url"].endswith(f"invite_{token}"))
+        path = "/api/invitations/claim"
+        self.assertEqual(main.app.test_client().post(path, json={"token": token}).status_code, 401)
+        self.assertFalse(self.first.post(path, json={"token": token}).json["claimed"])
+        self.assertTrue(self.second.post(path, json={"token": token}).json["claimed"])
+        self.assertFalse(self.third.post(path, json={"token": token}).json["claimed"])
+        self.assertEqual(self.first.get("/api/invitations").json["available"], 2)
+
+    def test_0181_company_watch_and_opt_in_telegram_delivery(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 721)
+        self.login(self.second, 722)
+        user = main.User.query.filter_by(telegram_id="test-721").one()
+        user_id = user.id
+        user.telegram_id = "721"
+        main.db.session.commit()
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        watch = {**point, "category": "cafe", "radius": 3, "window": "hour"}
+        settings, path = "/api/settings/telegram", "/api/company-watch"
+        with patch.object(main, "BOT_TOKEN", "mock-only"), patch.object(main, "telegram_api", return_value={"ok": True}) as send:
+            self.assertFalse(self.first.get(settings).json["enabled"])
+            self.assertEqual(self.first.post(path, json=watch).status_code, 409)
+            self.assertEqual(self.first.post(settings, json={"enabled": True}).status_code, 200)
+            self.assertTrue(self.first.post(path, json=watch).json["active"])
+            for category, latitude, delay in (("walk", 53.9, 1), ("cafe", 54.3, 1), ("cafe", 53.9, 90)):
+                meeting = main.Meeting(owner_id=main.User.query.filter_by(telegram_id="test-722").one().id,
+                    category=category, format="one", description="Встреча", latitude=latitude, longitude=27.56,
+                    starts_at=main.utcnow()+timedelta(minutes=delay), expires_at=main.utcnow()+timedelta(hours=3))
+                main.db.session.add(meeting)
+            main.db.session.commit()
+            main.process_company_watches()
+            main.process_user_telegram_outbox()
+            send.assert_not_called()
+            self.second.post("/api/presence", json={**point, "category": "cafe"})
+            main.process_company_watches()
+            main.process_company_watches()
+            main.process_user_telegram_outbox()
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[1]["chat_id"], "721")
+            self.assertNotIn("53.9", send.call_args.args[1]["text"])
+            self.assertTrue(self.first.get(path).json["matched"])
+            self.first.post("/api/presence", json={**point, "category": "walk"})
+            main.Presence.query.filter_by(user_id=user_id).update({"updated_at": main.utcnow()-timedelta(hours=1, minutes=5)})
+            main.db.session.commit()
+            main.process_presence_reminders()
+            main.process_presence_reminders()
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(self.first.get("/api/presence").json["active"])
+            main.notify_user(user_id, "событие", kind="meeting_cancel", dedupe_key="cancel-721")
+            self.first.post(settings, json={"enabled": False})
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 2)
+            self.assertFalse(self.first.get(path).json["active"])
+
+    def test_0181_private_tasks_require_moderation_and_separate_reputation(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 731)
+        self.login(self.second, 732)
+        self.login(self.third, 733)
+        outsider = main.app.test_client()
+        self.login(outsider, 734)
+        path = "/api/private/tasks"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS": "test-731,test-732"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-733"}):
+            self.assertEqual(outsider.get(path).status_code, 403)
+            self.assertEqual(main.app.test_client().get(path).status_code, 401)
+            payload = {"category": "editing", "title": "Редактура заметки",
+                       "description": "Исправить опечатки в открытой заметке", "budget": 15}
+            self.assertEqual(self.first.post(path, json={**payload, "category": "banking"}).status_code, 400)
+            task = self.first.post(path, json=payload).json["item"]
+            action = f"{path}/{task['id']}/action"
+            self.assertEqual(task["status"], "pending")
+            self.assertEqual(self.second.get(path).json["items"], [])
+            self.assertEqual(self.second.post(action, json={"action": "apply"}).status_code, 404)
+            self.assertEqual(self.third.post(action, json={"action": "approve"}).status_code, 403)
+            csrf = self.third.get(path).json["csrf_token"]
+            headers = {"X-CSRF-Token": csrf}
+            self.assertEqual(self.third.post(action, json={"action": "approve"}, headers=headers).json["item"]["status"], "approved")
+            self.assertEqual(self.second.post(action, json={"action": "apply"}).status_code, 200)
+            applicant = self.first.get(path).json["items"][0]["applicants"][0]
+            self.assertEqual(self.first.post(action, json={"action": "assign", "user_id": applicant["id"]}).json["item"]["status"], "assigned")
+            self.assertEqual(self.first.post(action, json={"action": "accept"}).status_code, 409)
+            self.assertEqual(self.second.post(action, json={"action": "submit", "text": "Редактура завершена"}).json["item"]["status"], "submitted")
+            self.assertEqual(self.first.post(action, json={"action": "refuse", "text": "Нужно проверить правки"}).json["item"]["status"], "refused")
+            self.assertEqual(self.second.post(action, json={"action": "dispute", "text": "Правки согласованы"}).json["item"]["status"], "disputed")
+            self.assertEqual(self.third.post(action, json={"action": "resolve_accept"}, headers=headers).json["item"]["status"], "accepted")
+            self.assertEqual(self.second.get(path).json["reputation"], {"completed": 1})
+            self.assertEqual(main.MeetingThanks.query.count(), 0)
+
+    def test_0181_acquisition_separates_channels_and_deduplicates_registration(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 741)
+        self.login(self.second, 742)
+        self.login(self.third, 743)
+        clients = (self.first, self.second, self.third)
+        for client, medium in zip(clients, ("press", "creator", "ads")):
+            payload = {"visitor_id": "browser-unique", "source": "same", "campaign": "launch", "medium": medium}
+            self.assertTrue(client.post("/api/traffic", json=payload).json["counted"])
+            self.assertFalse(client.post("/api/traffic", json=payload).json["counted"])
+        self.assertEqual(self.first.get("/api/admin/traffic").status_code, 403)
+        with patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-741"}):
+            data = self.first.get("/api/admin/traffic").json
+        for key in ("press", "creator", "ads"):
+            self.assertEqual(data["channels"][key], {"visits": 1, "registrations": 1})
+
+
+if __name__ == "__main__":
+    unittest.main()
