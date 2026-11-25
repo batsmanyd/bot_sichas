@@ -1733,6 +1733,7 @@ class MvpFlowTest(unittest.TestCase):
                 json={"hours":24,"reason":"Проверка жалобы"},headers=headers).status_code,200)
             self.assertEqual(self.first.post("/api/presence",json=point).status_code,403)
             self.assertEqual(main.app.test_client().get("/api/v2/good-deeds").json["items"],[])
+            self.assertEqual(self.first.get("/api/v2/good-deeds").json["items"][0]["roster"],[])
             self.assertEqual(volunteer.post(f"/api/v2/good-deeds/{deed_id}/join",json={"joined":True}).status_code,409)
             self.assertEqual(self.third.post(f"/api/admin/users/{owner_id}/access",
                 json={"hours":0,"reason":"Проверка завершена"},headers=headers).status_code,200)
@@ -1762,6 +1763,29 @@ class MvpFlowTest(unittest.TestCase):
             main.worker_progress("outbox")
             main.worker_progress("maintenance")
             self.assertEqual(self.first.get("/ready").status_code,200)
+
+    def test_launch_block_stops_room_communication_and_photo_disclosure(self):
+        self.login(self.first, 951)
+        self.login(self.second, 952)
+        first = main.User.query.filter_by(telegram_id="test-951").one().id
+        second = main.User.query.filter_by(telegram_id="test-952").one().id
+        meeting_id = self.first.post("/api/meetings", json={"category":"walk","description":"Встреча в парке",
+            "latitude":53.9,"longitude":27.5}).json["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest",json={})
+        pending = self.first.get("/api/interests").json["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{pending}/decision",json={"decision":"accepted"})
+        for user_id in (first,second):
+            main.db.session.add(main.ProfileMedia(user_id=user_id,real_photo=main.encrypt_selfie(sample_photo())))
+            main.db.session.add(main.PhotoConsent(meeting_id=meeting_id,user_id=user_id))
+        main.db.session.commit()
+        self.assertTrue(self.second.get(f"/api/meetings/{meeting_id}/room").json["photos_revealed"])
+        reply=self.first.post(f"/api/meetings/{meeting_id}/report",
+                              json={"target_user_id":second,"reason":"Нежелательный контакт","block":True})
+        self.assertEqual(reply.status_code,200)
+        room=self.second.get(f"/api/meetings/{meeting_id}/room").json
+        self.assertFalse(room["photos_revealed"])
+        self.assertTrue(room["meeting"]["contact_locked"])
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/messages",json={"text":"Повторный контакт"}).status_code,403)
 
 
 if __name__ == "__main__":

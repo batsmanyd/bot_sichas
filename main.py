@@ -2221,7 +2221,7 @@ def feed():
             })
     if user:
         for meeting in Meeting.query.filter(Meeting.expires_at > now).all():
-            if not meeting_member(meeting, user):
+            if not meeting_member(meeting, user) or not meeting_contact_allowed(meeting, user.id):
                 continue
             state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
             if state and state.status != "active":
@@ -2506,6 +2506,12 @@ def meeting_peer_available(user_id, peer_id):
     ).first()
 
 
+def meeting_contact_allowed(meeting, user_id, members=None):
+    members = accepted_user_ids(meeting) if members is None else members
+    return not user_hidden(user_id) and all(meeting_peer_available(user_id, peer_id)
+                                            for peer_id in members - {user_id})
+
+
 @app.post("/api/meetings/<int:meeting_id>/repeat")
 @login_required
 @profile_required
@@ -2679,7 +2685,7 @@ def meeting_list_summary(meeting, viewer):
         "meeting_status": effective_meeting_status(meeting),
         "my_completion_confirmed": my_completion_confirmed,
         "needs_feedback": my_completion_confirmed and feedback_rating(my_feedback) is None,
-        "confirmed_place": confirmed_place.title if confirmed_place else None,
+        "confirmed_place": confirmed_place.title if confirmed_place and meeting_contact_allowed(meeting, viewer.id) else None,
         "latest_message": {
             "id": latest.id,
             "name": db.session.get(User, latest.user_id).name,
@@ -2881,9 +2887,10 @@ def room_payload(meeting, user):
     events.reverse()
     thanks = MeetingThanks.query.filter_by(meeting_id=meeting.id).all()
     member_ids = accepted_user_ids(meeting)
+    contact_allowed = meeting_contact_allowed(meeting, user.id, member_ids)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
     media_by_user = {row.user_id: row for row in ProfileMedia.query.filter(ProfileMedia.user_id.in_(member_ids))}
-    photos_revealed = len(member_ids) >= 2 and member_ids.issubset(consented_ids) and all(
+    photos_revealed = contact_allowed and len(member_ids) >= 2 and member_ids.issubset(consented_ids) and all(
         uid in media_by_user and media_by_user[uid].real_photo for uid in member_ids
     )
     confirmed_ids = {row.user_id for row in MeetingConfirmation.query.filter_by(meeting_id=meeting.id)}
@@ -2901,7 +2908,7 @@ def room_payload(meeting, user):
             "age": profile.age if profile else None,
             "gender": profile.gender if profile else None,
             "about": selfie.about if selfie else "",
-            "picture": picture, "public_picture": media_payload(media),
+            "picture": picture, "public_picture": media_payload(media) if contact_allowed or uid == user.id else None,
             "photo_visible": bool(picture), "photo_visibility": "mutual",
             "selfie_verified": bool(selfie),
             "photo_consented": uid in consented_ids,
@@ -2925,7 +2932,7 @@ def room_payload(meeting, user):
     status = effective_meeting_status(meeting)
     my_feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
-                         "latitude": None, "longitude": None,
+                         "latitude": None, "longitude": None, "contact_locked": not contact_allowed,
                          "my_confirmed": user.id in confirmed_ids,
                          "all_confirmed": len(member_ids) >= 2 and member_ids.issubset(confirmed_ids),
                          "starts_at": normalize_dt(meeting.starts_at).isoformat(),
@@ -2950,7 +2957,7 @@ def room_payload(meeting, user):
                     f"https://www.openstreetmap.org/?mlat={location.latitude:.6f}"
                     f"&mlon={location.longitude:.6f}#map=17/{location.latitude:.6f}/{location.longitude:.6f}"
                 ) if location else None,
-            } for p in places],
+            } for p in places] if contact_allowed else [],
             "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
                           "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
                          for m in messages],
@@ -2978,6 +2985,8 @@ def consent_to_photo(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     user = current_user()
     Meeting.query.filter_by(id=meeting.id).with_for_update().one()
     media = ProfileMedia.query.filter_by(user_id=user.id).first()
@@ -2998,6 +3007,8 @@ def confirm_meeting(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     meeting = Meeting.query.filter_by(id=meeting_id).with_for_update().one()
     members = accepted_user_ids(meeting)
     if len(members) < 2 or effective_meeting_status(meeting) != "active":
@@ -3028,6 +3039,8 @@ def propose_place(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     title = str(json_body().get("title", "")).strip()[:120]
     if len(title) < 2:
         return jsonify(error="Укажите место встречи"), 400
@@ -3140,6 +3153,8 @@ def vote_place(place_id):
     meeting, error = meeting_room_or_error(place.meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     vote = PlaceVote.query.filter_by(place_id=place.id, user_id=current_user().id).first()
     if vote:
         if place.confirmed:
@@ -3176,6 +3191,8 @@ def maybe_confirm_place(meeting, place, force=False):
 def confirm_place(place_id):
     place = db.get_or_404(MeetingPlace, place_id)
     meeting = db.session.get(Meeting, place.meeting_id)
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     if meeting.owner_id != current_user().id:
         return jsonify(error="Место подтверждает создатель встречи"), 403
     if MeetingPlaceLocation.query.filter_by(place_id=place.id).first() and not agreed_public_place(meeting, place):
@@ -3192,6 +3209,8 @@ def send_message(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     if len(accepted_user_ids(meeting)) < 2:
         return jsonify(error="Чат откроется после принятия отклика"), 409
     if effective_meeting_status(meeting) != "active" or MeetingEvent.query.filter_by(
@@ -3950,7 +3969,10 @@ GOOD_DEED_DIRECTIONS = {
 
 def _deed_payload(deed, viewer=None):
     participants = GoodDeedParticipant.query.filter_by(deed_id=deed.id).all()
-    can_manage = bool(viewer and (viewer.id in (deed.owner_id, deed_coordinator(deed)) or viewer.telegram_id in ADMIN_TELEGRAM_IDS))
+    organizer = active_organizer(deed.owner_id)
+    coordinator_id = deed_coordinator(deed)
+    can_manage = bool(viewer and (viewer.telegram_id in ADMIN_TELEGRAM_IDS or
+                                  organizer and viewer.id in (deed.owner_id, coordinator_id)))
     joined = [row for row in participants if row.status in {"joined", "confirmed"}]
     confirmed = [row for row in participants if row.status == "confirmed"]
     return {
@@ -3959,7 +3981,7 @@ def _deed_payload(deed, viewer=None):
         "direction": GOOD_DEED_DIRECTIONS[deed.direction],
         "description": deed.description,
         "organizer_name": deed.organizer_name,
-        "organizer_verified": bool(active_organizer(deed.owner_id) and deed_coordinator(deed)),
+        "organizer_verified": bool(organizer and coordinator_id),
         "coordinator_name": deed.coordinator_name,
         "area": deed.area,
         "starts_at": normalize_dt(deed.starts_at).isoformat(),
