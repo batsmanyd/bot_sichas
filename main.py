@@ -254,7 +254,7 @@ class ProfileSelfie(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
     image = db.Column(db.Text, nullable=False)
-    visibility = db.Column(db.String(20), nullable=False, default="mutual")
+    visibility = db.Column(db.String(20), nullable=False, default="hidden")
     about = db.Column(db.String(160), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
@@ -726,6 +726,8 @@ def process_notification_outbox(limit=20):
             )
             recipients = [payload["admin_telegram_id"]] if payload.get("admin_telegram_id") else sorted(ADMIN_TELEGRAM_IDS)
             for telegram_id in recipients:
+                if telegram_id not in ADMIN_TELEGRAM_IDS:
+                    continue
                 telegram_api("sendMessage", {
                     "chat_id": telegram_id,
                     "text": message,
@@ -1189,6 +1191,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    a = min(1.0, max(0.0, a))
     return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
@@ -2581,6 +2584,7 @@ def decide_interest(interest_id):
         (Interest.query.filter_by(meeting_id=meeting.id, status="pending")
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
     if decision == "accepted":
+        clear_meeting_consents(meeting.id)
         state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
         if not state:
             db.session.add(MeetingState(meeting_id=meeting.id, status="active"))
@@ -2608,6 +2612,11 @@ def meeting_member(meeting, user):
     if meeting.owner_id == user.id:
         return True
     return Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id, status="accepted").first() is not None
+
+
+def clear_meeting_consents(meeting_id):
+    PhotoConsent.query.filter_by(meeting_id=meeting_id).delete()
+    MeetingConfirmation.query.filter_by(meeting_id=meeting_id).delete()
 
 
 def meeting_room_or_error(meeting_id):
@@ -3048,6 +3057,7 @@ def meeting_lifecycle(meeting_id):
         if not interest:
             return jsonify(error="Вы уже не участвуете в этой встрече"), 409
         interest.status = "rejected"
+        clear_meeting_consents(meeting.id)
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
                                     kind="leave", note="Участник отказался от встречи"))
         purge_chat_if_ready(meeting)
