@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DATABASE_URL: sqlite:////data/sichas.db
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      SELFIE_ENCRYPTION_KEY: ${SELFIE_ENCRYPTION_KEY:?Set SELFIE_ENCRYPTION_KEY in .env}
+    volumes:
+      - app-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+volumes:
+  app-data:

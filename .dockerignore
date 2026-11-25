@@ -1,0 +1,13 @@
+*
+!requirements.txt
+!main.py
+!index.html
+!admin.html
+!legal.html
+!manifest.webmanifest
+!*.svg
+!*.png
+!alembic.ini
+!migrations/
+!migrations/**
+**/__pycache__

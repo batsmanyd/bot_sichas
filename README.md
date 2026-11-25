@@ -8,13 +8,13 @@
 - PostgreSQL на Railway и SQLite для локальной разработки;
 - реальные пользователи, геолокация, постоянный статус с напоминанием через час;
 - встречи и повторно-безопасные отклики;
-- история уведомлений в приложении и Telegram-уведомления;
+- уведомления о встречах в приложении, жалобы через Telegram только администраторам;
 - доверие по завершённым встречам, благодарностям и неявкам;
 - полноценные точки мест встречи с названием и координатами;
 - возвращаемые приглашения и отметка «Развивает клуб»;
 - радиус 3/5/10/12 км;
-- смещённые координаты других пользователей на карте;
-- гостевой просмотр без возможности выполнять действия.
+- приблизительные зоны на карте и диапазоны расстояния;
+- гостевой просмотр демо и публичных акций без персональных карточек.
 
 ## Переменные Railway
 
@@ -31,7 +31,7 @@
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
 завершает запуск, если отсутствует обязательная конфигурация, используется не
 PostgreSQL/HTTPS, включён тестовый вход или схема БД не находится на Alembic
-revision `0007_runtime_guards`. Временный production-ключ не генерируется.
+revision `0008_safety_good_deeds`. Временный production-ключ не генерируется.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
 
@@ -46,3 +46,28 @@ Destructive PostgreSQL concurrency tests разрешены только для 
 явно задано `ALLOW_DESTRUCTIVE_TEST_DB=true`.
 
 Railway запускает приложение командой из `Procfile`.
+
+## Windows и Docker Desktop
+
+В Docker Desktop включите Linux containers (WSL 2). В PowerShell из корня
+репозитория создайте `.env` с двумя независимыми постоянными ключами:
+
+```powershell
+function New-SichasKey {
+    $bytes = New-Object byte[] 32
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+    [Convert]::ToBase64String($bytes)
+}
+@("SECRET_KEY=$(New-SichasKey)", "SELFIE_ENCRYPTION_KEY=$(New-SichasKey)") | Set-Content .env -Encoding ascii
+docker compose up --build -d --wait
+Invoke-RestMethod http://127.0.0.1:8080/health
+```
+
+Откройте [http://127.0.0.1:8080](http://127.0.0.1:8080). Кнопка «Демо» запускает
+сценарий с вымышленными участниками. Карта использует внешние тайлы. Скачивание
+образа и зависимостей при первой сборке требует доступа в интернет.
+
+`docker compose down` останавливает локальное приложение. SQLite хранится в томе
+`app-data`. Сохраните исходный `.env` вместе с резервной копией БД. Для переноса
+данных старой версии сначала выполните [миграцию](docs/MIGRATIONS.md) на копии.

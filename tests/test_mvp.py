@@ -52,6 +52,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(feed[0]["kind"], "person")
         self.assertEqual(feed[0]["name"], "Тест 1")
         self.assertNotEqual(feed[0]["latitude"], point_one["latitude"])
+        self.assertIn("distance_band", feed[0])
+        self.assertGreater(feed[0]["zone_radius_m"], 0)
+        self.assertEqual(self.third.get("/api/feed?lat=53.9060&lon=27.5680").get_json()["items"], [])
         response = self.first.post("/api/meetings", json={
             **point_one, "category": "walk", "description": "Прогуляться и поговорить", "format": "one",
         })
@@ -87,20 +90,39 @@ class MvpFlowTest(unittest.TestCase):
         room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertFalse(room["photos_revealed"])
         self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
-        self.assertIsNotNone(next(person["picture"] for person in room["participants"] if person["mine"]))
+        self.assertTrue(all(person["picture"] is None for person in room["participants"]))
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/photo-consent").status_code, 409)
+        photos = {"data:image/jpeg;base64,/9j/QQ==", "data:image/jpeg;base64,/9j/Qg=="}
+        for user, photo in zip((first_user, second_user), sorted(photos)):
+            main.db.session.add(main.ProfileMedia(user_id=user.id, real_photo=main.encrypt_selfie(photo)))
+        main.db.session.commit()
+        confirmation_path = f"/api/v2/meetings/{meeting_id}/confirm"
+        self.assertFalse(self.first.post(confirmation_path).get_json()["room"]["meeting"]["all_confirmed"])
+        self.assertTrue(self.second.post(confirmation_path).get_json()["room"]["meeting"]["all_confirmed"])
         room = self.second.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["my_photo_consent"])
         self.assertFalse(room["photos_revealed"])
         room = self.first.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["photos_revealed"])
-        self.assertEqual({person["picture"] for person in room["participants"]}, {
-            "data:image/jpeg;base64,first", "data:image/jpeg;base64,second",
+        self.assertEqual({person["picture"] for person in room["participants"]}, photos)
+        self.assertEqual(self.third.get(f"/api/meetings/{meeting_id}/room").status_code, 403)
+        headers = {"X-Operation-ID": "private-photo-replay"}
+        messages = f"/api/meetings/{meeting_id}/messages"
+        sent = self.second.post(messages, json={"text": "До встречи"}, headers=headers)
+        self.assertEqual(sent.status_code, 201)
+        saved = main.OperationRecord.query.filter_by(operation_id="private-photo-replay").one()
+        self.assertNotIn("base64", saved.response_json)
+        updated = self.first.post("/api/profile", json={
+            "name": "Тест Один", "age": 30, "gender": "male",
+            "about": "Люблю прогулки и общение с людьми.", "terms_accepted": True, "real_photo": "",
         })
-        first_selfie = main.ProfileSelfie.query.filter_by(user_id=first_user.id).one()
-        first_selfie.visibility = "hidden"
+        self.assertEqual(updated.status_code, 200)
+        replay = self.second.post(messages, json={"text": "До встречи"}, headers=headers).get_json()
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(replay["room"]["photos_revealed"])
+        self.assertIsNone(next(person["picture"] for person in replay["room"]["participants"] if not person["mine"]))
+        main.ChatMessage.query.filter_by(id=sent.get_json()["message_id"]).delete()
         main.db.session.commit()
-        room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
-        self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
         response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
         self.assertEqual(response.status_code, 201, response.get_json())
         place_id = response.get_json()["room"]["places"][0]["id"]
@@ -626,6 +648,9 @@ class MvpFlowTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 201, response.get_json())
         place = response.get_json()["room"]["places"][0]
+        self.assertIsNone(place["latitude"])
+        self.assertIsNone(place["map_url"])
+        place = self.first.post(f"/api/places/{place['id']}/vote").get_json()["room"]["places"][0]
         self.assertEqual(place["latitude"], 53.9031)
         self.assertEqual(place["longitude"], 27.5627)
         self.assertIn("openstreetmap.org", place["map_url"])
@@ -958,7 +983,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
         self.assertIn("placePickerMap=L.map('placePickerMap',{zoomControl:true});placePickerMap.attributionControl.setPrefix(false)", frontend)
         self.assertIn("Ваша активная встреча", frontend)
-        self.assertIn("item.age?item.age+' лет'", frontend)
+        self.assertIn("L.circle([item.latitude,item.longitude]", frontend)
         self.assertEqual(frontend.count("$('locateMe').onclick=locateMe"), 1)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
@@ -1041,7 +1066,7 @@ class MvpFlowTest(unittest.TestCase):
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
             backend = source.read()
-        self.assertIn('EXPECTED_SCHEMA_REVISION = "0007_runtime_guards"', backend)
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0008_safety_good_deeds"', backend)
         self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
         self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
 
@@ -1327,3 +1352,54 @@ class MvpFlowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_good_deed_moderation_roster_completion_and_trace(self):
+        from unittest.mock import patch
+
+        for client, number in ((self.first, 601), (self.second, 602), (self.third, 603)):
+            self.login(client, number)
+            self.assertEqual(client.post("/api/profile", json={
+                "name": f"Тест {number}", "age": 29, "gender": "female",
+                "about": "Помогаю в местных экологических акциях.",
+                "selfie": "data:image/jpeg;base64,/9j/QQ==", "terms_accepted": True,
+            }).status_code, 200)
+        path = "/api/v2/good-deeds"
+        payload = {
+            "title": "Уборка сквера", "direction": "environment", "description": "Собираем мусор в сквере",
+            "organizer_name": "Инициатива района", "coordinator_name": "Координатор",
+            "area": "У входа в городской сквер", "instructions": "Возьмите перчатки",
+            "starts_at": (main.utcnow() + timedelta(hours=2)).isoformat(),
+        }
+        self.assertEqual(self.first.post(path, json={**payload, "area": "У меня дома"}).status_code, 400)
+        deed = self.first.post(path, json=payload).get_json()["item"]
+        deed_id = deed["id"]
+        guest = main.app.test_client()
+        self.assertEqual(guest.get(path).get_json()["items"], [])
+        self.assertEqual(self.second.get(path).get_json()["items"], [])
+        approval = f"/api/v2/admin/good-deeds/{deed_id}/decision"
+        self.assertEqual(self.second.post(approval, json={"decision": "active"}).status_code, 403)
+        with patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-603"}):
+            self.assertEqual(self.third.post(approval, json={"decision": "active"}).status_code, 200)
+        for _ in range(2):
+            joined = self.second.post(f"{path}/{deed_id}/join", json={"joined": True})
+            self.assertEqual(joined.get_json()["item"]["participants"], 1)
+        self.assertEqual(guest.get(path).get_json()["items"][0]["roster"], [])
+        roster = self.first.get(path).get_json()["items"][0]["roster"]
+        self.assertEqual(len(roster), 1)
+        complete = f"{path}/{deed_id}/complete"
+        result = {"result_summary": "Сквер приведён в порядок", "thanks": "Спасибо за участие", "participant_ids": [roster[0]["id"]]}
+        self.assertEqual(self.first.post(complete, json=result).status_code, 409)
+        main.db.session.get(main.GoodDeed, deed_id).starts_at = main.utcnow() - timedelta(hours=2)
+        main.db.session.commit()
+        self.assertEqual(self.second.post(complete, json=result).status_code, 403)
+        self.assertEqual(self.first.post(complete, json=result).status_code, 200)
+        trace = self.second.get("/api/v2/good-trace").get_json()
+        self.assertEqual(trace["confirmed_deeds"], 1)
+        self.assertEqual(trace["hours"], 2)
+        self.assertEqual(trace["directions"], ["Экология"])
+        self.assertEqual(trace["thanks"], 1)
+        self.assertEqual(trace["appreciations"][0]["text"], "Спасибо за участие")
+        self.assertEqual(self.first.delete("/api/account", json={"confirmation": "нет"}).status_code, 400)
+        self.assertEqual(main.GoodDeed.query.count(), 1)
+        self.assertEqual(self.first.delete("/api/account", json={"confirmation": "УДАЛИТЬ"}).status_code, 200)
+        self.assertEqual(main.GoodDeed.query.count(), 0)
