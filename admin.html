@@ -19,8 +19,41 @@
 <main class="shell">
   <header class="top"><div class="brand">Сейчас · Модерация<span>Жалобы и безопасность сообщества</span></div><div id="live" class="live">Обновляем</div></header>
   <section id="metrics" class="metrics"></section>
+  <details id="launchAdmin"><summary>Разделы и пользователи</summary>
+    <p><a href="/?manage=deeds">Очередь добрых дел</a> · <a href="/?manage=tasks">Поручения и споры</a></p>
+    <form id="moduleForm" class="filters"><fieldset id="moduleChoices" disabled><legend>Новые действия</legend>
+      <label><input type="checkbox" name="meetings"> Встречи</label>
+      <label><input type="checkbox" name="good_deeds"> Добрые дела</label>
+      <label><input type="checkbox" name="tasks"> Поручения</label>
+      <label><input type="checkbox" name="notifications"> Telegram-уведомления</label>
+    </fieldset><button id="saveModules" disabled>Сохранить разделы</button></form>
+    <form id="lookupUser" class="filters"><label>Telegram ID <input name="account" inputmode="numeric" pattern="[0-9]*"></label>
+      <button>Найти аккаунт</button></form>
+    <div id="launchUsers"></div><button class="action" id="nextUsers" type="button" hidden>Ещё аккаунты</button>
+    <form id="accessForm" class="filters">
+      <label>ID аккаунта <input type="number" name="user_id" min="1" required></label>
+      <label>Доступ <select name="hours"><option value="24">Ограничить на сутки</option><option value="168">На неделю</option><option value="876000">До решения владельца</option><option value="0">Восстановить</option></select></label>
+      <label>Причина <input name="reason" minlength="3" maxlength="180" required></label><button>Изменить доступ</button>
+    </form>
+    <p id="launchStatus" role="status"></p>
+  </details>
+  <details id="organizerAdmin"><summary>Организаторы и координаторы</summary>
+    <div id="organizerList"></div>
+    <form id="organizerForm" class="filters">
+      <label>ID аккаунта <input type="number" name="user_id" min="1" required></label>
+      <label>Публичное имя <input name="name" minlength="3" maxlength="120" required></label>
+      <label>Основание проверки или отзыва <input name="reason" minlength="3" maxlength="180" required></label>
+      <label><input type="checkbox" name="active" checked> Проверка подтверждена</label><button>Сохранить организатора</button>
+    </form>
+    <form id="coordinatorForm" class="filters">
+      <label>ID организатора <input type="number" name="organizer_id" min="1" required></label>
+      <label>ID координатора <input type="number" name="user_id" min="1" required></label>
+      <label>Публичное имя координатора <input name="label" maxlength="120"></label>
+      <label><input type="checkbox" name="active" checked> Допуск согласован</label><button>Сохранить координатора</button>
+    </form><p id="organizerStatus" role="status"></p>
+  </details>
   <details id="releaseControls"><summary>Управление поручениями и показатели</summary>
-    <div id="releaseMetrics" class="metrics"></div>
+    <div id="releaseMetrics" class="metrics"></div><p>Активность по дням <output id="dailyStats"></output></p>
     <form id="taskPolicy" class="filters"><label>Лимит суммы <input name="max_budget" type="number" min="1" max="100000" required></label>
       <label>Комиссия, % <input name="fee" type="number" min="0" max="50" step="0.01" required></label>
       <label><input name="enabled" type="checkbox"> Принимать новые поручения</label>
@@ -92,12 +125,79 @@ async function loadReleaseControls(){
   const metrics={registrations:'Регистрации',active_7d:'Активность за 7 дней',meetings:'Создано встреч',
     completed_meetings:'Состоялось встреч',completed_repeat_meetings:'Повторные встречи',returning_7d:'Вернулись в течение 7 дней',responses:'Отклики',confirmed_responses:'Принятые отклики',
     completed_good_deeds:'Завершённые акции',tasks:'Создано поручений',completed_tasks:'Принято поручений'};
+  $('dailyStats').textContent=stats.daily_activity.map(item=>item.day+' · '+item.users).join(' | ');
   $('releaseMetrics').innerHTML=Object.entries(metrics).map(([key,label])=>metric(label,stats[key])).join('')
     +metric('Расчётная комиссия',stats.estimated_commission.map(item=>esc(item.amount+' '+item.currency)).join(', ')||'0')
     +metric('Фактическая выручка','0')
+    +metric('Ожидают отправки',stats.outbox.pending||0)
+    +metric('Недоставленные уведомления',stats.outbox.undelivered||0)
     +metric('Ошибки HTTP с запуска',stats.runtime_errors.http_5xx)
     +metric('Ошибки фоновых задач с запуска',stats.runtime_errors.background_errors);
 }
+const moduleKeys=['meetings','good_deeds','tasks','notifications'];
+let nextBefore=null;
+async function loadLaunchModules(){
+  const data=await api('/api/admin/launch-modules');
+  csrf=data.csrf_token;
+  for(const key of moduleKeys)$('moduleForm').elements[key].checked=data.modules[key];
+  $('moduleChoices').disabled=false;
+  $('saveModules').disabled=false;
+}
+async function loadLaunchUsers(before=null){
+  const query=new URLSearchParams(new FormData($('lookupUser')));
+  if(before)query.set('before',before);
+  const data=await api('/api/admin/users?'+query);
+  const rows=data.items.map(user=>`<p>#${user.id} · ${esc(user.name)} · ${user.restricted?'ограничен':'активен'}${user.admin?' · администратор':''}${user.organizer?' · организатор':''} <button type="button" data-access-user="${user.id}">Выбрать</button></p>`).join('');
+  if(before)$('launchUsers').insertAdjacentHTML('beforeend',rows);
+  else $('launchUsers').innerHTML=rows||'<p>Аккаунты не найдены</p>';
+  nextBefore=data.next_before;
+  $('nextUsers').hidden=!nextBefore;
+}
+$('nextUsers').onclick=()=>loadLaunchUsers(nextBefore).catch(error=>{$('launchStatus').textContent=error.message});
+$('launchUsers').onclick=event=>{
+  const id=event.target.dataset.accessUser;
+  if(!id)return;
+  $('accessForm').elements.user_id.value=id;
+  $('organizerForm').elements.user_id.value=id;
+};
+$('lookupUser').onsubmit=event=>{event.preventDefault();loadLaunchUsers().catch(error=>{$('launchStatus').textContent=error.message})};
+$('launchAdmin').addEventListener('toggle',event=>{
+  if(event.target.open)Promise.all([loadLaunchModules(),loadLaunchUsers()]).catch(error=>{$('launchStatus').textContent=error.message});
+});
+async function loadOrganizers(){
+  const data=await api('/api/admin/organizers');
+  csrf=data.csrf_token;
+  $('organizerList').innerHTML=data.items.map(row=>`<p>#${row.user_id} · ${esc(row.name)} · ${row.active?'проверен':'допуск отозван'}
+    ${row.coordinators.map(item=>`<br>Координатор #${item.user_id} · ${esc(item.label)}`).join('')}</p>`).join('')||'<p>Нет проверенных организаторов</p>';
+}
+$('organizerAdmin').addEventListener('toggle',event=>{
+  if(event.target.open)loadOrganizers().catch(error=>{$('organizerStatus').textContent=error.message});
+});
+function bindAdminForm(id,status,task){
+  $(id).onsubmit=async event=>{
+    event.preventDefault();
+    const form=event.target, button=form.querySelector('button');
+    button.disabled=true;
+    try{await task(form,Object.fromEntries(new FormData(form)));$(status).textContent='Сохранено'}
+    catch(error){$(status).textContent=error.message}
+    finally{button.disabled=false}
+  };
+}
+bindAdminForm('moduleForm','launchStatus',async form=>{
+  await api('/api/admin/launch-modules',{method:'POST',body:JSON.stringify({modules:Object.fromEntries(moduleKeys.map(key=>[key,form.elements[key].checked]))})});
+});
+bindAdminForm('accessForm','launchStatus',async (_form,body)=>{
+  await api('/api/admin/users/'+Number(body.user_id)+'/access',{method:'POST',body:JSON.stringify({hours:Number(body.hours),reason:body.reason})});
+  await loadLaunchUsers();
+});
+bindAdminForm('organizerForm','organizerStatus',async (form,body)=>{
+  await api('/api/admin/organizers',{method:'POST',body:JSON.stringify({...body,user_id:Number(body.user_id),active:form.elements.active.checked})});
+  await loadOrganizers();
+});
+bindAdminForm('coordinatorForm','organizerStatus',async (form,body)=>{
+  await api('/api/admin/organizers/'+Number(body.organizer_id)+'/coordinators',{method:'POST',body:JSON.stringify({...body,user_id:Number(body.user_id),active:form.elements.active.checked})});
+  await loadOrganizers();
+});
 $('releaseControls').addEventListener('toggle',event=>{
   if(event.target.open)Promise.all([loadReleaseControls(),loadCorporateCustomers()]).catch(error=>{$('taskPolicyStatus').textContent=error.message});
 });

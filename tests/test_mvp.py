@@ -1076,7 +1076,7 @@ class MvpFlowTest(unittest.TestCase):
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
             backend = source.read()
-        self.assertIn('EXPECTED_SCHEMA_REVISION = "0010_release_controls"', backend)
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0011_launch_readiness"', backend)
         self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
         self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
 
@@ -1370,15 +1370,22 @@ class MvpFlowTest(unittest.TestCase):
                 "about": "Помогаю в местных экологических акциях.",
                 "selfie": sample_photo(), "terms_accepted": True,
             }).status_code, 200)
+        owner_id = main.User.query.filter_by(telegram_id="test-601").one().id
+        coordinator_id = owner_id
+        main.db.session.add(main.VerifiedOrganizer(user_id=owner_id, name="Инициатива района", active=True))
+        main.db.session.flush()
+        main.db.session.add(main.OrganizerCoordinator(organizer_id=owner_id,user_id=coordinator_id,label="Координатор"))
+        main.db.session.commit()
         path = "/api/v2/good-deeds"
         payload = {
             "title": "Уборка сквера", "direction": "environment", "description": "Собираем мусор в сквере",
-            "organizer_name": "Инициатива района", "coordinator_name": "Координатор",
+            "organizer_name": "Подмена имени", "coordinator_id": coordinator_id, "public_site_confirmed": True,
             "area": "У входа в городской сквер", "instructions": "Возьмите перчатки",
             "starts_at": (main.utcnow() + timedelta(hours=2)).isoformat(),
         }
         self.assertEqual(self.first.post(path, json={**payload, "area": "У меня дома"}).status_code, 400)
         deed = self.first.post(path, json=payload).get_json()["item"]
+        self.assertEqual(deed["organizer_name"], "Инициатива района")
         deed_id = deed["id"]
         guest = main.app.test_client()
         self.assertEqual(guest.get(path).get_json()["items"], [])
@@ -1397,7 +1404,7 @@ class MvpFlowTest(unittest.TestCase):
         complete = f"{path}/{deed_id}/complete"
         result = {"result_summary": "Сквер приведён в порядок", "thanks": "Спасибо за участие", "participant_ids": [roster[0]["id"]]}
         self.assertEqual(self.first.post(complete, json=result).status_code, 409)
-        main.db.session.get(main.GoodDeed, deed_id).starts_at = main.utcnow() - timedelta(hours=2)
+        main.db.session.get(main.GoodDeed, deed_id).starts_at = main.utcnow() - timedelta(hours=3)
         main.db.session.commit()
         self.assertEqual(self.second.post(complete, json=result).status_code, 403)
         self.assertEqual(self.first.post(complete, json=result).status_code, 200)
@@ -1606,7 +1613,7 @@ class MvpFlowTest(unittest.TestCase):
             payload = {"title":"Фото витрины", "description":"Фото товара с разрешения магазина",
                        "category":"public_photo", "budget":80, "currency":"EUR", "city":"Warsaw",
                        "country":"PL", "due_at":(main.utcnow()+timedelta(hours=3)).isoformat(),
-                       "requirements":"Снять товар крупным планом"}
+                       "requirements":"Снять товар крупным планом", "public_site_confirmed":True}
             self.assertEqual(self.first.post(path,json={**payload,"city":""}).status_code, 400)
             self.assertEqual(self.first.post(path,json={**payload,"description":"Нужна слежка за человеком"}).status_code, 400)
             item = self.first.post(path,json=payload).json["item"]
@@ -1618,7 +1625,12 @@ class MvpFlowTest(unittest.TestCase):
             self.assertEqual(self.third.post(route,json={"action":"approve"},headers={"X-CSRF-Token":mod_csrf}).status_code, 200)
             self.assertEqual(len(self.second.get(path+"?city=Warsaw&country=PL").json["items"]),1)
             self.assertEqual(self.second.get(path+"?city=London&country=GB").json["items"],[])
-            self.second.post(route,json={"action":"apply"})
+            self.assertEqual(self.second.post(route,json={"action":"apply"}).status_code,409)
+            self.assertEqual(self.second.post("/api/private/task-work-area",json={"city":"warsaw","country":"PL"}).status_code,200)
+            workers=f"{path}/{item['id']}/workers"
+            self.assertEqual(self.first.get(workers).json,{"count":1})
+            self.assertEqual(self.second.get(workers).status_code,404)
+            self.assertEqual(self.second.post(route,json={"action":"apply"}).status_code,200)
             applicant = self.first.get(path).json["items"][0]["applicants"][0]["id"]
             self.first.post(route,json={"action":"assign","user_id":applicant})
             self.assertEqual(self.second.post(route,json={"action":"submit","text":"Фото готово"}).status_code, 400)
@@ -1672,6 +1684,84 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(self.third.get("/api/feed?lat=0&lon=0&radius=3").json["items"],[])
         self.assertEqual(self.third.post(f"/api/meetings/{new_id}/interest",json={}).status_code,404)
         self.assertEqual(self.second.get("/api/interests").json["incoming"][0]["meeting_id"],new_id)
+
+    def test_launch_admin_controls_apply_to_direct_api(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 941)
+        self.login(self.second, 942)
+        self.login(self.third, 943)
+        volunteer = main.app.test_client()
+        self.login(volunteer, 945)
+        owner = main.User.query.filter_by(telegram_id="test-941").one()
+        coordinator = main.User.query.filter_by(telegram_id="test-942").one()
+        owner_id, coordinator_id = owner.id, coordinator.id
+        module_path = "/api/admin/launch-modules"
+        registry = "/api/admin/organizers"
+        point = {"category":"walk","latitude":53.9,"longitude":27.5}
+        deed = {"title":"Чистый парк","description":"Убираем мусор вместе","area":"Вход в парк",
+                "instructions":"Возьмите перчатки","coordinator_id":coordinator_id,"public_site_confirmed":True,
+                "starts_at":(main.utcnow()+timedelta(hours=2)).isoformat()}
+        for client in (self.first,self.second,volunteer):
+            client.post("/api/profile",json={"name":"Тестовый участник","age":24,"gender":"female",
+                "about":"Описание тестовой анкеты участника","selfie":sample_photo(),"terms_accepted":True})
+        with patch.object(main,"ADMIN_TELEGRAM_IDS",{"test-943"}):
+            self.assertEqual(self.first.get(module_path).status_code,403)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,403)
+            headers={"X-CSRF-Token":self.third.get(module_path).json["csrf_token"]}
+            modules={key:False for key in main.DEFAULT_MODULES}
+            self.assertEqual(self.third.post(module_path,json={"modules":modules}).status_code,403)
+            self.assertEqual(self.third.post(module_path,json={"modules":modules},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,409)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,409)
+            self.assertEqual(self.first.delete("/api/presence").status_code,200)
+            self.assertFalse(self.first.get("/api/session").json["modules"]["notifications"])
+            self.third.post(module_path,json={"modules":main.DEFAULT_MODULES},headers=headers)
+            self.assertEqual(self.third.post(registry,json={"user_id":owner_id,"active":True,"name":"Парк",
+                                         "reason":"Проверенные документы"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,403)
+            self.assertEqual(self.third.post(f"{registry}/{owner_id}/coordinators",
+                json={"user_id":coordinator_id,"active":True,"label":"Координатор парка"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json={**deed,"description":"Слежка за человеком"}).status_code,400)
+            created = self.first.post("/api/v2/good-deeds",json=deed)
+            self.assertEqual(created.status_code,201)
+            deed_id=created.json["item"]["id"]
+            self.assertEqual(self.third.post(f"/api/v2/admin/good-deeds/{deed_id}/decision",
+                json={"decision":"active"},headers=headers).status_code,200)
+            self.assertTrue(main.app.test_client().get("/api/v2/good-deeds").json["items"])
+            self.assertEqual(self.third.post(f"/api/admin/users/{owner_id}/access",
+                json={"hours":24,"reason":"Проверка жалобы"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,403)
+            self.assertEqual(main.app.test_client().get("/api/v2/good-deeds").json["items"],[])
+            self.assertEqual(volunteer.post(f"/api/v2/good-deeds/{deed_id}/join",json={"joined":True}).status_code,409)
+            self.assertEqual(self.third.post(f"/api/admin/users/{owner_id}/access",
+                json={"hours":0,"reason":"Проверка завершена"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,200)
+
+    def test_launch_shared_rate_limit_and_activity_retention(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 944)
+        self.first.get("/api/session")
+        self.first.get("/api/session")
+        self.assertEqual(main.DailyActivity.query.count(),1)
+        with patch.object(main,"ALLOW_TEST_AUTH",False), patch.dict(main.PUBLIC_RATE_LIMITS,{"/api/traffic":2}):
+            body={"visitor_id":"launch-rate-limit","source":"test"}
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,200)
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,200)
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,429)
+            self.assertEqual(len(main.PublicRateBucket.query.one().key),64)
+
+    def test_launch_readiness_reports_a_stalled_worker(self):
+        from unittest.mock import patch
+
+        with patch.object(main, "IS_PRODUCTION", True), patch.object(main, "WORKER_STARTED", main.time.monotonic()-300), patch.object(main, "WORKER_PROGRESS", {}):
+            stale = self.first.get("/ready")
+            self.assertEqual(stale.status_code,503)
+            self.assertEqual(set(stale.json["stale_workers"]),{"outbox","maintenance"})
+            main.worker_progress("outbox")
+            main.worker_progress("maintenance")
+            self.assertEqual(self.first.get("/ready").status_code,200)
 
 
 if __name__ == "__main__":

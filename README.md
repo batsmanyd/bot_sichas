@@ -31,7 +31,7 @@
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
 завершает запуск, если отсутствует обязательная конфигурация, используется не
 PostgreSQL/HTTPS, включён тестовый вход или схема БД не находится на Alembic
-revision `0010_release_controls`. Временный production-ключ не генерируется.
+revision `0011_launch_readiness`. Временный production-ключ не генерируется.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
 

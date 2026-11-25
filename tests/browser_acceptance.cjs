@@ -29,8 +29,31 @@ const {chromium}=require('playwright');
   }
   try{
     const [owner, worker, admin]=await Promise.all(['991','992','993'].map(pageFor));
+    const ownerId=(await (await owner.request.get(base+'/api/session')).json()).user.id;
+    const dashboard=await admin.context().newPage();
+    dashboard.on('pageerror',error=>errors.push(error.message));
+    await dashboard.goto(base+'/admin');
+    await dashboard.locator('#organizerAdmin summary').click();
+    await dashboard.locator('#organizerForm [name=user_id]').fill(String(ownerId));
+    await dashboard.locator('#organizerForm [name=name]').fill('Организатор акции');
+    await dashboard.locator('#organizerForm [name=reason]').fill('Документы проверены');
+    await dashboard.getByRole('button',{name:'Сохранить организатора'}).click();
+    await dashboard.locator('#organizerStatus').getByText('Сохранено').waitFor();
+    await dashboard.locator('#coordinatorForm [name=organizer_id]').fill(String(ownerId));
+    await dashboard.locator('#coordinatorForm [name=user_id]').fill(String(ownerId));
+    await dashboard.locator('#coordinatorForm [name=label]').fill('Координатор акции');
+    await dashboard.getByRole('button',{name:'Сохранить координатора'}).click();
+    await dashboard.locator('#organizerList').getByText(/Координатор акции/).waitFor();
+    await dashboard.locator('#launchAdmin summary').click();
+    await dashboard.locator('#moduleForm [name=notifications]').and(dashboard.locator(':checked')).waitFor();
+    await dashboard.locator('#moduleForm [name=notifications]').uncheck();
+    await dashboard.getByRole('button',{name:'Сохранить разделы'}).click();
+    await dashboard.locator('#launchStatus').getByText('Сохранено').waitFor();
+    assert.equal((await (await owner.request.get(base+'/api/session')).json()).modules.notifications,false);
+    await dashboard.close();
+    console.log('Browser: organizer verification, coordinator authorization and global switches.');
     await tasks(owner);
-    await owner.locator('#privateTasksDialog summary').first().click();
+    await owner.locator('#privateTasksDialog details:has(#privateTaskForm) > summary').click();
     for(const [field,value] of Object.entries({title:'Проверочная редактура',description:'Безопасное дистанционное оформление текста',budget:35})){
       await owner.locator('#privateTaskForm [name='+field+']').fill(String(value));
     }
@@ -59,9 +82,10 @@ const {chromium}=require('playwright');
     await owner.locator('#newGoodDeed summary').click();
     const now=new Date(Date.now()+120*60000);
     const fields={title:'Уборка городского сквера',description:'Убираем мусор на общедоступной территории',
-      organizer_name:'Организатор акции',coordinator_name:'Координатор акции',area:'Вход в городской сквер',
+      area:'Вход в городской сквер',
       starts_at:now.toISOString().slice(0,16),instructions:'Возьмите перчатки и пакеты'};
     for(const [field,value] of Object.entries(fields))await owner.locator('#goodDeedForm [name='+field+']').fill(value);
+    await owner.locator('#goodDeedForm [name=public_site_confirmed]').check();
     await owner.getByRole('button',{name:'Отправить на проверку'}).click();
     await owner.getByText('На проверке',{exact:true}).waitFor();
     await deeds(admin);
@@ -80,6 +104,24 @@ const {chromium}=require('playwright');
     await owner.getByText('Завершена',{exact:true}).waitFor();
     await deeds(worker,true);
     await worker.getByText('Спасибо за помощь',{exact:false}).waitFor();
+    await owner.locator('#closeGoodDeeds').click();
+    await worker.locator('#closeGoodDeeds').click();
+    await owner.locator('#createBtn').click();
+    const meetingCreated=owner.waitForResponse(r=>r.url().endsWith('/api/meetings')&&r.request().method()==='POST');
+    await owner.locator('#saveMeeting').click();
+    assert.equal((await meetingCreated).status(),201);
+    await worker.locator('#requestNearbyLocation').click();
+    await worker.getByRole('button',{name:'Мне интересно',exact:true}).click();
+    await owner.locator('nav [data-page=chats]').click();
+    await owner.getByRole('button',{name:'Принять',exact:true}).click();
+    await owner.getByRole('button',{name:'Открыть встречу',exact:true}).click();
+    await owner.locator('#messageInput').fill('Увидимся в кафе');
+    await owner.locator('#sendMessage').click();
+    await owner.locator('#roomMessages').getByText('Увидимся в кафе').waitFor();
+    await worker.locator('nav [data-page=chats]').click();
+    await worker.getByRole('button',{name:'Открыть встречу',exact:true}).click();
+    await worker.locator('#roomMessages').getByText('Увидимся в кафе').waitFor();
+    console.log('Browser: geolocation, meeting creation, application, acceptance and synchronized room.');
     const publicContext=await browser.newContext({viewport:{width:1280,height:800}});
     const publicPage=await publicContext.newPage();
     publicPage.on('pageerror',error=>errors.push(error.message));

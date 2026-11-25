@@ -23,7 +23,7 @@ with main.app.app_context():
 def advance_good_deed():
     if not main.admin_user():
         return {"ok":False},403
-    main.GoodDeed.query.update({"starts_at":main.utcnow()-timedelta(minutes=1)})
+    main.GoodDeed.query.update({"starts_at":main.utcnow()-timedelta(hours=3)})
     main.db.session.commit()
     return {"ok":True}
 

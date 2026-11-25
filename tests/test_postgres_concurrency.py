@@ -149,3 +149,16 @@ class PostgresConcurrencyTest(unittest.TestCase):
         ])
         self.assertEqual([response.status_code for response in responses], [200, 200])
         self.assertEqual(sum(bool(response.get_json().get("replayed")) for response in responses), 1)
+
+    def test_launch_rate_limit_is_atomic_across_requests(self):
+        from unittest.mock import patch
+
+        clients = [main.app.test_client() for _ in range(8)]
+        with patch.object(main, "ALLOW_TEST_AUTH", False), patch.dict(main.PUBLIC_RATE_LIMITS, {"/api/traffic": 2}):
+            replies = self.concurrent_post([
+                lambda client=client, index=index: client.post(
+                    "/api/traffic", json={"visitor_id": f"concurrent-launch-{index}", "source": "test"})
+                for index, client in enumerate(clients)
+            ])
+        self.assertEqual(sorted(reply.status_code for reply in replies), [200, 200] + [429] * 6)
+        self.assertEqual(main.PublicRateBucket.query.one().count, 8)
