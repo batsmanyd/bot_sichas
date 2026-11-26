@@ -1,12 +1,25 @@
 import hashlib
 import hmac
 import json
+import os
+import subprocess
+import sys
 import time
 import unittest
 from datetime import timedelta
 from urllib.parse import urlencode
 
 import main
+
+
+def sample_photo():
+    import base64
+    from io import BytesIO
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
 class MvpFlowTest(unittest.TestCase):
@@ -49,6 +62,9 @@ class MvpFlowTest(unittest.TestCase):
         self.assertEqual(feed[0]["kind"], "person")
         self.assertEqual(feed[0]["name"], "Тест 1")
         self.assertNotEqual(feed[0]["latitude"], point_one["latitude"])
+        self.assertIn("distance_band", feed[0])
+        self.assertGreater(feed[0]["zone_radius_m"], 0)
+        self.assertEqual(self.third.get("/api/feed?lat=53.9060&lon=27.5680").get_json()["items"], [])
         response = self.first.post("/api/meetings", json={
             **point_one, "category": "walk", "description": "Прогуляться и поговорить", "format": "one",
         })
@@ -84,20 +100,39 @@ class MvpFlowTest(unittest.TestCase):
         room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
         self.assertFalse(room["photos_revealed"])
         self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
-        self.assertIsNotNone(next(person["picture"] for person in room["participants"] if person["mine"]))
+        self.assertTrue(all(person["picture"] is None for person in room["participants"]))
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/photo-consent").status_code, 409)
+        photos = {"data:image/jpeg;base64,/9j/QQ==", "data:image/jpeg;base64,/9j/Qg=="}
+        for user, photo in zip((first_user, second_user), sorted(photos)):
+            main.db.session.add(main.ProfileMedia(user_id=user.id, real_photo=main.encrypt_selfie(photo)))
+        main.db.session.commit()
+        confirmation_path = f"/api/v2/meetings/{meeting_id}/confirm"
+        self.assertFalse(self.first.post(confirmation_path).get_json()["room"]["meeting"]["all_confirmed"])
+        self.assertTrue(self.second.post(confirmation_path).get_json()["room"]["meeting"]["all_confirmed"])
         room = self.second.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["my_photo_consent"])
         self.assertFalse(room["photos_revealed"])
         room = self.first.post(f"/api/meetings/{meeting_id}/photo-consent").get_json()["room"]
         self.assertTrue(room["photos_revealed"])
-        self.assertEqual({person["picture"] for person in room["participants"]}, {
-            "data:image/jpeg;base64,first", "data:image/jpeg;base64,second",
+        self.assertEqual({person["picture"] for person in room["participants"]}, photos)
+        self.assertEqual(self.third.get(f"/api/meetings/{meeting_id}/room").status_code, 403)
+        headers = {"X-Operation-ID": "private-photo-replay"}
+        messages = f"/api/meetings/{meeting_id}/messages"
+        sent = self.second.post(messages, json={"text": "До встречи"}, headers=headers)
+        self.assertEqual(sent.status_code, 201)
+        saved = main.OperationRecord.query.filter_by(operation_id="private-photo-replay").one()
+        self.assertNotIn("base64", saved.response_json)
+        updated = self.first.post("/api/profile", json={
+            "name": "Тест Один", "age": 30, "gender": "male",
+            "about": "Люблю прогулки и общение с людьми.", "terms_accepted": True, "real_photo": "",
         })
-        first_selfie = main.ProfileSelfie.query.filter_by(user_id=first_user.id).one()
-        first_selfie.visibility = "hidden"
+        self.assertEqual(updated.status_code, 200)
+        replay = self.second.post(messages, json={"text": "До встречи"}, headers=headers).get_json()
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(replay["room"]["photos_revealed"])
+        self.assertIsNone(next(person["picture"] for person in replay["room"]["participants"] if not person["mine"]))
+        main.ChatMessage.query.filter_by(id=sent.get_json()["message_id"]).delete()
         main.db.session.commit()
-        room = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()
-        self.assertIsNone(next(person["picture"] for person in room["participants"] if not person["mine"]))
         response = self.second.post(f"/api/meetings/{meeting_id}/places", json={"title": "Кафе у парка"})
         self.assertEqual(response.status_code, 201, response.get_json())
         place_id = response.get_json()["room"]["places"][0]["id"]
@@ -315,7 +350,9 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.get("/api/version")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["version"], main.APP_VERSION)
-        page = self.first.get("/").get_data(as_text=True)
+        page_response = self.first.get("/")
+        page = page_response.get_data(as_text=True)
+        page_response.close()
         self.assertIn(f"Версия <span id=\"appVersion\">{main.APP_VERSION}</span>", page)
 
     def test_confirmed_one_to_one_meeting_disappears_from_public_feed(self):
@@ -402,15 +439,15 @@ class MvpFlowTest(unittest.TestCase):
         self.assertFalse(self.first.get("/api/session").get_json()["profile_completed"])
         self.assertEqual(self.first.post("/api/profile", json={
             "name": "Ю", "age": 17, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": True,
+            "selfie": sample_photo(), "selfie_visibility": "mutual", "terms_accepted": True,
         }).status_code, 400)
         self.assertEqual(self.first.post("/api/profile", json={
             "name": "Юрий", "age": 51, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "mutual", "terms_accepted": False,
+            "selfie": sample_photo(), "selfie_visibility": "mutual", "terms_accepted": False,
         }).status_code, 400)
         response = self.first.post("/api/profile", json={
             "name": "Юрий", "age": 85, "gender": "male", "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,test", "selfie_visibility": "hidden", "terms_accepted": True,
+            "selfie": sample_photo(), "selfie_visibility": "hidden", "terms_accepted": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["profile"]["city"], "Минск")
@@ -419,7 +456,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertNotIn("base64,test", stored_selfie.image)
         self.assertTrue(self.first.get("/api/session").get_json()["profile_completed"])
         profile = self.first.get("/api/profile").get_json()["profile"]
-        self.assertEqual(profile["selfie_preview"], "data:image/jpeg;base64,test")
+        self.assertEqual(profile["selfie_preview"], main.sanitized_photo(sample_photo()))
         self.assertEqual(profile["name"], "Юрий")
         self.assertEqual(profile["age"], 85)
         self.assertEqual(profile["gender"], "male")
@@ -431,7 +468,7 @@ class MvpFlowTest(unittest.TestCase):
         response = self.first.post("/api/profile", json={
             "name": "Юрий", "age": 51, "gender": "male",
             "about": "Я люблю живое общение и прогулки.",
-            "selfie": "data:image/jpeg;base64,delete-me",
+            "selfie": sample_photo(),
             "selfie_visibility": "mutual", "terms_accepted": True,
         })
         self.assertEqual(response.status_code, 200, response.get_json())
@@ -621,6 +658,9 @@ class MvpFlowTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 201, response.get_json())
         place = response.get_json()["room"]["places"][0]
+        self.assertIsNone(place["latitude"])
+        self.assertIsNone(place["map_url"])
+        place = self.first.post(f"/api/places/{place['id']}/vote").get_json()["room"]["places"][0]
         self.assertEqual(place["latitude"], 53.9031)
         self.assertEqual(place["longitude"], 27.5627)
         self.assertIn("openstreetmap.org", place["map_url"])
@@ -917,7 +957,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("await loadInterests(true)", frontend)
         self.assertNotIn("Версия приложения", frontend)
         self.assertNotIn("Имитировать реальную встречу", frontend)
-        self.assertIn('id="cityLabel" class="city">Минск</div>', frontend)
+        self.assertIn('id="cityLabel" class="city">Рядом</div>', frontend)
         self.assertIn("Участник не пришёл", frontend)
         self.assertIn("Оспорить неявку", frontend)
         self.assertIn("Сказать спасибо", frontend)
@@ -931,7 +971,10 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("group.items.some(x=>x.my_completion_confirmed)", frontend)
         self.assertIn("$('messageComposer').style.display=archived?'none':'flex'", frontend)
         self.assertIn("function rateMeeting(rating)", frontend)
-        self.assertIn("demoRoom.meeting.needs_feedback=true", frontend)
+        self.assertIn("if(saved)$('messageInput').value=''", frontend)
+        self.assertIn("Не сохранено — текст оставлен для повтора", frontend)
+        self.assertIn("$('sendMessage').disabled=true", frontend)
+        self.assertIn("meeting.needs_feedback", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
@@ -946,14 +989,860 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("mapMeetings.filter(item=>!item.mine)", frontend)
         self.assertIn("agreedPlaces.map", frontend)
         self.assertIn("Место согласовано ✓", frontend)
-        self.assertIn("&time=now`);mapMeetings=data.items", frontend)
+        self.assertIn("feedQuery(currentLocation,{time:'now'})", frontend)
         self.assertIn("fallback=currentLocation||{latitude:53.9023,longitude:27.5619}", frontend)
         self.assertIn("placePickerMap=L.map('placePickerMap',{zoomControl:true});placePickerMap.attributionControl.setPrefix(false)", frontend)
         self.assertIn("Ваша активная встреча", frontend)
-        self.assertIn("item.age?item.age+' лет'", frontend)
+        self.assertIn("L.circle([item.latitude,item.longitude]", frontend)
         self.assertEqual(frontend.count("$('locateMe').onclick=locateMe"), 1)
         with open("main.py", encoding="utf-8") as source:
             self.assertNotIn('"scope": "openid profile phone"', source.read())
+
+    def test_private_repository_files_are_not_public(self):
+        for path in (
+            "/main.py", "/.git/config", "/tests/test_mvp.py", "/sichas.db",
+            "/static/../main.py", "/%2e%2e/main.py", "/demo", "/scripts/local_demo.py",
+            "/demo-anna.svg", "/demo-user.svg",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.first.get(path).status_code, 404)
+        manifest_response = self.first.get("/manifest.webmanifest")
+        self.assertEqual(manifest_response.status_code, 200)
+        manifest_response.close()
+
+    def test_production_configuration_fails_fast_without_secrets(self):
+        environment = os.environ.copy()
+        for name in (
+            "SECRET_KEY", "SELFIE_ENCRYPTION_KEY", "DATABASE_URL", "PUBLIC_URL",
+            "TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "RAILWAY_ENVIRONMENT",
+        ):
+            environment.pop(name, None)
+        environment["APP_ENV"] = "production"
+        process = subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("Missing required production configuration", process.stderr)
+        self.assertNotIn("audit-local-only-not-production", process.stderr)
+
+    def test_production_rejects_test_auth_and_invalid_admin_configuration(self):
+        base_environment = os.environ.copy()
+        base_environment.update({
+            "APP_ENV": "production",
+            "SECRET_KEY": "local-validation-session-key-not-production",
+            "SELFIE_ENCRYPTION_KEY": "local-validation-selfie-key-not-production",
+            "DATABASE_URL": "postgresql://invalid:invalid@127.0.0.1:1/never-connected",
+            "PUBLIC_URL": "https://staging.invalid",
+            "TELEGRAM_BOT_TOKEN": "local-validation-token-not-production",
+            "ADMIN_TELEGRAM_IDS": "123456789",
+            "ALEMBIC_RUNNING": "1",
+        })
+        cases = (
+            ({"ALLOW_TEST_AUTH": "true"}, "ALLOW_TEST_AUTH must be false"),
+            ({"ALLOW_TEST_AUTH": "false", "PUBLIC_URL": "http://staging.invalid"}, "absolute HTTPS URL"),
+            ({"ALLOW_TEST_AUTH": "false", "ADMIN_TELEGRAM_IDS": "admin-name"}, "positive numeric Telegram IDs"),
+            ({"ALLOW_TEST_AUTH": "false", "DATABASE_URL": "sqlite:///unsafe-production.db"}, "must use PostgreSQL"),
+        )
+        for updates, expected in cases:
+            with self.subTest(expected=expected):
+                environment = {**base_environment, **updates}
+                process = subprocess.run(
+                    [sys.executable, "-c", "import main"],
+                    cwd=os.path.dirname(os.path.dirname(__file__)),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn(expected, process.stderr)
+                self.assertNotIn(environment["SECRET_KEY"], process.stderr)
+
+    def test_request_id_is_validated_and_returned(self):
+        supplied = "audit-request-1234"
+        response = self.first.get("/health", headers={"X-Request-ID": supplied})
+        self.assertEqual(response.headers["X-Request-ID"], supplied)
+        generated = self.first.get("/health", headers={"X-Request-ID": "bad value"}).headers["X-Request-ID"]
+        self.assertRegex(generated, r"^[0-9a-f]{32}$")
+        with open("main.py", encoding="utf-8") as source:
+            backend = source.read()
+        self.assertNotIn('app.logger.warning("Reverse geocoding failed for %s"', backend)
+        self.assertNotIn('app.logger.warning("Telegram notification failed for user %s"', backend)
+
+    def test_production_startup_uses_alembic_revision_guard(self):
+        with open("main.py", encoding="utf-8") as source:
+            backend = source.read()
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0012_task_alerts"', backend)
+        self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
+        self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
+
+    def test_sync_revisions_are_durable_and_cover_presence_and_meeting(self):
+        self.login(self.first, 301)
+        user = main.User.query.filter_by(telegram_id="test-301").one()
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        before = self.first.get("/api/sync-state").get_json()
+        self.first.post("/api/presence", json={**point, "category": "cafe"})
+        after_presence = self.first.get("/api/sync-state").get_json()
+        self.assertGreater(after_presence["feed"], before["feed"])
+        self.assertGreater(after_presence["user"], before["user"])
+        self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Аудит ревизий", "format": "one",
+        })
+        after_meeting = self.first.get("/api/sync-state").get_json()
+        self.assertGreater(after_meeting["feed"], after_presence["feed"])
+        stored = main.SyncRevision.query.filter_by(key=f"user:{user.id}").one().revision
+        main.REALTIME_REVISIONS.clear()
+        main.REALTIME_EVENTS.clear()
+        self.assertEqual(self.first.get("/api/sync-state").get_json()["user"], stored)
+
+    def test_two_user_room_revisions_cover_chat_place_vote_and_reschedule(self):
+        self.login(self.first, 340)
+        self.login(self.second, 341)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        baseline = self.first.get("/api/sync-state").get_json()["feed"]
+        self.first.post("/api/location", json=point)
+        after_location = self.first.get("/api/sync-state").get_json()["feed"]
+        self.assertGreater(after_location, baseline)
+        self.first.post("/api/presence", json={**point, "category": "cafe"})
+        after_presence = self.first.get("/api/sync-state").get_json()["feed"]
+        self.assertGreater(after_presence, after_location)
+        self.first.delete("/api/presence")
+        self.assertGreater(self.first.get("/api/sync-state").get_json()["feed"], after_presence)
+
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "walk", "description": "Полная синхронизация", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+
+        def room_revision(client):
+            return client.get(f"/api/sync-state?room_id={meeting_id}").get_json()["room"]
+
+        revision = room_revision(self.second)
+        self.first.post(f"/api/meetings/{meeting_id}/messages", json={"text": "Проверка синхронизации"})
+        self.assertGreater(room_revision(self.second), revision)
+        revision = room_revision(self.second)
+        place_response = self.first.post(f"/api/meetings/{meeting_id}/places", json={"title": "Парк"})
+        place_id = place_response.get_json()["room"]["places"][0]["id"]
+        self.assertGreater(room_revision(self.second), revision)
+        revision = room_revision(self.first)
+        self.second.post(f"/api/places/{place_id}/vote", json={})
+        self.assertGreater(room_revision(self.first), revision)
+        revision = room_revision(self.second)
+        moved_to = (main.utcnow() + timedelta(hours=1)).isoformat()
+        self.first.post(f"/api/meetings/{meeting_id}/lifecycle", json={
+            "action": "reschedule", "starts_at": moved_to,
+        })
+        self.assertGreater(room_revision(self.second), revision)
+
+    def test_user_cannot_have_two_active_confirmed_meetings(self):
+        self.login(self.first, 302)
+        self.login(self.second, 303)
+        self.login(self.third, 304)
+        point = {"latitude": 53.9023, "longitude": 27.5619,
+                 "category": "cafe", "description": "Одна активная встреча", "format": "one"}
+        first_meeting = self.first.post("/api/meetings", json=point).get_json()["id"]
+        second_meeting = self.second.post("/api/meetings", json=point).get_json()["id"]
+        self.third.post(f"/api/meetings/{first_meeting}/interest", json={})
+        self.third.post(f"/api/meetings/{second_meeting}/interest", json={})
+        first_interest = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        second_interest = self.second.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.assertEqual(self.first.post(
+            f"/api/interests/{first_interest}/decision", json={"decision": "accepted"}
+        ).status_code, 200)
+        conflict = self.second.post(
+            f"/api/interests/{second_interest}/decision", json={"decision": "accepted"}
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.get_json()["code"], "ACTIVE_MEETING_CONFLICT")
+
+    def test_operation_id_replays_meeting_and_message(self):
+        self.login(self.first, 305)
+        operation_id = "meeting-operation-305"
+        payload = {"latitude": 53.9023, "longitude": 27.5619,
+                   "category": "cafe", "description": "Идемпотентная встреча", "format": "one"}
+        headers = {"X-Operation-ID": operation_id}
+        created = self.first.post("/api/meetings", json=payload, headers=headers)
+        replayed = self.first.post("/api/meetings", json=payload, headers=headers)
+        self.assertEqual((created.status_code, replayed.status_code), (201, 201))
+        self.assertEqual(created.get_json()["id"], replayed.get_json()["id"])
+        self.assertTrue(replayed.get_json()["replayed"])
+        self.assertEqual(main.Meeting.query.count(), 1)
+
+    def test_notifications_respect_read_at(self):
+        self.login(self.first, 306)
+        user = main.User.query.filter_by(telegram_id="test-306").one()
+        main.db.session.add(main.UserNotification(
+            user_id=user.id, kind="moderation_warning", text="Тестовое предупреждение",
+            dedupe_key="warning:306",
+        ))
+        main.db.session.commit()
+        before = self.first.get("/api/notifications").get_json()
+        self.assertEqual(before["unread"], 1)
+        self.assertFalse(before["items"][0]["read"])
+        self.first.post("/api/notifications/read", json={})
+        after = self.first.get("/api/notifications").get_json()
+        self.assertEqual(after["unread"], 0)
+        self.assertTrue(after["items"][0]["read"])
+
+    def test_room_returns_latest_one_hundred_messages(self):
+        self.login(self.first, 307)
+        self.login(self.second, 308)
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        meeting_id = self.first.post("/api/meetings", json={
+            **point, "category": "talk", "description": "Последние сообщения", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        first_user = main.User.query.filter_by(telegram_id="test-307").one()
+        for number in range(120):
+            main.db.session.add(main.ChatMessage(
+                meeting_id=meeting_id, user_id=first_user.id, text=f"Сообщение {number + 1}"
+            ))
+        main.db.session.commit()
+        messages = self.second.get(f"/api/meetings/{meeting_id}/room").get_json()["messages"]
+        self.assertEqual(len(messages), 100)
+        self.assertEqual(messages[0]["text"], "Сообщение 21")
+        self.assertEqual(messages[-1]["text"], "Сообщение 120")
+
+    def test_admin_report_outbox_and_audit(self):
+        original_admins, original_api = main.ADMIN_TELEGRAM_IDS, main.telegram_api
+        main.ADMIN_TELEGRAM_IDS = {"test-999"}
+        sent = []
+        main.telegram_api = lambda method, payload: sent.append((method, payload)) or {"ok": True}
+        try:
+            self.login(self.first, 309)
+            self.login(self.second, 310)
+            point = {"latitude": 53.9023, "longitude": 27.5619}
+            meeting_id = self.first.post("/api/meetings", json={
+                **point, "category": "walk", "description": "Жалоба для админки", "format": "one",
+            }).get_json()["id"]
+            self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+            interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+            self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+            target = main.User.query.filter_by(telegram_id="test-310").one()
+            reported = self.first.post(f"/api/meetings/{meeting_id}/report", json={
+                "target_user_id": target.id, "category": "safety", "reason": "Нарушил правила безопасности",
+            })
+            self.assertEqual(reported.status_code, 200, reported.get_json())
+            report_id = reported.get_json()["report_id"]
+            self.assertEqual(main.NotificationOutbox.query.count(), 1)
+            main.process_notification_outbox()
+            main.process_notification_outbox()
+            self.assertEqual(len(sent), 1)
+            self.assertIn(f"Новая жалоба #{report_id}", sent[0][1]["text"])
+            serialized_notification = json.dumps(sent[0][1], ensure_ascii=False)
+            self.assertNotIn("53.9023", serialized_notification)
+            self.assertNotIn("Нарушил правила безопасности", serialized_notification)
+            self.assertNotIn("test-309", serialized_notification)
+            self.assertNotIn("test-310", serialized_notification)
+            self.assertNotIn("selfie", serialized_notification.lower())
+            self.assertNotIn("token", serialized_notification.lower())
+
+            self.login(self.third, 999)
+            dashboard = self.third.get("/api/admin/dashboard")
+            self.assertEqual(dashboard.status_code, 200)
+            csrf = dashboard.get_json()["csrf_token"]
+            reports = self.third.get("/api/admin/reports").get_json()["items"]
+            self.assertEqual(reports[0]["reporter"][:2], "u_")
+            self.assertNotIn("picture", reports[0])
+            decided = self.third.post(
+                f"/api/admin/reports/{report_id}/action",
+                json={"action": "confirm", "reason": "Подтверждено модератором"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(decided.status_code, 200, decided.get_json())
+            self.assertEqual(main.db.session.get(main.UserReport, report_id).status, "confirmed")
+            self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 1)
+            blocked = self.third.post(
+                f"/api/admin/reports/{report_id}/action",
+                json={"action": "block", "reason": "Подтверждённая угроза безопасности"},
+                headers={"X-CSRF-Token": csrf},
+            )
+            self.assertEqual(blocked.status_code, 200, blocked.get_json())
+            self.assertEqual(self.third.get("/api/admin/dashboard").get_json()["counts"]["blocked"], 1)
+            blocked_reports = self.third.get("/api/admin/reports?status=blocked").get_json()["items"]
+            self.assertEqual([item["id"] for item in blocked_reports], [report_id])
+            direct = self.third.get(f"/api/admin/reports/{report_id}")
+            self.assertEqual(direct.status_code, 200)
+            self.assertEqual(direct.get_json()["report"]["id"], report_id)
+            self.assertEqual(main.ModerationAction.query.filter_by(report_id=report_id).count(), 2)
+            with open("admin.html", encoding="utf-8") as source:
+                admin_frontend = source.read()
+            self.assertIn("requestedReportId", admin_frontend)
+            self.assertIn("Заблокированные", admin_frontend)
+        finally:
+            main.ADMIN_TELEGRAM_IDS, main.telegram_api = original_admins, original_api
+
+    def test_admin_access_and_csrf_are_server_enforced(self):
+        self.login(self.first, 311)
+        self.assertEqual(self.first.get("/admin").status_code, 403)
+        self.assertEqual(self.first.get("/api/admin/dashboard").status_code, 403)
+
+    def test_regular_bot_text_gets_one_neutral_reply_and_no_outbox(self):
+        original_token, original_api = main.BOT_TOKEN, main.telegram_api
+        main.BOT_TOKEN = "123456:test-token"
+        sent = []
+        main.telegram_api = lambda method, payload: sent.append((method, payload)) or {"ok": True}
+        try:
+            response = self.first.post("/telegram/webhook", json={"message": {
+                "chat": {"id": 401}, "from": {"id": 401, "first_name": "Тест"},
+                "text": "Обычное сообщение",
+            }}, headers={"X-Telegram-Bot-Api-Secret-Token": main.TELEGRAM_WEBHOOK_SECRET})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("Бот не принимает сообщения", sent[0][1]["text"])
+            self.assertEqual(main.NotificationOutbox.query.count(), 0)
+        finally:
+            main.BOT_TOKEN, main.telegram_api = original_token, original_api
+
+    def test_third_independent_report_triggers_exactly_once(self):
+        owner = self.first
+        reporters = [self.second, self.third, main.app.test_client()]
+        self.login(owner, 320)
+        for client, number in zip(reporters, (321, 322, 323)):
+            self.login(client, number)
+        meeting_id = owner.post("/api/meetings", json={
+            "latitude": 53.9023, "longitude": 27.5619, "category": "talk",
+            "description": "Групповая модерация", "format": "group",
+        }).get_json()["id"]
+        for client in reporters:
+            client.post(f"/api/meetings/{meeting_id}/interest", json={})
+        for item in owner.get("/api/interests").get_json()["incoming"]:
+            owner.post(f"/api/interests/{item['id']}/decision", json={"decision": "accepted"})
+        target = main.User.query.filter_by(telegram_id="test-320").one()
+        for index, client in enumerate(reporters, start=1):
+            response = client.post(f"/api/meetings/{meeting_id}/report", json={
+                "target_user_id": target.id,
+                "category": "safety",
+                "reason": f"Независимая жалоба номер {index}",
+            })
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["report_count"], index)
+            if index == 1:
+                first_reporter = main.User.query.filter_by(telegram_id="test-321").one()
+                main.db.session.add(main.UserReport(
+                    meeting_id=meeting_id,
+                    reporter_id=first_reporter.id,
+                    target_id=target.id,
+                    category="safety",
+                    reason="Повтор того же независимого заявителя",
+                ))
+                main.db.session.commit()
+                self.assertEqual(main.independent_report_count(target.id), 1)
+            if index < 3:
+                self.assertIsNone(main.UserModeration.query.filter_by(user_id=target.id).first())
+        moderation = main.UserModeration.query.filter_by(user_id=target.id).one()
+        self.assertGreater(main.normalize_dt(moderation.hidden_until), main.utcnow())
+        self.assertEqual(main.UserReport.query.filter_by(target_id=target.id, auto_hidden=1).count(), 1)
+        self.assertEqual(main.independent_report_count(target.id), 3)
+
+    def test_room_chat_never_creates_admin_outbox(self):
+        self.login(self.first, 330)
+        self.login(self.second, 331)
+        meeting_id = self.first.post("/api/meetings", json={
+            "latitude": 53.9023, "longitude": 27.5619, "category": "talk",
+            "description": "Чат без Telegram", "format": "one",
+        }).get_json()["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest", json={})
+        interest_id = self.first.get("/api/interests").get_json()["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{interest_id}/decision", json={"decision": "accepted"})
+        response = self.second.post(
+            f"/api/meetings/{meeting_id}/messages", json={"text": "Обычный room-chat"}
+        )
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertEqual(main.NotificationOutbox.query.count(), 0)
+
+
+    def test_good_deed_moderation_roster_completion_and_trace(self):
+        from unittest.mock import patch
+
+        for client, number in ((self.first, 601), (self.second, 602), (self.third, 603)):
+            self.login(client, number)
+            self.assertEqual(client.post("/api/profile", json={
+                "name": f"Тест {number}", "age": 29, "gender": "female",
+                "about": "Помогаю в местных экологических акциях.",
+                "selfie": sample_photo(), "terms_accepted": True,
+            }).status_code, 200)
+        owner_id = main.User.query.filter_by(telegram_id="test-601").one().id
+        coordinator_id = owner_id
+        main.db.session.add(main.VerifiedOrganizer(user_id=owner_id, name="Инициатива района", active=True))
+        main.db.session.flush()
+        main.db.session.add(main.OrganizerCoordinator(organizer_id=owner_id,user_id=coordinator_id,label="Координатор"))
+        main.db.session.commit()
+        path = "/api/v2/good-deeds"
+        payload = {
+            "title": "Уборка сквера", "direction": "environment", "description": "Собираем мусор в сквере",
+            "organizer_name": "Подмена имени", "coordinator_id": coordinator_id, "public_site_confirmed": True,
+            "area": "У входа в городской сквер", "instructions": "Возьмите перчатки",
+            "starts_at": (main.utcnow() + timedelta(hours=2)).isoformat(),
+        }
+        self.assertEqual(self.first.post(path, json={**payload, "area": "У меня дома"}).status_code, 400)
+        deed = self.first.post(path, json=payload).get_json()["item"]
+        self.assertEqual(deed["organizer_name"], "Инициатива района")
+        deed_id = deed["id"]
+        guest = main.app.test_client()
+        self.assertEqual(guest.get(path).get_json()["items"], [])
+        self.assertEqual(self.second.get(path).get_json()["items"], [])
+        approval = f"/api/v2/admin/good-deeds/{deed_id}/decision"
+        self.assertEqual(self.second.post(approval, json={"decision": "active"}).status_code, 403)
+        with patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-603"}):
+            csrf = self.third.get(path).json["csrf_token"]
+            self.assertEqual(self.third.post(approval, json={"decision": "active"}, headers={"X-CSRF-Token": csrf}).status_code, 200)
+        for _ in range(2):
+            joined = self.second.post(f"{path}/{deed_id}/join", json={"joined": True})
+            self.assertEqual(joined.get_json()["item"]["participants"], 1)
+        self.assertEqual(guest.get(path).get_json()["items"][0]["roster"], [])
+        roster = self.first.get(path).get_json()["items"][0]["roster"]
+        self.assertEqual(len(roster), 1)
+        complete = f"{path}/{deed_id}/complete"
+        result = {"result_summary": "Сквер приведён в порядок", "thanks": "Спасибо за участие", "participant_ids": [roster[0]["id"]]}
+        self.assertEqual(self.first.post(complete, json=result).status_code, 409)
+        main.db.session.get(main.GoodDeed, deed_id).starts_at = main.utcnow() - timedelta(hours=3)
+        main.db.session.commit()
+        self.assertEqual(self.second.post(complete, json=result).status_code, 403)
+        self.assertEqual(self.first.post(complete, json=result).status_code, 200)
+        trace = self.second.get("/api/v2/good-trace").get_json()
+        self.assertEqual(trace["confirmed_deeds"], 1)
+        self.assertEqual(trace["hours"], 2)
+        self.assertEqual(trace["directions"], ["Экология"])
+        self.assertEqual(trace["thanks"], 1)
+        self.assertEqual(trace["appreciations"][0]["text"], "Спасибо за участие")
+        self.assertEqual(self.first.delete("/api/account", json={"confirmation": "нет"}).status_code, 400)
+        self.assertEqual(main.GoodDeed.query.count(), 1)
+        self.assertEqual(self.first.delete("/api/account", json={"confirmation": "УДАЛИТЬ"}).status_code, 200)
+        self.assertEqual(main.GoodDeed.query.count(), 0)
+
+    def test_0181_today_schedule_respects_minsk_midnight(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        self.login(self.first, 701)
+        self.login(self.second, 702)
+        endpoint = "/api/meetings"
+        data = {"latitude": 53.9023, "longitude": 27.5619, "category": "cafe",
+                "description": "Кофе вечером", "time_mode": "today"}
+        with patch.object(main, "utcnow", return_value=datetime(2026, 11, 25, 18, tzinfo=timezone.utc)):
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": 179}).status_code, 201)
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": 180}).status_code, 400)
+            self.assertEqual(self.first.post(endpoint, json={**data, "starts_in_minutes": -1}).status_code, 400)
+            feed = "/api/feed?lat=53.9023&lon=27.5619&radius=3&category=cafe"
+            self.assertEqual(self.second.get(feed + "&time=hour").json["items"], [])
+            self.assertEqual(self.second.get(feed + "&time=today").json["items"][0]["time_mode"], "today")
+
+    def test_0181_pwa_referral_shares_telegram_token_and_claims_once(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        self.login(self.first, 711)
+        self.login(self.second, 712)
+        self.login(self.third, 713)
+        invitation = self.first.post("/api/invitations", json={}).json
+        token = parse_qs(urlsplit(invitation["pwa_url"]).query)["invite"][0]
+        self.assertTrue(invitation["telegram_url"].endswith(f"invite_{token}"))
+        path = "/api/invitations/claim"
+        self.assertEqual(main.app.test_client().post(path, json={"token": token}).status_code, 401)
+        self.assertFalse(self.first.post(path, json={"token": token}).json["claimed"])
+        self.assertTrue(self.second.post(path, json={"token": token}).json["claimed"])
+        self.assertFalse(self.third.post(path, json={"token": token}).json["claimed"])
+        self.assertEqual(self.first.get("/api/invitations").json["available"], 2)
+
+    def test_0181_company_watch_and_opt_in_telegram_delivery(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 721)
+        self.login(self.second, 722)
+        user = main.User.query.filter_by(telegram_id="test-721").one()
+        user_id = user.id
+        user.telegram_id = "721"
+        main.db.session.add(main.UserProfile(user_id=user_id, age=29, gender="female"))
+        main.db.session.add(main.ProfileSelfie(user_id=user_id, image=main.encrypt_selfie("fixture"), about="Test profile"))
+        main.db.session.commit()
+        point = {"latitude": 53.9023, "longitude": 27.5619}
+        watch = {**point, "category": "cafe", "radius": 3, "window": "hour"}
+        settings, path = "/api/settings/telegram", "/api/company-watch"
+        with patch.object(main, "BOT_TOKEN", "mock-only"), patch.object(main, "telegram_api", return_value={"ok": True}) as send:
+            self.assertFalse(self.first.get(settings).json["enabled"])
+            self.assertEqual(self.first.post(path, json=watch).status_code, 409)
+            self.assertEqual(self.first.post(settings, json={"enabled": True}).status_code, 200)
+            self.assertTrue(self.first.post(path, json=watch).json["active"])
+            for category, latitude, delay in (("walk", 53.9, 1), ("cafe", 54.3, 1), ("cafe", 53.9, 90)):
+                meeting = main.Meeting(owner_id=main.User.query.filter_by(telegram_id="test-722").one().id,
+                    category=category, format="one", description="Встреча", latitude=latitude, longitude=27.56,
+                    starts_at=main.utcnow()+timedelta(minutes=delay), expires_at=main.utcnow()+timedelta(hours=3))
+                main.db.session.add(meeting)
+            main.db.session.commit()
+            main.process_company_watches()
+            main.process_user_telegram_outbox()
+            send.assert_not_called()
+            self.second.post("/api/presence", json={**point, "category": "cafe"})
+            main.process_company_watches()
+            main.process_company_watches()
+            main.process_user_telegram_outbox()
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[1]["chat_id"], "721")
+            self.assertNotIn("53.9", send.call_args.args[1]["text"])
+            self.assertTrue(self.first.get(path).json["matched"])
+            self.first.post("/api/presence", json={**point, "category": "walk"})
+            main.Presence.query.filter_by(user_id=user_id).update({"updated_at": main.utcnow()-timedelta(hours=1, minutes=5)})
+            main.db.session.commit()
+            main.process_presence_reminders()
+            main.process_presence_reminders()
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(self.first.get("/api/presence").json["active"])
+            main.notify_user(user_id, "событие", kind="meeting_cancel", dedupe_key="cancel-721")
+            self.first.post(settings, json={"enabled": False})
+            main.process_user_telegram_outbox()
+            self.assertEqual(send.call_count, 2)
+            self.assertFalse(self.first.get(path).json["active"])
+
+    def test_task_expiry_withdrawal_reapproval_and_optional_alerts(self):
+        from unittest.mock import patch
+
+        for client, number in zip((self.first, self.second, self.third), (811, 812, 813)):
+            self.login(client, number)
+        tasks = "/api/private/tasks"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS": "test-811,test-812"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-813"}), patch.object(main, "BOT_TOKEN", "stub"):
+            csrf = self.third.get(tasks).json["csrf_token"]
+            headers = {"X-CSRF-Token": csrf}
+            worker = main.User.query.filter_by(telegram_id="test-812").one()
+            main.db.session.add(main.TelegramPreference(user_id=worker.id, enabled=True, revision=1))
+            main.write_release_setting("task_policy", {**main.DEFAULT_TASK_POLICY, "fee_bps": 1000})
+            main.db.session.commit()
+            alerts = "/api/private/task-alerts"
+            self.assertEqual(self.second.get(alerts).json, {"matching": False, "events": False})
+            self.assertEqual(self.second.post(alerts, json={"matching": True, "events": True}).status_code, 200)
+            self.assertEqual(self.first.post(alerts, json={"matching": False, "events": True}).status_code, 200)
+            area = {"city": "Минск", "country": "BY"}
+            self.assertEqual(self.second.post("/api/private/task-work-area", json=area).status_code, 200)
+            due = main.utcnow() + timedelta(hours=2)
+            task = self.first.post(tasks, json={**area, "due_at": due.isoformat(), "title": "Редактура заметки",
+                "description": "Исправить опечатки в короткой заметке", "category": "editing", "budget": 35}).json["item"]
+            self.assertEqual(task["amounts"], {"reward": "35.00", "fee": "3.50", "total": "38.50"})
+            path = f"{tasks}/{task['id']}/action"
+
+            def act(client, action, **values):
+                return client.post(path, json={"action": action, **values}, headers=headers if client is self.third else {})
+
+            self.assertEqual(act(self.third, "approve").status_code, 200)
+            self.assertEqual(main.UserNotification.query.filter_by(user_id=worker.id, kind="task_match").count(), 1)
+            self.assertEqual(main.NotificationOutbox.query.filter_by(kind="user_telegram").count(), 1)
+            self.assertEqual(self.second.get(tasks, query_string={"scope": "available", "city": "МИНСК",
+                "category": "editing", "deadline": "24h", "budget_min": 30, "budget_max": 40}).json["items"][0]["applicants"], [])
+            self.assertEqual(self.second.get(tasks+"?scope=available&budget_min=40").json["items"], [])
+            self.assertEqual(act(self.second, "apply").status_code, 200)
+            self.assertEqual(act(self.second, "withdraw").status_code, 200)
+            self.assertEqual(act(self.first, "assign", user_id=worker.id).status_code, 400)
+            self.assertEqual(act(self.second, "apply").status_code, 200)
+            self.assertEqual(act(self.first, "assign", user_id=worker.id).status_code, 200)
+            self.assertEqual(act(self.second, "start").json["item"]["status"], "in_progress")
+            self.assertEqual(act(self.first, "cancel").json["item"]["status"], "cancel_requested")
+            self.assertEqual(act(self.second, "confirm_cancel").json["item"]["status"], "cancelled")
+            self.assertEqual(act(self.first, "reopen", due_at=due.isoformat()).json["item"]["status"], "pending")
+            self.assertEqual(act(self.third, "approve").json["item"]["applicants"], [])
+            with patch.object(main, "utcnow", return_value=due+timedelta(seconds=1)):
+                self.assertEqual(self.second.get(tasks+"?scope=available").json["items"], [])
+                self.assertEqual(act(self.second, "apply").status_code, 409)
+                self.assertEqual(self.first.get(tasks+"?scope=mine").json["items"][0]["status"], "expired")
+            access = f"/api/admin/users/{worker.id}/task-access"
+            self.assertEqual(self.third.post(access, json={"enabled": False}).status_code, 403)
+            self.assertEqual(self.third.post(access, json={"enabled": False}, headers=headers).status_code, 200)
+            self.assertEqual(self.second.get(tasks).status_code, 403)
+            with patch.object(main, "telegram_api") as telegram:
+                main.process_user_telegram_outbox()
+                telegram.assert_not_called()
+
+    def test_0181_private_tasks_require_moderation_and_separate_reputation(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 731)
+        self.login(self.second, 732)
+        self.login(self.third, 733)
+        outsider = main.app.test_client()
+        self.login(outsider, 734)
+        path = "/api/private/tasks"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS": "test-731,test-732"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-733"}):
+            self.assertEqual(outsider.get(path).status_code, 403)
+            self.assertEqual(main.app.test_client().get(path).status_code, 401)
+            payload = {"category": "editing", "title": "Редактура заметки",
+                       "description": "Исправить опечатки в открытой заметке", "budget": 15}
+            self.assertEqual(self.first.post(path, json={**payload, "category": "banking"}).status_code, 400)
+            task = self.first.post(path, json=payload).json["item"]
+            action = f"{path}/{task['id']}/action"
+            self.assertEqual(task["status"], "pending")
+            self.assertEqual(self.second.get(path).json["items"], [])
+            self.assertEqual(self.second.post(action, json={"action": "apply"}).status_code, 404)
+            self.assertEqual(self.third.post(action, json={"action": "approve"}).status_code, 403)
+            csrf = self.third.get(path).json["csrf_token"]
+            headers = {"X-CSRF-Token": csrf}
+            self.assertEqual(self.third.post(action, json={"action": "approve"}, headers=headers).json["item"]["status"], "approved")
+            self.assertEqual(self.second.post(action, json={"action": "apply"}).status_code, 200)
+            applicant = self.first.get(path).json["items"][0]["applicants"][0]
+            self.assertEqual(self.first.post(action, json={"action": "assign", "user_id": applicant["id"]}).json["item"]["status"], "assigned")
+            self.assertEqual(self.first.post(action, json={"action": "accept"}).status_code, 409)
+            self.assertEqual(self.second.post(action, json={"action": "submit", "text": "Редактура завершена"}).json["item"]["status"], "submitted")
+            self.assertEqual(self.first.post(action, json={"action": "refuse", "text": "Нужно проверить правки"}).json["item"]["status"], "refused")
+            self.assertEqual(self.second.post(action, json={"action": "dispute", "text": "Правки согласованы"}).json["item"]["status"], "disputed")
+            self.assertEqual(self.third.post(action, json={"action": "resolve_accept"}, headers=headers).json["item"]["status"], "accepted")
+            self.assertEqual(self.second.get(path).json["reputation"], {"completed": 1})
+            self.assertEqual(main.MeetingThanks.query.count(), 0)
+
+    def test_0181_acquisition_separates_channels_and_deduplicates_registration(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 741)
+        self.login(self.second, 742)
+        self.login(self.third, 743)
+        clients = (self.first, self.second, self.third)
+        for client, medium in zip(clients, ("press", "creator", "ads")):
+            payload = {"visitor_id": "browser-unique", "source": "same", "campaign": "launch", "medium": medium}
+            self.assertTrue(client.post("/api/traffic", json=payload).json["counted"])
+            self.assertFalse(client.post("/api/traffic", json=payload).json["counted"])
+        self.assertEqual(self.first.get("/api/admin/traffic").status_code, 403)
+        with patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-741"}):
+            data = self.first.get("/api/admin/traffic").json
+        for key in ("press", "creator", "ads"):
+            self.assertEqual(data["channels"][key], {"visits": 1, "registrations": 1})
+
+    def test_release_protects_api_profile_and_public_search_surface(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 901)
+        with patch.object(main, "ALLOW_TEST_AUTH", False):
+            self.assertEqual(self.first.post("/api/presence", json={"category":"walk"}).status_code, 403)
+            self.assertEqual(self.first.post("/api/meetings", json={"category":"walk"}).status_code, 403)
+        self.assertEqual(self.first.post("/api/location", headers={"Sec-Fetch-Site":"cross-site"},
+                                        json={"latitude":10, "longitude":10}).status_code, 403)
+        for loc in ("/about", "/about?lang=en", "/about/qr.png", "/sitemap.xml", "/robots.txt", "/service-worker.js"):
+            with self.subTest(loc=loc), self.first.get(loc) as response:
+                self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.first.get("/api/feed").headers["X-Robots-Tag"], "noindex, nofollow")
+        with self.first.get("/about?lang=en") as response:
+            self.assertIn(b'<html lang="en">', response.data)
+
+    def test_release_international_day_uses_user_zone(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        self.login(self.first, 902)
+        payload = {"category":"walk", "description":"Walk", "time_mode":"today",
+                   "starts_in_minutes":120, "latitude":40.7, "longitude":-74.0}
+        with patch.object(main, "utcnow", return_value=datetime(2026, 11, 25, 20, tzinfo=timezone.utc)):
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"Europe/Minsk"}).status_code, 400)
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"America/New_York"}).status_code, 201)
+            self.assertEqual(self.first.post("/api/meetings", json={**payload, "time_zone":"invalid"}).status_code, 400)
+
+    def test_release_closed_task_material_policy_and_audit(self):
+        from io import BytesIO
+        import base64
+        from unittest.mock import patch
+        from PIL import Image
+
+        admin = main.app.test_client()
+        company = main.app.test_client()
+        self.login(company, 915)
+        main.User.query.filter_by(telegram_id="test-915").update({"telegram_id":"915"})
+        main.db.session.commit()
+        for client, account in ((self.first, 911),(self.second,912),(self.third,913),(admin,914)):
+            self.login(client, account)
+        path = "/api/private/tasks"
+        settings = "/api/admin/release-settings"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS":"test-911,test-912",
+                                     "TASK_MODERATOR_TELEGRAM_IDS":"test-913"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-914"}):
+            self.assertEqual(self.third.get(settings).status_code, 403)
+            policy = {"categories":["public_photo"],"max_budget":100,"fee_bps":750,"enabled":True}
+            self.assertEqual(admin.post(settings,json=policy).status_code, 403)
+            csrf = admin.get(settings).json["csrf_token"]
+            self.assertEqual(company.get(path).status_code,403)
+            enrollment = "/api/admin/corporate-customers"
+            self.assertEqual(admin.post(enrollment,json={"account":"915","organization":"Example company"},
+                                        headers={"X-CSRF-Token":csrf}).status_code,200)
+            self.assertEqual(company.get(path).status_code,200)
+            self.assertEqual(admin.post(settings,json=policy,headers={"X-CSRF-Token":csrf}).status_code, 200)
+            payload = {"title":"Фото витрины", "description":"Фото товара с разрешения магазина",
+                       "category":"public_photo", "budget":80, "currency":"EUR", "city":"Warsaw",
+                       "country":"PL", "due_at":(main.utcnow()+timedelta(hours=3)).isoformat(),
+                       "requirements":"Снять товар крупным планом", "public_site_confirmed":True}
+            self.assertEqual(self.first.post(path,json={**payload,"city":""}).status_code, 400)
+            self.assertEqual(self.first.post(path,json={**payload,"description":"Нужна слежка за человеком"}).status_code, 400)
+            item = self.first.post(path,json=payload).json["item"]
+            self.assertEqual(item["estimated_fee"], "6.00")
+            self.assertEqual(item["terms"]["city"], "Warsaw")
+            self.assertEqual(self.second.get(path).json["items"], [])
+            route = f"{path}/{item['id']}/action"
+            mod_csrf = self.third.get(path).json["csrf_token"]
+            self.assertEqual(self.third.post(route,json={"action":"approve"},headers={"X-CSRF-Token":mod_csrf}).status_code, 200)
+            self.assertEqual(len(self.second.get(path+"?city=Warsaw&country=PL").json["items"]),1)
+            self.assertEqual(self.second.get(path+"?city=London&country=GB").json["items"],[])
+            self.assertEqual(self.second.post(route,json={"action":"apply"}).status_code,409)
+            self.assertEqual(self.second.post("/api/private/task-work-area",json={"city":"warsaw","country":"PL"}).status_code,200)
+            workers=f"{path}/{item['id']}/workers"
+            self.assertEqual(self.first.get(workers).json,{"count":1})
+            self.assertEqual(self.second.get(workers).status_code,404)
+            self.assertEqual(self.second.post(route,json={"action":"apply"}).status_code,200)
+            applicant = self.first.get(path).json["items"][0]["applicants"][0]["id"]
+            self.first.post(route,json={"action":"assign","user_id":applicant})
+            self.assertEqual(self.second.post(route,json={"action":"submit","text":"Фото готово"}).status_code, 400)
+            photo = Image.new("RGB", (8,8))
+            metadata = photo.getexif()
+            metadata[270] = "private location"
+            buffer = BytesIO()
+            photo.save(buffer,format="JPEG",exif=metadata)
+            encoded = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+            response = self.second.post(route,json={"action":"submit","text":"Фото готово","photos":[encoded]})
+            self.assertEqual(response.status_code,200,response.json)
+            url = response.json["item"]["materials"][0]["url"]
+            with self.first.get(url) as material:
+                self.assertEqual(material.status_code,200)
+                self.assertEqual(dict(Image.open(BytesIO(material.data)).getexif()),{})
+            self.assertEqual(main.app.test_client().get(url).status_code,401)
+            self.assertEqual(company.get(url).status_code,404)
+            self.assertEqual(main.TaskMaterial.query.one().image[:4],"enc:")
+            self.assertEqual(self.first.post(route,json={"action":"accept"}).status_code,200)
+            stats = admin.get("/api/admin/release-metrics").json
+            self.assertEqual(stats["actual_revenue"],[])
+            self.assertEqual(stats["estimated_commission"],[{"currency":"EUR","amount":"6.0"}])
+            self.assertEqual(main.TaskActivity.query.filter_by(task_id=item["id"]).count(),6)
+
+    def test_release_repeat_invitation_is_private_and_idempotent(self):
+        self.login(self.first, 921)
+        self.login(self.second, 922)
+        self.login(self.third, 923)
+        first = main.User.query.filter_by(telegram_id="test-921").one()
+        second = main.User.query.filter_by(telegram_id="test-922").one()
+        now = main.utcnow()
+        old = main.Meeting(owner_id=first.id, category="talk", description="Знакомство", format="one",
+                           latitude=53.9, longitude=27.56, starts_at=now-timedelta(hours=2),
+                           expires_at=now-timedelta(hours=1))
+        main.db.session.add(old)
+        main.db.session.flush()
+        old_id, second_id = old.id, second.id
+        main.db.session.add(main.Interest(meeting_id=old_id,user_id=second_id,status="accepted"))
+        main.db.session.add(main.MeetingState(meeting_id=old_id,status="completed"))
+        for who in (first.id, second_id):
+            main.db.session.add(main.MeetingEvent(meeting_id=old_id,user_id=who,kind="complete"))
+        main.db.session.commit()
+        contacts=self.first.get("/api/meetings/previous-contacts").json["items"]
+        self.assertEqual([(x["user_id"],x["meeting_id"]) for x in contacts],[(second_id,old_id)])
+        path=f"/api/meetings/{old_id}/repeat"
+        self.assertEqual(self.third.post(path,json={"user_id":second_id}).status_code,404)
+        reply=self.first.post(path,json={"user_id":second_id})
+        self.assertEqual(reply.status_code,201)
+        new_id=reply.json["meeting_id"]
+        self.assertEqual(self.first.post(path,json={"user_id":second_id}).json["meeting_id"],new_id)
+        self.assertEqual(self.third.get("/api/feed?lat=0&lon=0&radius=3").json["items"],[])
+        self.assertEqual(self.third.post(f"/api/meetings/{new_id}/interest",json={}).status_code,404)
+        self.assertEqual(self.second.get("/api/interests").json["incoming"][0]["meeting_id"],new_id)
+
+    def test_launch_admin_controls_apply_to_direct_api(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 941)
+        self.login(self.second, 942)
+        self.login(self.third, 943)
+        volunteer = main.app.test_client()
+        self.login(volunteer, 945)
+        owner = main.User.query.filter_by(telegram_id="test-941").one()
+        coordinator = main.User.query.filter_by(telegram_id="test-942").one()
+        owner_id, coordinator_id = owner.id, coordinator.id
+        module_path = "/api/admin/launch-modules"
+        registry = "/api/admin/organizers"
+        point = {"category":"walk","latitude":53.9,"longitude":27.5}
+        deed = {"title":"Чистый парк","description":"Убираем мусор вместе","area":"Вход в парк",
+                "instructions":"Возьмите перчатки","coordinator_id":coordinator_id,"public_site_confirmed":True,
+                "starts_at":(main.utcnow()+timedelta(hours=2)).isoformat()}
+        for client in (self.first,self.second,volunteer):
+            client.post("/api/profile",json={"name":"Тестовый участник","age":24,"gender":"female",
+                "about":"Описание тестовой анкеты участника","selfie":sample_photo(),"terms_accepted":True})
+        with patch.object(main,"ADMIN_TELEGRAM_IDS",{"test-943"}):
+            self.assertEqual(self.first.get(module_path).status_code,403)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,403)
+            headers={"X-CSRF-Token":self.third.get(module_path).json["csrf_token"]}
+            modules={key:False for key in main.DEFAULT_MODULES}
+            self.assertEqual(self.third.post(module_path,json={"modules":modules}).status_code,403)
+            self.assertEqual(self.third.post(module_path,json={"modules":modules},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,409)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,409)
+            self.assertEqual(self.first.delete("/api/presence").status_code,200)
+            self.assertFalse(self.first.get("/api/session").json["modules"]["notifications"])
+            self.third.post(module_path,json={"modules":main.DEFAULT_MODULES},headers=headers)
+            self.assertEqual(self.third.post(registry,json={"user_id":owner_id,"active":True,"name":"Парк",
+                                         "reason":"Проверенные документы"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json=deed).status_code,403)
+            self.assertEqual(self.third.post(f"{registry}/{owner_id}/coordinators",
+                json={"user_id":coordinator_id,"active":True,"label":"Координатор парка"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/v2/good-deeds",json={**deed,"description":"Слежка за человеком"}).status_code,400)
+            created = self.first.post("/api/v2/good-deeds",json=deed)
+            self.assertEqual(created.status_code,201)
+            deed_id=created.json["item"]["id"]
+            self.assertEqual(self.third.post(f"/api/v2/admin/good-deeds/{deed_id}/decision",
+                json={"decision":"active"},headers=headers).status_code,200)
+            self.assertTrue(main.app.test_client().get("/api/v2/good-deeds").json["items"])
+            self.assertEqual(self.third.post(f"/api/admin/users/{owner_id}/access",
+                json={"hours":24,"reason":"Проверка жалобы"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,403)
+            self.assertEqual(main.app.test_client().get("/api/v2/good-deeds").json["items"],[])
+            self.assertEqual(self.first.get("/api/v2/good-deeds").json["items"][0]["roster"],[])
+            self.assertEqual(volunteer.post(f"/api/v2/good-deeds/{deed_id}/join",json={"joined":True}).status_code,409)
+            self.assertEqual(self.third.post(f"/api/admin/users/{owner_id}/access",
+                json={"hours":0,"reason":"Проверка завершена"},headers=headers).status_code,200)
+            self.assertEqual(self.first.post("/api/presence",json=point).status_code,200)
+
+    def test_launch_shared_rate_limit_and_activity_retention(self):
+        from unittest.mock import patch
+
+        self.login(self.first, 944)
+        self.first.get("/api/session")
+        self.first.get("/api/session")
+        self.assertEqual(main.DailyActivity.query.count(),1)
+        with patch.object(main,"ALLOW_TEST_AUTH",False), patch.dict(main.PUBLIC_RATE_LIMITS,{"/api/traffic":2}):
+            body={"visitor_id":"launch-rate-limit","source":"test"}
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,200)
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,200)
+            self.assertEqual(self.first.post("/api/traffic",json=body).status_code,429)
+            self.assertEqual(len(main.PublicRateBucket.query.one().key),64)
+
+    def test_launch_readiness_reports_a_stalled_worker(self):
+        from unittest.mock import patch
+
+        with patch.object(main, "IS_PRODUCTION", True), patch.object(main, "WORKER_STARTED", main.time.monotonic()-300), patch.object(main, "WORKER_PROGRESS", {}):
+            stale = self.first.get("/ready")
+            self.assertEqual(stale.status_code,503)
+            self.assertEqual(set(stale.json["stale_workers"]),{"outbox","maintenance"})
+            main.worker_progress("outbox")
+            main.worker_progress("maintenance")
+            self.assertEqual(self.first.get("/ready").status_code,200)
+
+    def test_launch_block_stops_room_communication_and_photo_disclosure(self):
+        self.login(self.first, 951)
+        self.login(self.second, 952)
+        first = main.User.query.filter_by(telegram_id="test-951").one().id
+        second = main.User.query.filter_by(telegram_id="test-952").one().id
+        meeting_id = self.first.post("/api/meetings", json={"category":"walk","description":"Встреча в парке",
+            "latitude":53.9,"longitude":27.5}).json["id"]
+        self.second.post(f"/api/meetings/{meeting_id}/interest",json={})
+        pending = self.first.get("/api/interests").json["incoming"][0]["id"]
+        self.first.post(f"/api/interests/{pending}/decision",json={"decision":"accepted"})
+        for user_id in (first,second):
+            main.db.session.add(main.ProfileMedia(user_id=user_id,real_photo=main.encrypt_selfie(sample_photo())))
+            main.db.session.add(main.PhotoConsent(meeting_id=meeting_id,user_id=user_id))
+        main.db.session.commit()
+        self.assertTrue(self.second.get(f"/api/meetings/{meeting_id}/room").json["photos_revealed"])
+        reply=self.first.post(f"/api/meetings/{meeting_id}/report",
+                              json={"target_user_id":second,"reason":"Нежелательный контакт","block":True})
+        self.assertEqual(reply.status_code,200)
+        room=self.second.get(f"/api/meetings/{meeting_id}/room").json
+        self.assertFalse(room["photos_revealed"])
+        self.assertTrue(room["meeting"]["contact_locked"])
+        self.assertEqual(self.second.post(f"/api/meetings/{meeting_id}/messages",json={"text":"Повторный контакт"}).status_code,403)
 
 
 if __name__ == "__main__":

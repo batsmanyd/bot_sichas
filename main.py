@@ -1,45 +1,92 @@
 import base64
 import hashlib
+import io
 import hmac
 import json
+import logging
 import math
 import os
 import re
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
-from urllib.parse import parse_qsl, quote, urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 import jwt
 import requests
+import qrcode
+from PIL import Image
 from cryptography.fernet import Fernet, InvalidToken
 from flask import (
-    Flask, Response, jsonify, redirect, request, send_from_directory, session,
+    has_request_context,
+    Flask, Response, abort, g, jsonify, redirect, request, send_from_directory, session,
     stream_with_context,
 )
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
+    Boolean, case,
     Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine, literal, select,
+    create_engine, distinct, func, literal, select, text as sql_text,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import declarative_base, relationship, scoped_session, sessionmaker
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = "0.17.8"
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://upbeat-reverence-production-c0b7.up.railway.app").rstrip("/")
+APP_VERSION = "1.0.0-rc.1"
+APP_TIMEZONE = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Minsk"))
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"} or bool(os.getenv("RAILWAY_ENVIRONMENT"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8080").rstrip("/")
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CLIENT_ID = os.getenv("TELEGRAM_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TELEGRAM_CLIENT_SECRET", "").strip()
 CALLBACK_URL = f"{PUBLIC_URL}/auth/telegram/callback"
 ALLOW_TEST_AUTH = os.getenv("ALLOW_TEST_AUTH", "false").lower() == "true"
+ENABLE_SSE = os.getenv(
+    "ENABLE_SSE", "true" if ALLOW_TEST_AUTH and not IS_PRODUCTION else "false"
+).lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
+EXPECTED_SCHEMA_REVISION = "0012_task_alerts"
 
-database_url = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}")
+if IS_PRODUCTION:
+    missing_configuration = [
+        name for name, value in {
+            "SECRET_KEY": os.getenv("SECRET_KEY"),
+            "SELFIE_ENCRYPTION_KEY": os.getenv("SELFIE_ENCRYPTION_KEY"),
+            "DATABASE_URL": os.getenv("DATABASE_URL"),
+            "PUBLIC_URL": os.getenv("PUBLIC_URL"),
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "ADMIN_TELEGRAM_IDS": os.getenv("ADMIN_TELEGRAM_IDS"),
+        }.items() if not str(value or "").strip()
+    ]
+    if missing_configuration:
+        raise RuntimeError(
+            "Missing required production configuration: "
+            + ", ".join(sorted(missing_configuration))
+        )
+    public_url = urlparse(PUBLIC_URL)
+    invalid_configuration = []
+    if public_url.scheme != "https" or not public_url.netloc:
+        invalid_configuration.append("PUBLIC_URL must be an absolute HTTPS URL")
+    if not str(os.getenv("DATABASE_URL") or "").startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        invalid_configuration.append("DATABASE_URL must use PostgreSQL in production")
+    if ALLOW_TEST_AUTH:
+        invalid_configuration.append("ALLOW_TEST_AUTH must be false")
+    if any(not value.isdigit() or int(value) <= 0 for value in ADMIN_TELEGRAM_IDS):
+        invalid_configuration.append("ADMIN_TELEGRAM_IDS must contain positive numeric Telegram IDs")
+    if invalid_configuration:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(invalid_configuration))
+
+database_url = os.getenv("DATABASE_URL") or f"sqlite:///{os.path.join(BASE_DIR, 'sichas.db')}"
 if database_url.startswith("postgres://"):
     database_url = "postgresql+psycopg://" + database_url[len("postgres://"):]
 elif database_url.startswith("postgresql://"):
@@ -48,19 +95,47 @@ elif database_url.startswith("postgresql://"):
 secret_seed = os.getenv("SECRET_KEY") or CLIENT_SECRET or BOT_TOKEN
 if not secret_seed:
     secret_seed = secrets.token_hex(32)
+selfie_key_seed = os.getenv("SELFIE_ENCRYPTION_KEY") or f"{secret_seed}|development-selfie-key"
+SELFIE_ENCRYPTION_KEY_VERSION = (
+    os.getenv("SELFIE_ENCRYPTION_KEY_VERSION", "v1").strip() or "v1"
+)
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = hashlib.sha256(f"{secret_seed}|seichas-session".encode()).hexdigest()
 selfie_cipher = Fernet(base64.urlsafe_b64encode(
-    hashlib.sha256(f"{app.secret_key}|selfie-storage-v1".encode()).digest()
+    hashlib.sha256(selfie_key_seed.encode()).digest()
 ))
 app.config.update(
     SESSION_COOKIE_SECURE=PUBLIC_URL.startswith("https://") and not app.testing,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    MAX_CONTENT_LENGTH=2_200_000,
 )
+
+
+class StructuredLogFormatter(logging.Formatter):
+    """Emit operational metadata without request bodies, query strings, or credentials."""
+
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        for key in ("request_id", "method", "path", "status_code", "duration_ms"):
+            value = getattr(record, key, None)
+            if value is not None:
+                payload[key] = value
+        if record.exc_info:
+            payload["exception"] = record.exc_info[0].__name__
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+if IS_PRODUCTION:
+    for handler in app.logger.handlers:
+        handler.setFormatter(StructuredLogFormatter())
 device_token_serializer = URLSafeTimedSerializer(app.secret_key, salt="sichas-device-auth-v1")
 DEVICE_TOKEN_MAX_AGE = 180 * 24 * 60 * 60
 GEOCODE_LOCK = threading.Lock()
@@ -129,16 +204,28 @@ def utcnow():
 
 
 def encrypt_selfie(value):
-    return "enc:" + selfie_cipher.encrypt(value.encode()).decode()
+    return f"enc:{SELFIE_ENCRYPTION_KEY_VERSION}:" + selfie_cipher.encrypt(value.encode()).decode()
 
 
 def decrypt_selfie(value):
     if not value:
         return None
     if not value.startswith("enc:"):
-        return value  # Existing records are migrated when the profile is next saved.
+        return value
     try:
-        return selfie_cipher.decrypt(value[4:].encode()).decode()
+        encrypted_value = value[4:]
+        if ":" in encrypted_value:
+            version, encrypted_value = encrypted_value.split(":", 1)
+            if version != SELFIE_ENCRYPTION_KEY_VERSION:
+                app.logger.error("Stored selfie uses an unavailable encryption key version")
+                return None
+            return selfie_cipher.decrypt(encrypted_value.encode()).decode()
+        # 0.17.8 encrypted unversioned selfies with a key derived from the
+        # original session secret. Production migrations rewrite them.
+        legacy_cipher = Fernet(base64.urlsafe_b64encode(
+            hashlib.sha256(f"{app.secret_key}|selfie-storage-v1".encode()).digest()
+        ))
+        return legacy_cipher.decrypt(encrypted_value.encode()).decode()
     except InvalidToken:
         app.logger.error("Stored selfie could not be decrypted")
         return None
@@ -175,7 +262,7 @@ class ProfileSelfie(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
     image = db.Column(db.Text, nullable=False)
-    visibility = db.Column(db.String(20), nullable=False, default="mutual")
+    visibility = db.Column(db.String(20), nullable=False, default="hidden")
     about = db.Column(db.String(160), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
@@ -308,7 +395,14 @@ class UserReport(db.Model):
     meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
     reporter_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     target_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    category = db.Column(db.String(40), nullable=False, default="other", index=True)
     reason = db.Column(db.String(180), nullable=False)
+    status = db.Column(db.String(30), nullable=False, default="new", index=True)
+    moderator_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True)
+    decision = db.Column(db.String(40), index=True)
+    decision_reason = db.Column(db.String(180))
+    auto_hidden = db.Column(db.Integer, nullable=False, default=0)
+    reviewed_at = db.Column(db.DateTime(timezone=True))
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
@@ -343,7 +437,7 @@ class UserModeration(db.Model):
     __tablename__ = "user_moderation"
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
-    hidden_until = db.Column(db.DateTime(timezone=True), nullable=False)
+    hidden_until = db.Column(db.DateTime(timezone=True), nullable=False, index=True)
     reason = db.Column(db.String(180), nullable=False)
 
 
@@ -395,7 +489,59 @@ class AuthHandoff(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class SyncRevision(db.Model):
+    __tablename__ = "sync_revision"
+    key = db.Column(db.String(120), primary_key=True)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ModerationAction(db.Model):
+    __tablename__ = "moderation_action"
+    id = db.Column(db.Integer, primary_key=True)
+    report_id = db.Column(db.Integer, db.ForeignKey("user_report.id"), index=True)
+    moderator_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    action = db.Column(db.String(40), nullable=False, index=True)
+    reason = db.Column(db.String(180))
+    metadata_json = db.Column(db.Text)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+
+class NotificationOutbox(db.Model):
+    __tablename__ = "notification_outbox"
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(40), nullable=False, index=True)
+    dedupe_key = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    payload_json = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    next_attempt_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+    delivered_at = db.Column(db.DateTime(timezone=True))
+    last_error = db.Column(db.String(180))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class OperationRecord(db.Model):
+    __tablename__ = "operation_record"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    operation_id = db.Column(db.String(80), nullable=False)
+    method = db.Column(db.String(10), nullable=False)
+    path = db.Column(db.String(180), nullable=False)
+    status_code = db.Column(db.Integer, nullable=False)
+    response_json = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "operation_id", name="uq_operation_user_id"),)
+
+
+SAFE_HELP_GOALS = {
+    "Обсудить вопрос дистанционно",
+    "Подсказать дорогу в публичном месте",
+    "Помочь разобраться в городской навигации",
+    "Помочь друг другу",
+}
 VALID_CATEGORIES = {"cafe", "walk", "talk", "active", "shop", "help", "leisure"}
+REPORT_CATEGORIES = {"safety", "harassment", "spam", "no_show", "no_show_dispute", "other"}
 CATEGORY_ICONS = {
     "cafe": "☕", "walk": "🚶", "talk": "💬", "active": "🚲",
     "shop": "🛍", "help": "🤝", "leisure": "🎬",
@@ -416,6 +562,239 @@ def normalize_dt(value):
     return value
 
 
+def bump_revision_keys(*keys):
+    """Atomically increment durable revisions in the caller's transaction."""
+    now = utcnow()
+    for key in sorted({str(key)[:120] for key in keys if key}):
+        values = {"key": key, "revision": 1, "updated_at": now}
+        if engine.dialect.name == "postgresql":
+            statement = postgresql_insert(SyncRevision).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=[SyncRevision.key],
+                set_={"revision": SyncRevision.revision + 1, "updated_at": now},
+            )
+        else:
+            statement = sqlite_insert(SyncRevision).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=[SyncRevision.key],
+                set_={"revision": SyncRevision.revision + 1, "updated_at": now},
+            )
+        db.session.execute(statement)
+
+
+def bump_sync(feed=False, user_ids=(), meeting_ids=(), notification_ids=(), admin=False):
+    keys = []
+    if feed:
+        keys.append("feed")
+    if admin:
+        keys.append("admin")
+    keys.extend(f"user:{user_id}" for user_id in set(user_ids))
+    keys.extend(f"room:{meeting_id}" for meeting_id in set(meeting_ids))
+    keys.extend(f"notifications:{user_id}" for user_id in set(notification_ids))
+    bump_revision_keys(*keys)
+
+
+def revision_value(key):
+    row = db.session.get(SyncRevision, key)
+    return row.revision if row else 0
+
+
+def request_operation_id():
+    value = str(request.headers.get("X-Operation-ID") or json_body().get("operation_id") or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", value):
+        return ""
+    return value
+
+
+def replay_operation(user, operation_id):
+    if not operation_id:
+        return None
+    record = OperationRecord.query.filter_by(user_id=user.id, operation_id=operation_id).first()
+    if not record:
+        return None
+    if record.method != request.method or record.path != request.path:
+        return jsonify(error="Operation ID уже использован для другого действия",
+                       code="OPERATION_ID_CONFLICT"), 409
+    payload = json.loads(record.response_json)
+    meeting_id = payload.pop("_room_meeting_id", None)
+    previous_room = payload.pop("room", None)
+    if previous_room:
+        meeting_id = previous_room["meeting"]["id"]
+    if meeting_id:
+        meeting = db.session.get(Meeting, meeting_id)
+        if meeting and meeting_member(meeting, user) and not chat_closed_for(meeting, user.id):
+            payload["room"] = room_payload(meeting, user)
+    payload["replayed"] = True
+    return jsonify(payload), record.status_code
+
+
+def remember_operation(user, operation_id, payload, status_code):
+    if operation_id:
+        db.session.add(OperationRecord(
+            user_id=user.id,
+            operation_id=operation_id,
+            method=request.method,
+            path=request.path,
+            status_code=status_code,
+            response_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        ))
+
+
+def admin_user():
+    user = current_user()
+    return user if user and user.telegram_id in ADMIN_TELEGRAM_IDS else None
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not admin_user():
+            return jsonify(error="Нет доступа"), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def admin_csrf_token():
+    if not session.get("admin_csrf"):
+        session["admin_csrf"] = secrets.token_urlsafe(32)
+    return session["admin_csrf"]
+
+
+def verify_admin_csrf():
+    received = request.headers.get("X-CSRF-Token", "")
+    expected = str(session.get("admin_csrf") or "")
+    if not expected or not secrets.compare_digest(received, expected):
+        return False
+    origin = request.headers.get("Origin")
+    if not origin:
+        return not IS_PRODUCTION
+    allowed = {urlparse(PUBLIC_URL).netloc, urlparse(request.host_url).netloc}
+    return urlparse(origin).netloc in allowed
+
+
+def anonymized_user_id(user_id):
+    return "u_" + hmac.new(
+        app.secret_key.encode(), f"admin-user:{user_id}".encode(), hashlib.sha256
+    ).hexdigest()[:12]
+
+
+def independent_report_count(target_id, since=None):
+    query = db.session.query(func.count(distinct(UserReport.reporter_id))).filter(
+        UserReport.target_id == target_id,
+        UserReport.category != "no_show_dispute",
+    )
+    if since:
+        query = query.filter(UserReport.created_at >= since)
+    return int(query.scalar() or 0)
+
+
+def queue_admin_report(report, report_count):
+    for telegram_id in sorted(ADMIN_TELEGRAM_IDS):
+        payload = {
+            "report_id": report.id,
+            "category": report.category,
+            "created_at": normalize_dt(report.created_at).isoformat(),
+            "report_count": report_count,
+            "status": report.status,
+            "admin_telegram_id": telegram_id,
+        }
+        db.session.add(NotificationOutbox(
+            kind="admin_report",
+            dedupe_key=f"admin-report:{report.id}:{telegram_id}",
+            payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            status="pending",
+            next_attempt_at=utcnow(),
+        ))
+
+
+def process_notification_outbox(limit=20):
+    now = utcnow()
+    query = NotificationOutbox.query.filter(
+        NotificationOutbox.kind == "admin_report",
+        NotificationOutbox.status.in_(("pending", "failed")),
+        NotificationOutbox.next_attempt_at <= now,
+    ).order_by(NotificationOutbox.id).limit(limit)
+    if engine.dialect.name == "postgresql":
+        query = query.with_for_update(skip_locked=True)
+    rows = query.all()
+    for row in rows:
+        row.status = "sending"
+        row.attempts += 1
+        try:
+            payload = json.loads(row.payload_json)
+            if row.kind != "admin_report":
+                raise ValueError("Unsupported outbox event")
+            message = (
+                f"Новая жалоба #{payload['report_id']}\n"
+                f"Категория: {payload['category']}\n"
+                f"Дата: {payload['created_at']}\n"
+                f"Жалоб на пользователя: {payload['report_count']}\n"
+                f"Статус: {payload['status']}"
+            )
+            recipients = [payload["admin_telegram_id"]] if payload.get("admin_telegram_id") else sorted(ADMIN_TELEGRAM_IDS)
+            for telegram_id in recipients:
+                if telegram_id not in ADMIN_TELEGRAM_IDS:
+                    continue
+                telegram_api("sendMessage", {
+                    "chat_id": telegram_id,
+                    "text": message,
+                    "reply_markup": {"inline_keyboard": [[{
+                        "text": "Открыть жалобу",
+                        "url": f"{PUBLIC_URL}/admin?report={payload['report_id']}",
+                    }]]},
+                })
+            row.status = "sent"
+            row.delivered_at = utcnow()
+            row.last_error = None
+        except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+            row.status = "failed"
+            row.last_error = type(error).__name__[:180]
+            row.next_attempt_at = utcnow() + timedelta(seconds=min(3600, 2 ** min(row.attempts, 10)))
+            app.logger.warning("Admin report notification delivery failed for outbox %s", row.id)
+    db.session.commit()
+    return len(rows)
+
+
+def notification_outbox_loop():
+    while True:
+        time.sleep(5)
+        try:
+            configure_telegram_bot()
+            with app.app_context():
+                process_notification_outbox()
+                process_user_telegram_outbox()
+                worker_progress("outbox")
+        except Exception:
+            record_runtime_error("background_errors")
+            app.logger.exception("Notification outbox worker failed")
+
+
+def lock_user_actions(user_ids):
+    if engine.dialect.name == "postgresql":
+        for user_id in sorted(set(user_ids)):
+            db.session.execute(sql_text("SELECT pg_advisory_xact_lock(:user_id)"), {"user_id": int(user_id)})
+
+
+def active_confirmed_meeting_ids(user_id, exclude_meeting_id=None):
+    candidate_ids = {
+        row.id for row in Meeting.query.filter_by(owner_id=user_id).all()
+        if Interest.query.filter_by(meeting_id=row.id, status="accepted").first()
+    }
+    candidate_ids.update(
+        row.meeting_id for row in Interest.query.filter_by(user_id=user_id, status="accepted").all()
+    )
+    result = set()
+    for meeting_id in candidate_ids:
+        if meeting_id == exclude_meeting_id:
+            continue
+        meeting = db.session.get(Meeting, meeting_id)
+        if meeting and effective_meeting_status(meeting) == "active":
+            result.add(meeting_id)
+    return result
+
+
 def emit_realtime(user_ids, kind="changed", meeting_id=None):
     """Wake connected clients after the database transaction is committed."""
     payload = {"kind": kind, "meeting_id": meeting_id, "at": int(time.time())}
@@ -432,6 +811,22 @@ def current_user():
     return db.session.get(User, user_id) if user_id else None
 
 
+def completed_profile(user):
+    return bool(user and (ALLOW_TEST_AUTH and user.telegram_id.startswith("test-") or (
+        UserProfile.query.filter_by(user_id=user.id).first()
+        and ProfileSelfie.query.filter_by(user_id=user.id).first()
+    )))
+
+
+def profile_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not completed_profile(current_user()):
+            return jsonify(error="Сначала заполните профиль"), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -444,6 +839,8 @@ def login_required(view):
 @app.get("/api/events")
 @login_required
 def realtime_events():
+    if not ENABLE_SSE:
+        return jsonify(error="SSE отключён; используйте /api/sync-state"), 404
     user_id = current_user().id
 
     @stream_with_context
@@ -471,7 +868,8 @@ def realtime_events():
 
 
 def json_body():
-    return request.get_json(silent=True) or {}
+    value = request.get_json(silent=True)
+    return value if isinstance(value, dict) else {}
 
 
 def clean_tracking_value(value, fallback, max_length):
@@ -504,8 +902,11 @@ def invite_account(user_id):
 
 
 def claim_invitation(user, token):
-    token = str(token or "").removeprefix("invite_")[:40]
-    invitation = Invitation.query.filter_by(token=token, status="created").first()
+    token = str(token or "").removeprefix("invite_")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16}", token):
+        return False
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
+    invitation = Invitation.query.filter_by(token=token, status="created").with_for_update().first()
     if not invitation or invitation.inviter_id == user.id:
         return False
     if Invitation.query.filter_by(claimed_by=user.id).first():
@@ -575,7 +976,11 @@ def chat_expired(meeting):
 def chat_closed_for(meeting, user_id):
     if MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user_id).first():
         return True
-    if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=user_id).first():
+    if UserReport.query.filter(
+        UserReport.meeting_id == meeting.id,
+        UserReport.reporter_id == user_id,
+        UserReport.category != "no_show_dispute",
+    ).first():
         return True
     if MeetingEvent.query.filter_by(
             meeting_id=meeting.id, user_id=user_id, kind="leave"
@@ -632,6 +1037,7 @@ def purge_meeting_notifications(meeting, user_ids=None):
         UserNotification.created_at >= meeting.created_at,
         UserNotification.kind != "presence_reminder",
         UserNotification.kind != "thanks",
+        ~UserNotification.kind.startswith("task_"),
     ).all()
     removed = 0
     for notice in notices:
@@ -653,8 +1059,10 @@ def closed_at_for(meeting, user_id):
     ).first()
     if feedback:
         return normalize_dt(feedback.created_at)
-    report = UserReport.query.filter_by(
-        meeting_id=meeting.id, reporter_id=user_id
+    report = UserReport.query.filter(
+        UserReport.meeting_id == meeting.id,
+        UserReport.reporter_id == user_id,
+        UserReport.category != "no_show_dispute",
     ).first()
     if report:
         return normalize_dt(report.created_at)
@@ -749,6 +1157,15 @@ def trust_payload(user_id):
             target_user_id=event.user_id,
             kind="no_show_disputed",
         ).first()
+        if disputed:
+            dispute_report = UserReport.query.filter_by(
+                meeting_id=event.meeting_id,
+                reporter_id=user_id,
+                target_id=event.user_id,
+                category="no_show_dispute",
+            ).first()
+            if dispute_report and dispute_report.status == "dismissed":
+                disputed = None
         if not disputed and normalize_dt(event.created_at) <= dispute_window:
             no_shows += 1
 
@@ -807,21 +1224,47 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    a = min(1.0, max(0.0, a))
     return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def safe_point(lat, lon, identifier):
-    digest = hashlib.sha256(f"{app.secret_key}|{identifier}".encode()).digest()
-    lat_offset = ((digest[0] / 255) - 0.5) * 0.005
-    lon_offset = ((digest[1] / 255) - 0.5) * 0.008
-    if abs(lat_offset) < 0.0005:
-        lat_offset = 0.0005 if lat_offset >= 0 else -0.0005
-    if abs(lon_offset) < 0.0008:
-        lon_offset = 0.0008 if lon_offset >= 0 else -0.0008
-    return round(lat + lat_offset, 4), round(lon + lon_offset, 4)
+def approximate_zone(latitude, longitude):
+    return round(round(latitude / 0.01) * 0.01, 2), round(round(longitude / 0.015) * 0.015, 3)
 
 
-def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
+def distance_band(distance):
+    for limit, label in ((1, "до 1 км"), (3, "1–3 км"), (5, "3–5 км"),
+                         (10, "5–10 км"), (12, "10–12 км")):
+        if distance <= limit:
+            return limit, label
+    return 12, "более 12 км"
+
+
+def media_payload(media):
+    return decrypt_selfie(media.public_image) if media and media.public_image else None
+
+
+def valid_photo(value):
+    if not isinstance(value, str) or len(value) > 700_000:
+        return False
+    header, _, payload = value.partition(",")
+    signatures = {
+        "data:image/jpeg;base64": b"\xff\xd8\xff",
+        "data:image/png;base64": b"\x89PNG\r\n\x1a\n",
+        "data:image/webp;base64": b"RIFF",
+    }
+    if header not in signatures:
+        return False
+    try:
+        decoded = base64.b64decode(payload, validate=True)
+    except ValueError:
+        return False
+    return decoded.startswith(signatures[header]) and (
+        header != "data:image/webp;base64" or decoded[8:12] == b"WEBP"
+    )
+
+
+def notify_user(user_id, text, kind="info", dedupe_key=None):
     persistent = kind in {"presence_reminder", "meeting_confirmation"}
     if persistent:
         if dedupe_key and UserNotification.query.filter_by(dedupe_key=dedupe_key).first():
@@ -829,25 +1272,10 @@ def notify_user(user_id, text, kind="info", dedupe_key=None, telegram=False):
         db.session.add(UserNotification(
             user_id=user_id, kind=kind, text=str(text)[:300], dedupe_key=dedupe_key,
         ))
-        db.session.commit()
-    if not telegram or not BOT_TOKEN:
-        return True
-    user = db.session.get(User, user_id)
-    if not user or not user.telegram_id or user.telegram_id.startswith("test-"):
-        return True
-    telegram_id = user.telegram_id
-
-    def deliver():
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": telegram_id, "text": text},
-                timeout=5,
-            ).raise_for_status()
-        except requests.RequestException:
-            app.logger.warning("Telegram notification failed for user %s", user_id)
-
-    threading.Thread(target=deliver, daemon=True).start()
+        bump_sync(user_ids={user_id}, notification_ids={user_id})
+    if BOT_TOKEN:
+        queue_user_telegram(user_id, kind, dedupe_key)
+    db.session.commit()
     return True
 
 
@@ -855,13 +1283,11 @@ def process_presence_reminders():
     threshold = utcnow() - timedelta(hours=1)
     active = Presence.query.filter(Presence.active_until > utcnow(), Presence.updated_at <= threshold).all()
     for presence in active:
-        started = normalize_dt(presence.updated_at).replace(microsecond=0).isoformat()
         notify_user(
             presence.user_id,
             "Вы всё ещё открыты для общения. Оставить статус включённым или выключить его в приложении?",
             kind="presence_reminder",
-            dedupe_key=f"presence-reminder:{presence.id}:{started}",
-            telegram=True,
+            dedupe_key=presence_reminder_key(presence),
         )
 
 
@@ -871,12 +1297,19 @@ def presence_reminder_loop():
         try:
             with app.app_context():
                 process_presence_reminders()
+                process_company_watches()
+                expire_tasks()
+                expire_task_materials()
+                expire_launch_data()
+                worker_progress("maintenance")
         except Exception:
+            record_runtime_error("background_errors")
             app.logger.exception("Presence reminder worker failed")
 
 
 TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(f"{app.secret_key}|telegram-webhook".encode()).hexdigest()[:48]
 telegram_bot_configured = False
+telegram_setup_attempt = float("-inf")
 
 
 def telegram_api(method, payload):
@@ -888,10 +1321,11 @@ def telegram_api(method, payload):
 
 
 def configure_telegram_bot():
-    global telegram_bot_configured
-    if telegram_bot_configured or not BOT_TOKEN or app.testing:
+    global telegram_bot_configured, telegram_setup_attempt
+    now = time.monotonic()
+    if telegram_bot_configured or not BOT_TOKEN or app.testing or now - telegram_setup_attempt < 60:
         return
-    telegram_bot_configured = True
+    telegram_setup_attempt = now
     try:
         telegram_api("setWebhook", {
             "url": f"{PUBLIC_URL}/telegram/webhook",
@@ -904,14 +1338,52 @@ def configure_telegram_bot():
         telegram_api("setChatMenuButton", {"menu_button": {
             "type": "web_app", "text": "Открыть «Сейчас»", "web_app": {"url": PUBLIC_URL},
         }})
-    except requests.RequestException:
+        telegram_bot_configured = True
+    except (requests.RequestException, ValueError):
         telegram_bot_configured = False
-        app.logger.exception("Telegram bot setup failed")
+        app.logger.warning("Telegram bot setup failed")
 
 
 @app.before_request
-def ensure_telegram_bot_configured():
-    configure_telegram_bot()
+def assign_request_id():
+    supplied = str(request.headers.get("X-Request-ID") or "").strip()
+    g.request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", supplied) else uuid.uuid4().hex
+    g.request_started_at = time.perf_counter()
+
+
+PUBLIC_RATE_LIMITS = {"/auth/handoff": 8, "/auth/telegram-mini-app": 20,
+                      "/auth/telegram/start": 20, "/auth/device": 40, "/api/traffic": 120, "/api/profile": 30}
+RUNTIME_ERRORS = {"http_5xx": 0, "background_errors": 0}
+RUNTIME_ERRORS_LOCK = threading.Lock()
+WORKER_PROGRESS = {}
+WORKER_STARTED = time.monotonic()
+
+
+@app.before_request
+def limit_public_requests():
+    limit = PUBLIC_RATE_LIMITS.get(request.path)
+    if not limit or ALLOW_TEST_AUTH:
+        return None
+    window = int(time.time()) // 60
+    key = hmac.new(app.secret_key.encode(), f"{request.remote_addr}|{request.path}".encode(), hashlib.sha256).hexdigest()
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    statement = insert(PublicRateBucket).values(key=key, window=window, count=1)
+    statement = statement.on_conflict_do_update(index_elements=["key"], set_={
+        "window": window,
+        "count": case((PublicRateBucket.window == window, PublicRateBucket.count + 1), else_=1),
+    }).returning(PublicRateBucket.count)
+    count = db.session.execute(statement).scalar_one()
+    db.session.commit()
+    if count > limit:
+        return jsonify(error="Слишком много запросов. Повторите позже"), 429, {"Retry-After": "60"}
+    return None
+
+
+@app.before_request
+def reject_cross_site_mutations():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.headers.get("Sec-Fetch-Site") == "cross-site":
+        if request.path.startswith("/api/"):
+            return jsonify(error="Запрос из другого сайта отклонён"), 403
 
 
 def upsert_telegram_user(data):
@@ -994,13 +1466,66 @@ def base64url_sha256(value):
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def record_runtime_error(kind):
+    with RUNTIME_ERRORS_LOCK:
+        RUNTIME_ERRORS[kind] += 1
+
+
 @app.after_request
 def security_headers(response):
+    if response.status_code >= 500:
+        record_runtime_error("http_5xx")
+    request_id = getattr(g, "request_id", uuid.uuid4().hex)
+    duration_ms = round((time.perf_counter() - getattr(g, "request_started_at", time.perf_counter())) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.path not in {"/about", "/sitemap.xml", "/robots.txt"}:
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "script-src 'self' 'unsafe-inline' https://telegram.org https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+        "img-src 'self' data: https://*.tile.openstreetmap.org; "
+        "connect-src 'self' https://nominatim.openstreetmap.org;"
+    )
+    response.headers["Permissions-Policy"] = "camera=(self), geolocation=(self), microphone=()"
+    if PUBLIC_URL.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    app.logger.info(
+        "request_complete",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url_rule.rule if request.url_rule else "<unmatched>",
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
     return response
+
+
+def worker_progress(name):
+    with RUNTIME_ERRORS_LOCK:
+        WORKER_PROGRESS[name] = time.monotonic()
+
+
+@app.get("/ready")
+def readiness():
+    db.session.execute(db.select(db.literal(1)))
+    if not IS_PRODUCTION:
+        return jsonify(ok=True, version=APP_VERSION)
+    now = time.monotonic()
+    with RUNTIME_ERRORS_LOCK:
+        stale = [name for name in ("maintenance", "outbox")
+                 if now - WORKER_PROGRESS.get(name, WORKER_STARTED) > 240]
+    if BOT_TOKEN and not telegram_bot_configured and now - WORKER_STARTED > 60:
+        stale.append("telegram_setup")
+    if stale:
+        return jsonify(ok=False, version=APP_VERSION, stale_workers=stale), 503
+    return jsonify(ok=True, version=APP_VERSION)
 
 
 @app.get("/health")
@@ -1023,14 +1548,19 @@ def api_session():
     user = current_user()
     profile = UserProfile.query.filter_by(user_id=user.id).first() if user else None
     selfie = ProfileSelfie.query.filter_by(user_id=user.id).first() if user else None
+    if user and user.telegram_id not in ADMIN_TELEGRAM_IDS:
+        record_daily_activity(user)
     return jsonify(
         authenticated=bool(user),
         telegram_configured=bool(BOT_TOKEN or oidc_configured()),
         mini_app_configured=bool(BOT_TOKEN),
         oidc_configured=oidc_configured(),
         test_auth_enabled=ALLOW_TEST_AUTH,
+        sse_enabled=ENABLE_SSE,
         is_admin=bool(user and user.telegram_id in ADMIN_TELEGRAM_IDS),
         profile_completed=bool(profile and selfie),
+        private_tasks_enabled=bool(private_task_access()),
+        modules=launch_modules(),
         user={
             "id": user.id,
             "name": user.name,
@@ -1038,6 +1568,28 @@ def api_session():
             "picture": user.picture,
             "trust": trust_payload(user.id),
         } if user else None,
+    )
+
+
+@app.get("/api/sync-state")
+@login_required
+def sync_state():
+    user = current_user()
+    room_id = request.args.get("room_id", type=int)
+    room_revision = 0
+    if room_id:
+        meeting = db.session.get(Meeting, room_id)
+        if not meeting or not meeting_member(meeting, user):
+            return jsonify(error="Нет доступа к встрече"), 403
+        room_revision = revision_value(f"room:{room_id}")
+    return jsonify(
+        feed=revision_value("feed"),
+        user=revision_value(f"user:{user.id}"),
+        notifications=revision_value(f"notifications:{user.id}"),
+        room=room_revision,
+        room_id=room_id,
+        private_tasks_enabled=bool(private_task_user(user)),
+        modules=launch_modules(),
     )
 
 
@@ -1050,8 +1602,9 @@ def track_traffic_visit():
     source = clean_tracking_value(data.get("source"), "direct", 60)
     medium = clean_tracking_value(data.get("medium"), "none", 40)
     campaign = clean_tracking_value(data.get("campaign"), "public_beta", 80)
-    landing_path = str(data.get("landing_path") or "/").strip()[:120]
-    if not landing_path.startswith("/"):
+    record_acquisition(current_user(), source, medium, campaign)
+    landing_path = str(data.get("landing_path") or "/").strip()
+    if landing_path not in {"/", "/about"}:
         landing_path = "/"
     visitor_hash = hashlib.sha256(
         f"{app.secret_key}|traffic-v1|{visitor_id}".encode()
@@ -1060,6 +1613,7 @@ def track_traffic_visit():
     existing = TrafficVisit.query.filter(
         TrafficVisit.visitor_hash == visitor_hash,
         TrafficVisit.source == source,
+        TrafficVisit.medium == medium,
         TrafficVisit.campaign == campaign,
         TrafficVisit.created_at >= since,
     ).first()
@@ -1071,13 +1625,65 @@ def track_traffic_visit():
             campaign=campaign,
             landing_path=landing_path,
         ))
-        db.session.commit()
+    db.session.commit()
     return jsonify(ok=True, counted=not bool(existing))
+
+
+class ProfileMedia(db.Model):
+    __tablename__ = "profile_media_v2"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    public_kind = db.Column(db.String(20), nullable=False, default="neutral")
+    public_image = db.Column(db.Text)
+    real_photo = db.Column(db.Text)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class MeetingConfirmation(db.Model):
+    __tablename__ = "meeting_confirmation_v2"
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey("meeting.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    confirmed_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (UniqueConstraint("meeting_id", "user_id", name="uq_meeting_confirmation_v2"),)
+
+
+class GoodDeed(db.Model):
+    __tablename__ = "good_deed_v2"
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    title = db.Column(db.String(120), nullable=False)
+    direction = db.Column(db.String(40), nullable=False, default="community")
+    description = db.Column(db.String(500), nullable=False)
+    organizer_name = db.Column(db.String(120), nullable=False)
+    coordinator_name = db.Column(db.String(120), nullable=False)
+    area = db.Column(db.String(120), nullable=False)
+    starts_at = db.Column(db.DateTime(timezone=True), nullable=False, index=True)
+    duration_minutes = db.Column(db.Integer, nullable=False, default=120)
+    capacity = db.Column(db.Integer, nullable=False, default=10)
+    instructions = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    result_summary = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class GoodDeedParticipant(db.Model):
+    __tablename__ = "good_deed_participant_v2"
+    id = db.Column(db.Integer, primary_key=True)
+    deed_id = db.Column(db.Integer, db.ForeignKey("good_deed_v2.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default="joined", index=True)
+    hours = db.Column(db.Float, nullable=False, default=0)
+    thanks = db.Column(db.String(180))
+    joined_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    confirmed_at = db.Column(db.DateTime(timezone=True))
+    __table_args__ = (UniqueConstraint("deed_id", "user_id", name="uq_good_deed_participant_v2"),)
 
 
 def user_profile_payload(user):
     profile = UserProfile.query.filter_by(user_id=user.id).first()
     selfie = ProfileSelfie.query.filter_by(user_id=user.id).first()
+    media = ProfileMedia.query.filter_by(user_id=user.id).first()
     return {
         "completed": bool(profile and selfie), "name": user.name,
         "age": profile.age if profile else None,
@@ -1086,7 +1692,12 @@ def user_profile_payload(user):
         "about": selfie.about if selfie else "",
         "selfie_present": bool(selfie),
         "selfie_preview": decrypt_selfie(selfie.image) if selfie else None,
-        "selfie_visibility": selfie.visibility if selfie else "mutual",
+        "selfie_visibility": "hidden",
+        "verification_label": "Селфи добавлено" if selfie else None,
+        "public_image_kind": media.public_kind if media else "neutral",
+        "public_image_preview": media_payload(media),
+        "real_photo_present": bool(media and media.real_photo),
+        "real_photo_preview": decrypt_selfie(media.real_photo) if media and media.real_photo else None,
         "trust": trust_payload(user.id),
     }
 
@@ -1102,6 +1713,7 @@ def get_profile():
 def save_profile():
     user, data = current_user(), json_body()
     name = str(data.get("name", "")).strip()[:40]
+    city = str(data.get("city") or "").strip()[:80]
     try:
         age = int(data.get("age"))
     except (TypeError, ValueError):
@@ -1109,7 +1721,9 @@ def save_profile():
     gender = str(data.get("gender", ""))
     about = str(data.get("about", "")).strip()[:160]
     selfie_image = str(data.get("selfie", ""))
-    selfie_visibility = str(data.get("selfie_visibility", "mutual"))
+    public_kind = data.get("public_image_kind")
+    public_image = data.get("public_image")
+    real_photo = data.get("real_photo")
     if len(name) < 2:
         return jsonify(error="Укажите имя — не короче двух букв"), 400
     if not 18 <= age <= 100:
@@ -1118,31 +1732,62 @@ def save_profile():
         return jsonify(error="Выберите вариант в поле «Пол»"), 400
     if len(about) < 20:
         return jsonify(error="Напишите одну короткую фразу о себе — минимум 20 символов"), 400
-    if selfie_visibility not in {"mutual", "accepted", "hidden"}:
-        return jsonify(error="Выберите, кому можно показывать селфи"), 400
+    if public_kind not in (None, "neutral", "avatar", "real"):
+        return jsonify(error="Выберите тип публичного изображения"), 400
+    try:
+        if selfie_image:
+            selfie_image = sanitized_photo(selfie_image)
+        if public_image:
+            public_image = sanitized_photo(public_image)
+        if real_photo:
+            real_photo = sanitized_photo(real_photo)
+    except (ValueError, OSError, Image.DecompressionBombError):
+        return jsonify(error="Выберите корректное изображение JPEG, PNG или WebP"), 400
     if data.get("terms_accepted") is not True:
         return jsonify(error="Подтвердите правила безопасных встреч"), 400
     profile = UserProfile.query.filter_by(user_id=user.id).first()
     selfie = ProfileSelfie.query.filter_by(user_id=user.id).first()
-    if selfie_image:
-        if not selfie_image.startswith("data:image/jpeg;base64,") or len(selfie_image) > 700_000:
-            return jsonify(error="Не удалось обработать селфи. Сделайте новое фото"), 400
-    elif not selfie:
+    if not selfie_image and not selfie:
         return jsonify(error="Добавьте свежее селфи"), 400
+    media = ProfileMedia.query.filter_by(user_id=user.id).first()
+    if public_kind in ("avatar", "real") and not public_image and not (media and media.public_image):
+        return jsonify(error="Добавьте публичное изображение"), 400
+    if public_kind is not None or real_photo is not None:
+        if not media:
+            media = ProfileMedia(user_id=user.id)
+            db.session.add(media)
+        if public_kind:
+            media.public_kind = public_kind
+        if public_kind == "neutral":
+            media.public_image = None
+        elif public_image:
+            media.public_image = encrypt_selfie(public_image)
+        if real_photo is not None:
+            previous = decrypt_selfie(media.real_photo) if media.real_photo else None
+            if real_photo != previous:
+                media.real_photo = encrypt_selfie(real_photo) if real_photo else None
+                meeting_ids = [row.meeting_id for row in PhotoConsent.query.filter_by(user_id=user.id)]
+                if meeting_ids:
+                    PhotoConsent.query.filter(PhotoConsent.meeting_id.in_(meeting_ids)).delete(synchronize_session=False)
+                    for meeting in Meeting.query.filter(Meeting.id.in_(meeting_ids)):
+                        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
+        bump_sync(feed=True)
     if not profile:
-        profile = UserProfile(user_id=user.id, age=age, gender=gender, city="Минск")
+        profile = UserProfile(user_id=user.id, age=age, gender=gender, city=city or "Минск")
         db.session.add(profile)
     else:
         profile.age, profile.gender = age, gender
+        if city:
+            profile.city = city
         profile.terms_accepted_at = utcnow()
     if not selfie:
         selfie = ProfileSelfie(user_id=user.id, image=encrypt_selfie(selfie_image),
-                               visibility=selfie_visibility, about=about)
+                               visibility="hidden", about=about)
         db.session.add(selfie)
     else:
         if selfie_image:
             selfie.image = encrypt_selfie(selfie_image)
-        selfie.visibility, selfie.about = selfie_visibility, about
+        selfie.visibility, selfie.about = "hidden", about
     user.name = name
     db.session.commit()
     return jsonify(ok=True, profile=user_profile_payload(user))
@@ -1172,7 +1817,7 @@ def telegram_webhook():
                         "text": "Вход подтверждён. Вернитесь в установленное приложение «Сейчас».",
                     })
                 except (ValueError, requests.RequestException):
-                    app.logger.exception("Telegram code login failed")
+                    app.logger.warning("Telegram code login failed")
                 return jsonify(ok=True)
             try:
                 telegram_api("sendMessage", {
@@ -1180,7 +1825,7 @@ def telegram_webhook():
                     "text": "Код не найден или его время истекло. Получите новый код в приложении «Сейчас».",
                 })
             except requests.RequestException:
-                app.logger.exception("Telegram expired code reply failed")
+                app.logger.warning("Telegram expired code reply failed")
             return jsonify(ok=True)
         start_payload = ""
         if message_text.startswith("/start "):
@@ -1189,20 +1834,30 @@ def telegram_webhook():
         if start_payload.startswith(("login_", "invite_")):
             web_app_url = f"{PUBLIC_URL}/?handoff={quote(start_payload, safe='')}"
         try:
-            telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "Бот теперь используется только для безопасного входа и уведомлений приложения «Сейчас».",
-                "reply_markup": {"remove_keyboard": True},
-            })
-            telegram_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "Нажмите кнопку ниже, чтобы открыть приложение.",
-                "reply_markup": {"inline_keyboard": [[{
-                    "text": "Открыть «Сейчас»", "web_app": {"url": web_app_url},
-                }]]},
-            })
+            if message_text.startswith("/start"):
+                telegram_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "Откройте приложение «Сейчас» кнопкой ниже.",
+                    "reply_markup": {"inline_keyboard": [[{
+                        "text": "Открыть приложение", "web_app": {"url": web_app_url},
+                    }]]},
+                })
+            else:
+                sender = message.get("from") or {}
+                user = upsert_telegram_user(sender)
+                if consume_action(user.id, "bot_text_reply", 1, 60):
+                    db.session.commit()
+                    telegram_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": (
+                            "Бот не принимает сообщения. Для общения используйте приложение, "
+                            "для жалобы — кнопку «Пожаловаться» внутри встречи или профиля."
+                        ),
+                    })
+                else:
+                    db.session.rollback()
         except requests.RequestException:
-            app.logger.exception("Telegram webhook reply failed")
+            app.logger.warning("Telegram webhook reply failed")
     return jsonify(ok=True)
 
 
@@ -1349,12 +2004,40 @@ def delete_account():
         return jsonify(error="Подтвердите удаление аккаунта"), 400
 
     user_id = user.id
+    transaction_lock(User.query.filter_by(id=user_id), User.id)
+    delete_private_features(user_id)
+    owned_deeds = db.session.query(GoodDeed.id).filter_by(owner_id=user_id)
+    DeedCoordination.query.filter((DeedCoordination.coordinator_id == user_id)
+                                 | DeedCoordination.deed_id.in_(owned_deeds)).delete(synchronize_session=False)
+    OrganizerCoordinator.query.filter((OrganizerCoordinator.user_id == user_id)
+                                      | (OrganizerCoordinator.organizer_id == user_id)).delete(synchronize_session=False)
+    VerifiedOrganizer.query.filter_by(user_id=user_id).delete()
+    TaskWorkArea.query.filter_by(user_id=user_id).delete()
+    DailyActivity.query.filter_by(user_id=user_id).delete()
+    ProfileMedia.query.filter_by(user_id=user_id).delete()
+    MeetingConfirmation.query.filter_by(user_id=user_id).delete()
+    GoodDeedParticipant.query.filter_by(user_id=user_id).delete()
+    for deed in GoodDeed.query.filter_by(owner_id=user_id):
+        GoodDeedParticipant.query.filter_by(deed_id=deed.id).delete()
+        db.session.delete(deed)
+    OperationRecord.query.filter_by(user_id=user_id).delete()
+    ModerationAction.query.filter_by(moderator_id=user_id).delete()
+    UserReport.query.filter_by(moderator_id=user_id).update({"moderator_id": None})
     proposed_place_ids = [row[0] for row in db.session.query(MeetingPlace.id).filter_by(user_id=user_id).all()]
     if proposed_place_ids:
+        PlaceVote.query.filter(PlaceVote.place_id.in_(proposed_place_ids)).delete(synchronize_session=False)
         MeetingPlaceLocation.query.filter(
             MeetingPlaceLocation.place_id.in_(proposed_place_ids)).delete(synchronize_session=False)
     owned_meeting_ids = [row[0] for row in db.session.query(Meeting.id).filter_by(owner_id=user_id).all()]
+    removed_reports = UserReport.query.filter(
+        (UserReport.reporter_id == user_id) | (UserReport.target_id == user_id)
+        | UserReport.meeting_id.in_(owned_meeting_ids)
+    )
+    report_ids = [report.id for report in removed_reports]
+    if report_ids:
+        ModerationAction.query.filter(ModerationAction.report_id.in_(report_ids)).delete(synchronize_session=False)
     if owned_meeting_ids:
+        MeetingConfirmation.query.filter(MeetingConfirmation.meeting_id.in_(owned_meeting_ids)).delete(synchronize_session=False)
         owned_place_ids = [row[0] for row in db.session.query(MeetingPlace.id).filter(
             MeetingPlace.meeting_id.in_(owned_meeting_ids)
         ).all()]
@@ -1412,11 +2095,14 @@ def delete_account():
 @app.get("/api/feed")
 def feed():
     user = current_user()
+    if not user:
+        return jsonify(items=[], agreed_places=[], guest=True)
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     radius = min(max(request.args.get("radius", 3, type=float), 1), 12)
     category = request.args.get("category", "")
     time_mode = request.args.get("time", "now")
+    zone = submitted_time_zone(request.args.get("time_zone")) or APP_TIMEZONE
     now = utcnow()
     result = []
     agreed_places = []
@@ -1438,7 +2124,7 @@ def feed():
     if valid_coordinates(lat, lon):
         presences = Presence.query.filter(Presence.active_until > now).all()
         for presence in presences:
-            if time_mode == "hour":
+            if time_mode in {"hour", "today"}:
                 continue
             if user and presence.user_id == user.id:
                 continue
@@ -1448,23 +2134,25 @@ def feed():
                 continue
             if category in VALID_CATEGORIES and presence.category != category:
                 continue
-            distance = haversine_km(lat, lon, presence.latitude, presence.longitude)
+            point = approximate_zone(presence.latitude, presence.longitude)
+            distance = haversine_km(lat, lon, *point)
+            upper, band = distance_band(distance)
             if distance > radius:
                 continue
-            point = safe_point(presence.latitude, presence.longitude, f"p{presence.id}")
             profile = UserProfile.query.filter_by(user_id=presence.user_id).first()
             selfie = ProfileSelfie.query.filter_by(user_id=presence.user_id).first()
             trust = trust_payload(presence.user_id)
+            media = ProfileMedia.query.filter_by(user_id=presence.user_id).first()
             result.append({
                 "kind": "person", "id": presence.id, "icon": CATEGORY_ICONS[presence.category],
                 "_owner_id": presence.user_id,
                 "name": presence.user.name if user else "Участник рядом", "category": presence.category,
-                "description": "Открыт к общению", "distance_km": round(distance, 1),
+                "description": "Открыт к общению", "distance_km": upper, "distance_band": band, "zone_radius_m": 1050,
                 "latitude": point[0], "longitude": point[1], "expires_at": normalize_dt(presence.active_until).isoformat(),
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
                 "interested": presence.user_id in proposed_owner_ids,
-                "trust": trust,
+                "trust": trust, "public_image": media_payload(media),
             })
 
         meetings = Meeting.query.filter(Meeting.expires_at > now).order_by(Meeting.id.desc()).all()
@@ -1472,6 +2160,8 @@ def feed():
         if user:
             interested_ids = {i.meeting_id for i in Interest.query.filter_by(user_id=user.id).all()}
         for meeting in meetings:
+            if targeted_meeting(meeting):
+                continue
             if user and meeting.owner_id == user.id:
                 continue
             if effective_meeting_status(meeting) != "active":
@@ -1499,35 +2189,43 @@ def feed():
                 continue
             if time_mode == "hour" and (is_now or starts_at > now + timedelta(minutes=60)):
                 continue
+            if time_mode == "today" and not now + timedelta(minutes=60) < starts_at < end_of_app_day(now, zone):
+                continue
+            if meeting.category == "help" and meeting.description not in SAFE_HELP_GOALS and (
+                meeting.description != "Предложение встретиться · Помочь друг другу"
+            ):
+                continue
             if meeting.owner_id in blocked_ids:
                 continue
             if user_hidden(meeting.owner_id):
                 continue
             if category in VALID_CATEGORIES and meeting.category != category:
                 continue
-            distance = haversine_km(lat, lon, meeting.latitude, meeting.longitude)
+            point = approximate_zone(meeting.latitude, meeting.longitude)
+            distance = haversine_km(lat, lon, *point)
+            upper, band = distance_band(distance)
             if distance > radius:
                 continue
-            point = safe_point(meeting.latitude, meeting.longitude, f"m{meeting.id}")
             profile = UserProfile.query.filter_by(user_id=meeting.owner_id).first()
             selfie = ProfileSelfie.query.filter_by(user_id=meeting.owner_id).first()
             trust = trust_payload(meeting.owner_id)
+            media = ProfileMedia.query.filter_by(user_id=meeting.owner_id).first()
             result.append({
                 "kind": "meeting", "id": meeting.id, "icon": CATEGORY_ICONS[meeting.category],
                 "_owner_id": meeting.owner_id,
                 "name": meeting.owner.name if user else "Открытая встреча", "category": meeting.category,
-                "description": meeting.description, "format": meeting.format, "distance_km": round(distance, 1),
+                "description": meeting.description, "format": meeting.format, "distance_km": upper, "distance_band": band, "zone_radius_m": 1050,
                 "latitude": point[0], "longitude": point[1], "mine": bool(user and meeting.owner_id == user.id),
                 "interested": meeting.id in interested_ids, "expires_at": normalize_dt(meeting.expires_at).isoformat(),
-                "starts_at": starts_at.isoformat(), "time_mode": "now" if is_now else "hour",
+                "starts_at": starts_at.isoformat(), "time_mode": "now" if is_now else ("hour" if starts_at <= now + timedelta(hours=1) else "today"),
                 "starts_in_minutes": max(0, round((starts_at - now).total_seconds() / 60)),
                 "age": profile.age if profile else None, "gender": profile.gender if profile else None,
                 "about": selfie.about if selfie else "", "profile_verified": bool(profile and selfie),
-                "trust": trust,
+                "trust": trust, "public_image": media_payload(media),
             })
     if user:
         for meeting in Meeting.query.filter(Meeting.expires_at > now).all():
-            if not meeting_member(meeting, user):
+            if not meeting_member(meeting, user) or not meeting_contact_allowed(meeting, user.id):
                 continue
             state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
             if state and state.status != "active":
@@ -1535,7 +2233,7 @@ def feed():
             confirmed = MeetingPlace.query.filter_by(
                 meeting_id=meeting.id, confirmed=1
             ).order_by(MeetingPlace.id.desc()).first()
-            if not confirmed:
+            if not confirmed or not agreed_public_place(meeting, confirmed):
                 continue
             location = MeetingPlaceLocation.query.filter_by(place_id=confirmed.id).first()
             if not location:
@@ -1569,12 +2267,14 @@ def location():
     if not valid_coordinates(data.get("latitude"), data.get("longitude")):
         return jsonify(error="Некорректная геолокация"), 400
     user.latitude, user.longitude = float(data["latitude"]), float(data["longitude"])
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True)
 
 
 @app.post("/api/presence")
 @login_required
+@profile_required
 def set_presence():
     user = current_user()
     data = json_body()
@@ -1593,6 +2293,7 @@ def set_presence():
     presence.updated_at = utcnow()
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(presence)
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True, active_until=None,
                    reminder_due_at=(normalize_dt(presence.updated_at) + timedelta(hours=1)).isoformat())
@@ -1603,6 +2304,7 @@ def set_presence():
 def stop_presence():
     user = current_user()
     Presence.query.filter_by(user_id=user.id).delete()
+    bump_sync(feed=True, user_ids={user.id})
     db.session.commit()
     return jsonify(ok=True)
 
@@ -1648,6 +2350,14 @@ def list_notifications():
     active_items = []
     for item in items:
         keep = item.kind == "presence_reminder" and presence_active
+        keep = keep or item.kind == "moderation_warning"
+        if item.kind.startswith("task_"):
+            keep = bool(private_task_user(user) and task_alert_enabled(user.id, item.kind.removeprefix("task_"))
+                        and normalize_dt(item.created_at) > now - timedelta(days=30))
+            if keep and item.kind == "task_match":
+                task_id = item.dedupe_key.split(":")[1]
+                task = db.session.get(PrivateTask, int(task_id))
+                keep = bool(task and task_match_available(task, user.id))
         if item.kind == "meeting_confirmation" and item.dedupe_key:
             try:
                 meeting_id = int(item.dedupe_key.split(":")[1])
@@ -1668,13 +2378,14 @@ def list_notifications():
             db.session.delete(item)
     db.session.commit()
     active_items = active_items[:10]
+    unread_items = [item for item in active_items if item.read_at is None]
     return jsonify(
-        unread=len(active_items),
+        unread=len(unread_items),
         items=[{
             "id": item.id,
             "kind": item.kind,
             "text": item.text,
-            "read": False,
+            "read": item.read_at is not None,
             "created_at": normalize_dt(item.created_at).isoformat(),
         } for item in active_items],
     )
@@ -1683,17 +2394,25 @@ def list_notifications():
 @app.post("/api/notifications/read")
 @login_required
 def read_notifications():
-    UserNotification.query.filter_by(user_id=current_user().id, read_at=None).update(
+    user_id = current_user().id
+    UserNotification.query.filter_by(user_id=user_id, read_at=None).update(
         {"read_at": utcnow()}, synchronize_session=False)
+    bump_sync(user_ids={user_id}, notification_ids={user_id})
     db.session.commit()
     return jsonify(ok=True)
 
 
 @app.post("/api/meetings")
 @login_required
+@profile_required
 def create_meeting():
     user = current_user()
     data = json_body()
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
     category = data.get("category")
     description = str(data.get("description", "")).strip()[:180]
     meeting_format = data.get("format", "one")
@@ -1705,18 +2424,35 @@ def create_meeting():
     lat, lon = data.get("latitude", user.latitude), data.get("longitude", user.longitude)
     if category not in VALID_CATEGORIES or not description:
         return jsonify(error="Выберите занятие и цель встречи"), 400
+    if category == "help" and description not in SAFE_HELP_GOALS:
+        return jsonify(error="Выберите дистанционную помощь или помощь в публичном месте"), 400
     if meeting_format not in {"one", "group"}:
         return jsonify(error="Некорректный формат встречи"), 400
-    if time_mode not in {"now", "hour"}:
+    if time_mode not in {"now", "hour", "today"}:
         return jsonify(error="Некорректное время встречи"), 400
-    if starts_in_minutes not in {0, 15, 30, 45, 60}:
-        return jsonify(error="Выберите время от 15 минут до часа"), 400
+    zone = submitted_time_zone(data.get("time_zone"))
+    if zone is None:
+        return jsonify(error="Некорректный часовой пояс"), 400
+    now = utcnow()
+    starts_at = now + timedelta(minutes=starts_in_minutes) if 0 <= starts_in_minutes <= 1440 else None
+    if not starts_at or (starts_in_minutes and starts_at >= end_of_app_day(now, zone)):
+        return jsonify(error="Выберите время до конца текущего дня"), 400
+    if time_mode == "hour" and starts_in_minutes not in {15, 30, 45, 60}:
+        return jsonify(error="Выберите время в пределах часа"), 400
     if time_mode == "now" and starts_in_minutes != 0:
         return jsonify(error="Для встречи прямо сейчас время должно быть нулевым"), 400
-    if time_mode == "hour" and starts_in_minutes == 0:
+    if time_mode != "now" and starts_in_minutes == 0:
         return jsonify(error="Выберите время встречи"), 400
     if not valid_coordinates(lat, lon):
         return jsonify(error="Разрешите геолокацию для создания встречи"), 400
+    lock_user_actions({user.id})
+    if replay := replay_operation(user, operation_id):
+        return replay
+    if active_confirmed_meeting_ids(user.id):
+        return jsonify(
+            error="Сначала завершите текущую подтверждённую встречу",
+            code="ACTIVE_MEETING_CONFLICT",
+        ), 409
     active_owned = Meeting.query.filter(Meeting.owner_id == user.id, Meeting.expires_at > utcnow()).all()
     for previous in active_owned:
         if Interest.query.filter_by(meeting_id=previous.id, status="accepted").first():
@@ -1732,7 +2468,6 @@ def create_meeting():
     if not consume_action(user.id, "meeting", 5, 3600):
         db.session.rollback()
         return jsonify(error="Слишком много встреч за час. Попробуйте позже"), 429
-    starts_at = utcnow() + timedelta(minutes=starts_in_minutes)
     meeting = Meeting(
         owner_id=user.id, category=category, description=description, format=meeting_format,
         latitude=float(lat), longitude=float(lon), starts_at=starts_at,
@@ -1740,12 +2475,95 @@ def create_meeting():
     )
     user.latitude, user.longitude = float(lat), float(lon)
     db.session.add(meeting)
+    db.session.flush()
+    payload = {"ok": True, "id": meeting.id}
+    bump_sync(feed=True, user_ids={user.id}, meeting_ids={meeting.id})
+    remember_operation(user, operation_id, payload, 201)
     db.session.commit()
-    return jsonify(ok=True, id=meeting.id), 201
+    return jsonify(payload), 201
+
+
+def past_meeting_membership(user_id, old_meeting_id):
+    previous = db.session.get(Meeting, old_meeting_id)
+    if not previous or effective_meeting_status(previous) != "completed":
+        return set()
+    members = accepted_user_ids(previous)
+    return members if user_id in members else set()
+
+
+@app.get("/api/meetings/previous-contacts")
+@login_required
+def previous_meeting_contacts():
+    user = current_user()
+    participations = db.session.query(Interest.meeting_id).filter_by(user_id=user.id, status="accepted")
+    meetings = Meeting.query.join(MeetingState).filter(
+        MeetingState.status == "completed",
+        (Meeting.owner_id == user.id) | Meeting.id.in_(participations)
+    ).order_by(Meeting.starts_at.desc()).limit(30)
+    contacts = {}
+    for meeting in meetings:
+        for peer_id in past_meeting_membership(user.id, meeting.id) - {user.id}:
+            if peer_id not in contacts and meeting_peer_available(user.id, peer_id):
+                peer = db.session.get(User, peer_id)
+                if peer:
+                    contacts[peer_id] = {"user_id": peer.id, "name": peer.name, "meeting_id": meeting.id}
+    return jsonify(items=list(contacts.values()))
+
+
+def meeting_peer_available(user_id, peer_id):
+    return not user_hidden(peer_id) and not UserBlock.query.filter(
+        ((UserBlock.blocker_id == user_id) & (UserBlock.blocked_id == peer_id))
+        | ((UserBlock.blocker_id == peer_id) & (UserBlock.blocked_id == user_id))
+    ).first()
+
+
+def meeting_contact_allowed(meeting, user_id, members=None):
+    members = accepted_user_ids(meeting) if members is None else members
+    return not user_hidden(user_id) and all(meeting_peer_available(user_id, peer_id)
+                                            for peer_id in members - {user_id})
+
+
+@app.post("/api/meetings/<int:meeting_id>/repeat")
+@login_required
+@profile_required
+def repeat_meeting(meeting_id):
+    user = current_user()
+    peer_id = json_body().get("user_id")
+    if type(peer_id) is not int or peer_id == user.id or peer_id not in past_meeting_membership(user.id, meeting_id):
+        abort(404)
+    if not meeting_peer_available(user.id, peer_id):
+        return jsonify(error="Повторное приглашение недоступно"), 403
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
+    label = "Повторная встреча · предложение"
+    existing = Interest.query.join(Meeting).filter(
+        Interest.user_id == user.id, Meeting.owner_id == peer_id,
+        Meeting.description == label, Meeting.expires_at > utcnow()
+    ).first()
+    if existing:
+        return jsonify(ok=True, meeting_id=existing.meeting_id)
+    if not consume_action(user.id, "repeat_meeting", 3, 3600):
+        return jsonify(error="Слишком много приглашений за час"), 429
+    now = utcnow()
+    meeting = Meeting(owner_id=peer_id, category="talk", description=label, format="one",
+                      latitude=0, longitude=0, starts_at=now, expires_at=now+timedelta(hours=1))
+    db.session.add(meeting)
+    db.session.flush()
+    db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+    bump_sync(user_ids={peer_id, user.id}, meeting_ids={meeting.id}, notification_ids={peer_id})
+    db.session.commit()
+    emit_realtime({peer_id, user.id}, "interest", meeting.id)
+    notify_user(peer_id, "Вас приглашают на повторную встречу", kind="repeat_meeting",
+                dedupe_key=f"repeat:{meeting.id}")
+    return jsonify(ok=True, meeting_id=meeting.id), 201
+
+
+def targeted_meeting(meeting):
+    return meeting.description.startswith(("Предложение встретиться · ", "Повторная встреча · "))
 
 
 @app.post("/api/presences/<int:presence_id>/interest")
 @login_required
+@profile_required
 def propose_meeting_to_presence(presence_id):
     user = current_user()
     presence = db.get_or_404(Presence, presence_id)
@@ -1774,21 +2592,25 @@ def propose_meeting_to_presence(presence_id):
     db.session.add(meeting)
     db.session.flush()
     db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+    bump_sync(user_ids={presence.user_id, user.id}, meeting_ids={meeting.id},
+              notification_ids={presence.user_id})
     db.session.commit()
     emit_realtime({presence.user_id, user.id}, "interest", meeting.id)
     notify_user(
         presence.user_id,
         f"{user.name} предлагает встретиться: {CATEGORY_MEETING_TITLES[presence.category]}",
-        telegram=True,
     )
     return jsonify(ok=True, meeting_id=meeting.id, already_sent=False), 201
 
 
 @app.post("/api/meetings/<int:meeting_id>/interest")
 @login_required
+@profile_required
 def express_interest(meeting_id):
     user = current_user()
     meeting = db.get_or_404(Meeting, meeting_id)
+    if targeted_meeting(meeting):
+        abort(404)
     if normalize_dt(meeting.expires_at) <= utcnow():
         return jsonify(error="Эта встреча уже завершена"), 409
     if not consume_action(user.id, "interest", 12, 3600):
@@ -1806,12 +2628,13 @@ def express_interest(meeting_id):
     interest = Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not interest:
         db.session.add(Interest(meeting_id=meeting.id, user_id=user.id))
+        bump_sync(user_ids={meeting.owner_id, user.id}, meeting_ids={meeting.id},
+                  notification_ids={meeting.owner_id})
         db.session.commit()
         emit_realtime({meeting.owner_id, user.id}, "interest", meeting.id)
         notify_user(
             meeting.owner_id,
             f"Новый отклик на встречу «{meeting.description}» от {user.name}",
-            telegram=True,
         )
     return jsonify(ok=True)
 
@@ -1873,7 +2696,7 @@ def meeting_list_summary(meeting, viewer):
         "meeting_status": effective_meeting_status(meeting),
         "my_completion_confirmed": my_completion_confirmed,
         "needs_feedback": my_completion_confirmed and feedback_rating(my_feedback) is None,
-        "confirmed_place": confirmed_place.title if confirmed_place else None,
+        "confirmed_place": confirmed_place.title if confirmed_place and meeting_contact_allowed(meeting, viewer.id) else None,
         "latest_message": {
             "id": latest.id,
             "name": db.session.get(User, latest.user_id).name,
@@ -1950,25 +2773,50 @@ def list_interests():
 @login_required
 def decide_interest(interest_id):
     user = current_user()
-    interest = db.get_or_404(Interest, interest_id)
-    meeting = db.session.get(Meeting, interest.meeting_id)
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
+    interest = Interest.query.filter_by(id=interest_id).with_for_update().first()
+    if not interest:
+        abort(404)
+    meeting = Meeting.query.filter_by(id=interest.meeting_id).with_for_update().first()
     if meeting.owner_id != user.id:
         return jsonify(error="Решение принимает создатель встречи"), 403
+    lock_user_actions({meeting.owner_id, interest.user_id})
+    if replay := replay_operation(user, operation_id):
+        return replay
     if interest.status != "pending":
         return jsonify(error="По этому отклику решение уже принято"), 409
     decision = json_body().get("decision")
     if decision not in {"accepted", "rejected"}:
         return jsonify(error="Выберите принять или отклонить"), 400
+    if normalize_dt(meeting.expires_at) <= utcnow() or effective_meeting_status(meeting) != "active":
+        return jsonify(error="Встреча уже недоступна", code="MEETING_NOT_ACTIVE"), 409
+    if decision == "accepted":
+        if not meeting_peer_available(meeting.owner_id, interest.user_id):
+            return jsonify(error="Участие больше недоступно"), 403
+        conflicting_users = [
+            member_id for member_id in (meeting.owner_id, interest.user_id)
+            if active_confirmed_meeting_ids(member_id, exclude_meeting_id=meeting.id)
+        ]
+        if conflicting_users:
+            return jsonify(
+                error="Участник уже находится в другой активной встрече",
+                code="ACTIVE_MEETING_CONFLICT",
+            ), 409
+        accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
+        if meeting.format == "one" and accepted_count:
+            return jsonify(error="Личная встреча уже занята", code="MEETING_CAPACITY_REACHED"), 409
+        if meeting.format == "group" and accepted_count >= 5:
+            return jsonify(error="Группа уже набрана", code="MEETING_CAPACITY_REACHED"), 409
     interest.status = decision
     if decision == "accepted" and meeting.format == "one":
         (Interest.query.filter_by(meeting_id=meeting.id, status="pending")
          .filter(Interest.id != interest.id).update({"status": "rejected"}, synchronize_session=False))
-    if decision == "accepted" and meeting.format == "group":
-        accepted_count = Interest.query.filter_by(meeting_id=meeting.id, status="accepted").count()
-        if accepted_count > 5:
-            db.session.rollback()
-            return jsonify(error="В группе может быть не больше 6 человек вместе с создателем"), 409
     if decision == "accepted":
+        clear_meeting_consents(meeting.id)
         state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
         if not state:
             db.session.add(MeetingState(meeting_id=meeting.id, status="active"))
@@ -1976,21 +2824,31 @@ def decide_interest(interest_id):
         Presence.query.filter(Presence.user_id.in_(member_ids)).update(
             {"active_until": utcnow()}, synchronize_session=False
         )
+    db.session.flush()
+    payload = {"ok": True, "interest": interest_payload(interest, user)}
+    bump_sync(feed=decision == "accepted",
+              user_ids={meeting.owner_id, interest.user_id}, meeting_ids={meeting.id},
+              notification_ids={interest.user_id})
+    remember_operation(user, operation_id, payload, 200)
     db.session.commit()
     emit_realtime({meeting.owner_id, interest.user_id}, f"interest_{decision}", meeting.id)
     result_text = "принят" if decision == "accepted" else "отклонён"
     notify_user(
         interest.user_id,
         f"Ваш отклик на встречу «{meeting.description}» {result_text}",
-        telegram=True,
     )
-    return jsonify(ok=True, interest=interest_payload(interest, user))
+    return jsonify(payload)
 
 
 def meeting_member(meeting, user):
     if meeting.owner_id == user.id:
         return True
     return Interest.query.filter_by(meeting_id=meeting.id, user_id=user.id, status="accepted").first() is not None
+
+
+def clear_meeting_consents(meeting_id):
+    PhotoConsent.query.filter_by(meeting_id=meeting_id).delete()
+    MeetingConfirmation.query.filter_by(meeting_id=meeting_id).delete()
 
 
 def meeting_room_or_error(meeting_id):
@@ -2023,9 +2881,12 @@ def room_payload(meeting, user):
     my_completion_confirmed = MeetingEvent.query.filter_by(
         meeting_id=meeting.id, user_id=user.id, kind="complete"
     ).first() is not None
-    messages = [] if my_completion_confirmed else (
-        ChatMessage.query.filter_by(meeting_id=meeting.id).order_by(ChatMessage.id).limit(100).all()
-    )
+    messages = []
+    if not my_completion_confirmed:
+        messages = list(reversed(
+            ChatMessage.query.filter_by(meeting_id=meeting.id)
+            .order_by(ChatMessage.id.desc()).limit(100).all()
+        ))
     state = MeetingState.query.filter_by(meeting_id=meeting.id).first()
     raw_events = MeetingEvent.query.filter_by(meeting_id=meeting.id).order_by(MeetingEvent.id.desc()).all()
     event_keys, events = set(), []
@@ -2037,24 +2898,30 @@ def room_payload(meeting, user):
     events.reverse()
     thanks = MeetingThanks.query.filter_by(meeting_id=meeting.id).all()
     member_ids = accepted_user_ids(meeting)
+    contact_allowed = meeting_contact_allowed(meeting, user.id, member_ids)
     consented_ids = {row.user_id for row in PhotoConsent.query.filter_by(meeting_id=meeting.id).all()}
-    photos_revealed = bool(member_ids) and member_ids.issubset(consented_ids)
+    media_by_user = {row.user_id: row for row in ProfileMedia.query.filter(ProfileMedia.user_id.in_(member_ids))}
+    photos_revealed = contact_allowed and len(member_ids) >= 2 and member_ids.issubset(consented_ids) and all(
+        uid in media_by_user and media_by_user[uid].real_photo for uid in member_ids
+    )
+    confirmed_ids = {row.user_id for row in MeetingConfirmation.query.filter_by(meeting_id=meeting.id)}
     participant_payload = []
     for uid in member_ids:
         participant = db.session.get(User, uid)
         profile = UserProfile.query.filter_by(user_id=uid).first()
         selfie = ProfileSelfie.query.filter_by(user_id=uid).first()
-        visibility = selfie.visibility if selfie else "hidden"
-        photo_visible = bool(selfie and (
-            uid == user.id or visibility == "accepted" or (visibility == "mutual" and photos_revealed)
-        ))
+        media = media_by_user.get(uid)
+        picture = decrypt_selfie(media.real_photo) if media and media.real_photo and (
+            uid == user.id or photos_revealed
+        ) else None
         participant_payload.append({
             "id": uid, "name": participant.name, "mine": uid == user.id,
             "age": profile.age if profile else None,
             "gender": profile.gender if profile else None,
             "about": selfie.about if selfie else "",
-            "picture": decrypt_selfie(selfie.image) if photo_visible else None,
-            "photo_visible": photo_visible, "photo_visibility": visibility,
+            "picture": picture, "public_picture": media_payload(media) if contact_allowed or uid == user.id else None,
+            "photo_visible": bool(picture), "photo_visibility": "mutual",
+            "selfie_verified": bool(selfie),
             "photo_consented": uid in consented_ids,
             "trust": trust_payload(uid),
             "thanked_by_me": any(row.giver_id == user.id and row.receiver_id == uid for row in thanks),
@@ -2076,7 +2943,9 @@ def room_payload(meeting, user):
     status = effective_meeting_status(meeting)
     my_feedback = MeetingFeedback.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     return {"meeting": {"id": meeting.id, "description": meeting.description, "format": meeting.format,
-                         "latitude": meeting.latitude, "longitude": meeting.longitude,
+                         "latitude": None, "longitude": None, "contact_locked": not contact_allowed,
+                         "my_confirmed": user.id in confirmed_ids,
+                         "all_confirmed": len(member_ids) >= 2 and member_ids.issubset(confirmed_ids),
                          "starts_at": normalize_dt(meeting.starts_at).isoformat(),
                          "is_owner": meeting.owner_id == user.id, "status": status,
                          "my_late": my_late,
@@ -2093,13 +2962,13 @@ def room_payload(meeting, user):
                 "voted": p.id in my_votes,
                 "confirmed": bool(p.confirmed),
                 "latitude": location.latitude if (location := MeetingPlaceLocation.query.filter_by(
-                    place_id=p.id).first()) else None,
+                    place_id=p.id).first() if p.confirmed and agreed_public_place(meeting, p) else None) else None,
                 "longitude": location.longitude if location else None,
                 "map_url": (
                     f"https://www.openstreetmap.org/?mlat={location.latitude:.6f}"
                     f"&mlon={location.longitude:.6f}#map=17/{location.latitude:.6f}/{location.longitude:.6f}"
                 ) if location else None,
-            } for p in places],
+            } for p in places] if contact_allowed else [],
             "messages": [{"id": m.id, "name": db.session.get(User, m.user_id).name, "text": m.text,
                           "mine": m.user_id == user.id, "created_at": normalize_dt(m.created_at).isoformat()}
                          for m in messages],
@@ -2127,13 +2996,52 @@ def consent_to_photo(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     user = current_user()
+    Meeting.query.filter_by(id=meeting.id).with_for_update().one()
+    media = ProfileMedia.query.filter_by(user_id=user.id).first()
+    if len(accepted_user_ids(meeting)) < 2 or not media or not media.real_photo:
+        return jsonify(error="Добавьте отдельное фото и дождитесь принятия отклика"), 409
     consent = PhotoConsent.query.filter_by(meeting_id=meeting.id, user_id=user.id).first()
     if not consent:
         db.session.add(PhotoConsent(meeting_id=meeting.id, user_id=user.id))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
         db.session.commit()
         emit_meeting(meeting, "photo_consent")
     return jsonify(ok=True, room=room_payload(meeting, user))
+
+
+@app.post("/api/v2/meetings/<int:meeting_id>/confirm")
+@login_required
+def confirm_meeting(meeting_id):
+    meeting, error = meeting_room_or_error(meeting_id)
+    if error:
+        return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
+    meeting = Meeting.query.filter_by(id=meeting_id).with_for_update().one()
+    members = accepted_user_ids(meeting)
+    if len(members) < 2 or effective_meeting_status(meeting) != "active":
+        return jsonify(error="Нет активной встречи с подтверждённым участником"), 409
+    user = current_user()
+    if not MeetingConfirmation.query.filter_by(meeting_id=meeting.id, user_id=user.id).first():
+        db.session.add(MeetingConfirmation(meeting_id=meeting.id, user_id=user.id))
+        bump_sync(user_ids=members, meeting_ids={meeting.id})
+        db.session.commit()
+        emit_meeting(meeting)
+    return jsonify(ok=True, room=room_payload(meeting, user))
+
+
+def agreed_public_place(meeting, place):
+    members = accepted_user_ids(meeting)
+    votes = {row.user_id for row in PlaceVote.query.filter_by(place_id=place.id)}
+    return len(members) >= 2 and members.issubset(votes) and place_is_public(place.title)
+
+
+def place_is_public(title):
+    private = r"квартир|подъезд|частн\w* дом|у (меня|тебя|него|неё) дома|мой дом"
+    return not re.search(private, title.casefold())
 
 
 @app.post("/api/meetings/<int:meeting_id>/places")
@@ -2142,9 +3050,13 @@ def propose_place(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     title = str(json_body().get("title", "")).strip()[:120]
     if len(title) < 2:
         return jsonify(error="Укажите место встречи"), 400
+    if not place_is_public(title):
+        return jsonify(error="Выберите публичное место встречи"), 400
     latitude = json_body().get("latitude")
     longitude = json_body().get("longitude")
     has_coordinates = latitude is not None or longitude is not None
@@ -2171,6 +3083,7 @@ def propose_place(meeting_id):
             db.session.add(PlaceVote(
                 place_id=existing_place.id, user_id=current_user().id
             ))
+            bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
             db.session.commit()
             maybe_confirm_place(meeting, existing_place)
             emit_meeting(meeting, "place_vote")
@@ -2187,6 +3100,7 @@ def propose_place(meeting_id):
             place_id=place.id, latitude=float(latitude), longitude=float(longitude), source="map",
         ))
     db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     emit_meeting(meeting, "place_proposed")
     maybe_confirm_place(meeting, place)
@@ -2236,7 +3150,7 @@ def reverse_geocode():
             house_number = address.get("house_number")
             title = f"{title}, {house_number}" if house_number else title
     except (requests.RequestException, ValueError):
-        app.logger.warning("Reverse geocoding failed for %s", coordinate_key)
+        app.logger.warning("Reverse geocoding failed")
     title = str(title).strip()[:120] or "Точка на карте"
     db.session.add(GeocodeCache(coordinate_key=coordinate_key, title=title))
     db.session.commit()
@@ -2250,6 +3164,8 @@ def vote_place(place_id):
     meeting, error = meeting_room_or_error(place.meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     vote = PlaceVote.query.filter_by(place_id=place.id, user_id=current_user().id).first()
     if vote:
         if place.confirmed:
@@ -2257,6 +3173,7 @@ def vote_place(place_id):
         db.session.delete(vote)
     else:
         db.session.add(PlaceVote(place_id=place.id, user_id=current_user().id))
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     if not vote:
         maybe_confirm_place(meeting, place)
@@ -2267,15 +3184,14 @@ def vote_place(place_id):
 def maybe_confirm_place(meeting, place, force=False):
     member_ids = accepted_user_ids(meeting)
     vote_count = PlaceVote.query.filter_by(place_id=place.id).count()
-    should_confirm = force or (
-        meeting.format == "one" and len(member_ids) == 2 and vote_count >= 2
-    )
+    should_confirm = force or (len(member_ids) >= 2 and vote_count >= len(member_ids))
     if not should_confirm or place.confirmed:
         return False
     MeetingPlace.query.filter_by(meeting_id=meeting.id).update(
         {"confirmed": 0}, synchronize_session=False
     )
     place.confirmed = 1
+    bump_sync(user_ids=member_ids, meeting_ids={meeting.id}, feed=True)
     db.session.commit()
     emit_meeting(meeting, "place_confirmed")
     return True
@@ -2286,8 +3202,12 @@ def maybe_confirm_place(meeting, place, force=False):
 def confirm_place(place_id):
     place = db.get_or_404(MeetingPlace, place_id)
     meeting = db.session.get(Meeting, place.meeting_id)
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
     if meeting.owner_id != current_user().id:
         return jsonify(error="Место подтверждает создатель встречи"), 403
+    if MeetingPlaceLocation.query.filter_by(place_id=place.id).first() and not agreed_public_place(meeting, place):
+        return jsonify(error="Точку на карте должны согласовать все участники"), 409
     maybe_confirm_place(meeting, place, force=True)
     emit_meeting(meeting, "place_confirmed")
     return jsonify(ok=True, room=room_payload(meeting, current_user()))
@@ -2295,23 +3215,42 @@ def confirm_place(place_id):
 
 @app.post("/api/meetings/<int:meeting_id>/messages")
 @login_required
+@profile_required
 def send_message(meeting_id):
     meeting, error = meeting_room_or_error(meeting_id)
     if error:
         return error
+    if not meeting_contact_allowed(meeting, current_user().id):
+        return jsonify(error="Общение в этой встрече ограничено"), 403
+    if len(accepted_user_ids(meeting)) < 2:
+        return jsonify(error="Чат откроется после принятия отклика"), 409
     if effective_meeting_status(meeting) != "active" or MeetingEvent.query.filter_by(
             meeting_id=meeting.id, user_id=current_user().id, kind="complete"
     ).first():
         return jsonify(error="Эта переписка уже закрыта"), 409
-    if not consume_action(current_user().id, "message", 12, 60):
-        return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
     text = str(json_body().get("text", "")).strip()[:500]
     if not text:
         return jsonify(error="Напишите сообщение"), 400
-    db.session.add(ChatMessage(meeting_id=meeting.id, user_id=current_user().id, text=text))
+    user = current_user()
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(user, operation_id):
+        return replay
+    lock_user_actions({user.id})
+    if replay := replay_operation(user, operation_id):
+        return replay
+    if not consume_action(user.id, "message", 12, 60):
+        return jsonify(error="Слишком много сообщений. Подождите минуту"), 429
+    message = ChatMessage(meeting_id=meeting.id, user_id=user.id, text=text)
+    db.session.add(message)
+    db.session.flush()
+    payload = {"ok": True, "message_id": message.id, "room": room_payload(meeting, user)}
+    bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
+    remember_operation(user, operation_id, {"ok": True, "message_id": message.id, "_room_meeting_id": meeting.id}, 201)
     db.session.commit()
     emit_meeting(meeting, "chat_message")
-    return jsonify(ok=True, room=room_payload(meeting, current_user())), 201
+    return jsonify(payload), 201
 
 
 def state_for(meeting):
@@ -2351,8 +3290,10 @@ def meeting_lifecycle(meeting_id):
     if state.status != "active":
         return jsonify(error="Встреча уже завершена или отменена"), 409
     target_id = data.get("target_user_id")
-    if action == "cancel" and meeting.owner_id != user.id:
+    if action in {"cancel", "reschedule"} and meeting.owner_id != user.id:
         return jsonify(error="Это действие доступно создателю встречи"), 403
+    if action == "not_happened" and meeting.format == "group" and meeting.owner_id != user.id:
+        return jsonify(error="Групповую встречу закрывает создатель"), 403
     if action == "leave":
         if meeting.owner_id == user.id:
             return jsonify(error="Создатель может отменить встречу"), 400
@@ -2362,17 +3303,18 @@ def meeting_lifecycle(meeting_id):
         if not interest:
             return jsonify(error="Вы уже не участвуете в этой встрече"), 409
         interest.status = "rejected"
+        clear_meeting_consents(meeting.id)
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id,
                                     kind="leave", note="Участник отказался от встречи"))
         purge_chat_if_ready(meeting)
         close_member_presences(meeting)
         purge_meeting_notifications(meeting)
+        bump_sync(feed=True, user_ids={meeting.owner_id, user.id}, meeting_ids={meeting.id})
         db.session.commit()
         emit_realtime({meeting.owner_id, user.id}, "meeting_left", meeting.id)
         notify_user(
             meeting.owner_id,
             f"{user.name} отказался от встречи «{meeting.description}»",
-            telegram=True,
         )
         return jsonify(ok=True, left=True)
     if action == "no_show":
@@ -2410,13 +3352,24 @@ def meeting_lifecycle(meeting_id):
             meeting_id=meeting.id, user_id=user.id,
             target_user_id=no_show.user_id, kind="no_show_disputed", note=reason,
         ))
+        dispute_report = UserReport(
+            meeting_id=meeting.id,
+            reporter_id=user.id,
+            target_id=no_show.user_id,
+            category="no_show_dispute",
+            reason=reason,
+            status="new",
+        )
+        db.session.add(dispute_report)
+        db.session.flush()
+        queue_admin_report(dispute_report, independent_report_count(no_show.user_id))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id}, admin=True)
         db.session.commit()
         emit_meeting(meeting, "no_show_disputed")
         notify_user(
             no_show.user_id,
             f"{user.name} оспорил отметку о неявке на встречу «{meeting.description}».",
             kind="meeting_no_show_disputed",
-            telegram=True,
         )
         return jsonify(ok=True, room=room_payload(meeting, user))
     if action == "cancel":
@@ -2434,6 +3387,7 @@ def meeting_lifecycle(meeting_id):
             return jsonify(error="Выберите новое время встречи"), 400
         if starts_at < utcnow() + timedelta(minutes=5) or starts_at > utcnow() + timedelta(days=7):
             return jsonify(error="Новое время должно быть от 5 минут до 7 дней вперёд"), 400
+        MeetingConfirmation.query.filter_by(meeting_id=meeting.id).delete()
         meeting.starts_at = starts_at
         meeting.expires_at = starts_at + timedelta(minutes=60)
         data["note"] = f"Новое время: {starts_at.isoformat()}"
@@ -2461,7 +3415,6 @@ def meeting_lifecycle(meeting_id):
                     f"{user.name} отметил, что встреча состоялась. Подтвердите результат в приложении.",
                     kind="meeting_confirmation",
                     dedupe_key=f"meeting-confirmation:{meeting.id}:{member_id}",
-                    telegram=True,
                 )
     elif action == "late":
         existing_late = MeetingEvent.query.filter_by(
@@ -2470,7 +3423,9 @@ def meeting_lifecycle(meeting_id):
         if existing_late:
             for event in existing_late:
                 db.session.delete(event)
+            bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
             db.session.commit()
+            emit_meeting(meeting, "meeting_late")
             return jsonify(ok=True, room=room_payload(meeting, user))
     if action != "complete":
         db.session.add(MeetingEvent(meeting_id=meeting.id, user_id=user.id, target_user_id=target_id,
@@ -2482,6 +3437,10 @@ def meeting_lifecycle(meeting_id):
         purge_meeting_notifications(meeting)
     elif action == "complete":
         close_member_presences(meeting)
+    members_for_sync = accepted_user_ids(meeting)
+    bump_sync(feed=action in {"cancel", "not_happened", "complete", "reschedule"},
+              user_ids=members_for_sync, meeting_ids={meeting.id},
+              notification_ids=members_for_sync - {user.id})
     db.session.commit()
     emit_meeting(meeting, f"meeting_{action}")
     if action in {"cancel", "late", "no_show", "not_happened", "reschedule"} or (
@@ -2504,7 +3463,6 @@ def meeting_lifecycle(meeting_id):
                 member_id,
                 f"{action_text}: «{meeting.description}»",
                 kind=f"meeting_{action}",
-                telegram=action in {"cancel", "late", "no_show", "not_happened", "reschedule"},
             )
     return jsonify(ok=True, room=room_payload(meeting, user))
 
@@ -2538,6 +3496,7 @@ def leave_feedback(meeting_id):
     purge_chat_if_ready(meeting)
     close_member_presences(meeting)
     purge_meeting_notifications(meeting, {current_user().id})
+    bump_sync(feed=True, user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id})
     db.session.commit()
     emit_meeting(meeting, "feedback")
     return jsonify(ok=True, closed=True)
@@ -2565,12 +3524,13 @@ def thank_participant(meeting_id):
         db.session.add(MeetingThanks(
             meeting_id=meeting.id, giver_id=user.id, receiver_id=receiver_id,
         ))
+        bump_sync(user_ids=accepted_user_ids(meeting), meeting_ids={meeting.id},
+                  notification_ids={receiver_id})
         db.session.commit()
         emit_meeting(meeting, "thanks")
         notify_user(receiver_id, f"{user.name} поблагодарил вас после встречи «{meeting.description}»",
                     kind="thanks",
-                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}",
-                    telegram=True)
+                    dedupe_key=f"thanks:{meeting.id}:{user.id}:{receiver_id}",)
     return jsonify(ok=True, room=room_payload(meeting, user))
 
 
@@ -2581,26 +3541,44 @@ def report_user(meeting_id):
     if error:
         return error
     data, reporter = json_body(), current_user()
-    if not consume_action(reporter.id, "report", 5, 86400):
-        return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
+    operation_id = request_operation_id()
+    if operation_id == "":
+        return jsonify(error="Некорректный Operation ID", code="INVALID_OPERATION_ID"), 400
+    if replay := replay_operation(reporter, operation_id):
+        return replay
     try:
         target_id = int(data.get("target_user_id"))
     except (TypeError, ValueError):
         return jsonify(error="Укажите участника"), 400
     if target_id == reporter.id or target_id not in accepted_user_ids(meeting):
         return jsonify(error="Некорректный участник"), 400
+    lock_user_actions({reporter.id, target_id})
+    if replay := replay_operation(reporter, operation_id):
+        return replay
+    if not consume_action(reporter.id, "report", 5, 86400):
+        return jsonify(error="Лимит жалоб на сегодня исчерпан"), 429
     reason = str(data.get("reason", "")).strip()[:180]
+    category = str(data.get("category", "other")).strip().lower()
+    if category not in REPORT_CATEGORIES - {"no_show_dispute"}:
+        return jsonify(error="Некорректная категория жалобы"), 400
     if len(reason) < 3:
         return jsonify(error="Опишите причину жалобы"), 400
     if UserReport.query.filter_by(meeting_id=meeting.id, reporter_id=reporter.id, target_id=target_id).first():
         return jsonify(error="Вы уже отправили жалобу на этого участника"), 409
-    db.session.add(UserReport(meeting_id=meeting.id, reporter_id=reporter.id,
-                              target_id=target_id, reason=reason))
+    report = UserReport(
+        meeting_id=meeting.id,
+        reporter_id=reporter.id,
+        target_id=target_id,
+        category=category,
+        reason=reason,
+        status="new",
+    )
+    db.session.add(report)
     if data.get("block") and not UserBlock.query.filter_by(blocker_id=reporter.id, blocked_id=target_id).first():
         db.session.add(UserBlock(blocker_id=reporter.id, blocked_id=target_id))
+    db.session.flush()
     recent = utcnow() - timedelta(hours=24)
-    report_count = UserReport.query.filter(UserReport.target_id == target_id,
-                                           UserReport.created_at >= recent).count()
+    report_count = independent_report_count(target_id, recent)
     if report_count >= 3:
         moderation = UserModeration.query.filter_by(user_id=target_id).first()
         if not moderation:
@@ -2609,55 +3587,218 @@ def report_user(meeting_id):
             db.session.add(moderation)
         else:
             moderation.hidden_until = utcnow() + timedelta(hours=24)
+        report.auto_hidden = 1
+    queue_admin_report(report, report_count)
+    payload = {"ok": True, "closed": True, "report_id": report.id, "report_count": report_count}
+    bump_sync(feed=bool(data.get("block") or report.auto_hidden),
+              user_ids={reporter.id, target_id}, meeting_ids={meeting.id}, admin=True)
+    remember_operation(reporter, operation_id, payload, 200)
     db.session.commit()
-    return jsonify(ok=True, closed=True)
+    return jsonify(payload)
 
 
 @app.get("/api/admin/reports")
-@login_required
+@admin_required
 def admin_reports():
-    user = current_user()
-    if user.telegram_id not in ADMIN_TELEGRAM_IDS:
-        return jsonify(error="Нет доступа"), 403
-    reports = UserReport.query.order_by(UserReport.id.desc()).limit(200).all()
-    return jsonify(items=[{"id": item.id, "meeting_id": item.meeting_id,
-                           "reporter": db.session.get(User, item.reporter_id).name,
-                           "target_id": item.target_id,
-                           "target": db.session.get(User, item.target_id).name,
-                           "reason": item.reason,
-                           "created_at": normalize_dt(item.created_at).isoformat()} for item in reports])
+    query = UserReport.query
+    status = request.args.get("status", "").strip()
+    category = request.args.get("category", "").strip()
+    user_filter = request.args.get("user", "").strip()
+    date_filter = request.args.get("date", "").strip()
+    if status == "blocked":
+        query = query.filter(UserReport.decision == "block")
+    elif status == "auto_hidden":
+        query = query.filter(UserReport.auto_hidden == 1)
+    elif status:
+        query = query.filter(UserReport.status == status)
+    if category:
+        query = query.filter(UserReport.category == category)
+    if date_filter:
+        try:
+            date_start = normalize_dt(datetime.fromisoformat(date_filter))
+            query = query.filter(
+                UserReport.created_at >= date_start,
+                UserReport.created_at < date_start + timedelta(days=1),
+            )
+        except ValueError:
+            return jsonify(error="Некорректная дата"), 400
+    reports = query.order_by(UserReport.id.desc()).limit(200).all()
+    if user_filter:
+        reports = [item for item in reports if user_filter in {
+            anonymized_user_id(item.reporter_id), anonymized_user_id(item.target_id), str(item.id),
+        }]
+    return jsonify(items=[admin_report_payload(item) for item in reports])
+
+
+@app.get("/api/admin/reports/<int:report_id>")
+@admin_required
+def admin_report(report_id):
+    return jsonify(report=admin_report_payload(db.get_or_404(UserReport, report_id)))
+
+
+def admin_report_payload(item):
+    meeting = db.session.get(Meeting, item.meeting_id)
+    actions = ModerationAction.query.filter_by(report_id=item.id).order_by(
+        ModerationAction.id.desc()).limit(50).all()
+    return {
+        "id": item.id,
+        "meeting_id": item.meeting_id,
+        "meeting_status": effective_meeting_status(meeting) if meeting else "deleted",
+        "category": item.category,
+        "reason": item.reason,
+        "status": item.status,
+        "decision": item.decision,
+        "decision_reason": item.decision_reason,
+        "auto_hidden": bool(item.auto_hidden),
+        "reporter": anonymized_user_id(item.reporter_id),
+        "target": anonymized_user_id(item.target_id),
+        "independent_reports": independent_report_count(item.target_id),
+        "trust": trust_payload(item.target_id),
+        "created_at": normalize_dt(item.created_at).isoformat(),
+        "reviewed_at": normalize_dt(item.reviewed_at).isoformat() if item.reviewed_at else None,
+        "history": [{
+            "action": action.action,
+            "reason": action.reason,
+            "created_at": normalize_dt(action.created_at).isoformat(),
+        } for action in actions],
+    }
+
+
+@app.get("/api/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    effectively_blocked_at = utcnow() + timedelta(days=3650)
+    unresolved = {"new", "in_progress"}
+    return jsonify(
+        csrf_token=admin_csrf_token(),
+        revision=revision_value("admin"),
+        counts={
+            "new": UserReport.query.filter_by(status="new").count(),
+            "in_progress": UserReport.query.filter_by(status="in_progress").count(),
+            "auto_hidden": UserReport.query.filter_by(auto_hidden=1).count(),
+            "blocked": UserModeration.query.filter(
+                UserModeration.hidden_until >= effectively_blocked_at
+            ).count(),
+            "confirmed": UserReport.query.filter_by(status="confirmed").count(),
+            "dismissed": UserReport.query.filter_by(status="dismissed").count(),
+            "resolved_today": UserReport.query.filter(
+                UserReport.status.in_(("confirmed", "dismissed", "resolved")),
+                UserReport.reviewed_at >= today,
+            ).count(),
+            "unresolved": UserReport.query.filter(UserReport.status.in_(unresolved)).count(),
+        },
+    )
+
+
+@app.post("/api/admin/reports/<int:report_id>/evidence")
+@admin_required
+def admin_report_evidence(report_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    report = db.get_or_404(UserReport, report_id)
+    admin = admin_user()
+    db.session.add(ModerationAction(
+        report_id=report.id,
+        moderator_id=admin.id,
+        action="view_evidence",
+        reason="Просмотр ограниченного фрагмента чата",
+    ))
+    incident_at = normalize_dt(report.created_at)
+    messages = ChatMessage.query.filter(
+        ChatMessage.meeting_id == report.meeting_id,
+        ChatMessage.created_at >= incident_at - timedelta(hours=2),
+        ChatMessage.created_at <= incident_at + timedelta(hours=2),
+    ).order_by(ChatMessage.id.desc()).limit(20).all()
+    bump_sync(admin=True)
+    db.session.commit()
+    return jsonify(items=[{
+        "id": message.id,
+        "author": anonymized_user_id(message.user_id),
+        "text": message.text,
+        "created_at": normalize_dt(message.created_at).isoformat(),
+    } for message in reversed(messages)])
+
+
+def apply_admin_action(report, admin, action, reason):
+    now = utcnow()
+    if action == "take":
+        report.status = "in_progress"
+    elif action == "confirm":
+        report.status, report.decision, report.reviewed_at = "confirmed", "confirmed", now
+    elif action == "dismiss":
+        report.status, report.decision, report.reviewed_at = "dismissed", "dismissed", now
+    elif action == "warn":
+        report.status = "in_progress"
+        db.session.add(UserNotification(
+            user_id=report.target_id,
+            kind="moderation_warning",
+            text="Администратор вынес предупреждение по правилам безопасного общения.",
+            dedupe_key=f"moderation-warning:{report.id}",
+        ))
+    elif action in {"hide_24h", "hide_7d", "block"}:
+        duration = timedelta(hours=24) if action == "hide_24h" else (
+            timedelta(days=7) if action == "hide_7d" else timedelta(days=36500)
+        )
+        moderation = UserModeration.query.filter_by(user_id=report.target_id).first()
+        if not moderation:
+            moderation = UserModeration(user_id=report.target_id, hidden_until=now + duration, reason=reason)
+            db.session.add(moderation)
+        else:
+            moderation.hidden_until = max(normalize_dt(moderation.hidden_until), now + duration)
+            moderation.reason = reason
+        report.status = "in_progress"
+        report.decision = action
+    elif action == "restore":
+        UserModeration.query.filter_by(user_id=report.target_id).delete(synchronize_session=False)
+        report.decision = "restored"
+    elif action == "close":
+        report.status, report.decision, report.reviewed_at = "resolved", "closed", now
+    else:
+        return False
+    report.moderator_id = admin.id
+    report.decision_reason = reason or report.decision_reason
+    db.session.add(ModerationAction(
+        report_id=report.id,
+        moderator_id=admin.id,
+        action=action,
+        reason=reason or None,
+        metadata_json=json.dumps({"target": anonymized_user_id(report.target_id)}, separators=(",", ":")),
+    ))
+    bump_sync(feed=action in {"hide_24h", "hide_7d", "block", "restore"},
+              user_ids={report.target_id}, notification_ids={report.target_id} if action == "warn" else (),
+              admin=True)
+    return True
+
+
+@app.post("/api/admin/reports/<int:report_id>/action")
+@admin_required
+def admin_report_action(report_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    report = db.get_or_404(UserReport, report_id)
+    action = str(json_body().get("action", "")).strip()
+    reason = str(json_body().get("reason", "")).strip()[:180]
+    if action != "take" and len(reason) < 3:
+        return jsonify(error="Укажите причину решения"), 400
+    if not apply_admin_action(report, admin_user(), action, reason):
+        return jsonify(error="Неизвестное действие"), 400
+    db.session.commit()
+    return jsonify(ok=True, report=admin_report_payload(report))
 
 
 @app.post("/api/admin/reports/<int:report_id>/decision")
-@login_required
+@admin_required
 def decide_admin_report(report_id):
-    admin = current_user()
-    if admin.telegram_id not in ADMIN_TELEGRAM_IDS:
-        return jsonify(error="Нет доступа"), 403
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    admin = admin_user()
     report = db.get_or_404(UserReport, report_id)
     decision = str(json_body().get("decision", "")).strip()
     if decision not in {"dismissed", "confirmed"}:
         return jsonify(error="Выберите решение по жалобе"), 400
-    meeting = db.session.get(Meeting, report.meeting_id)
-    if decision == "confirmed":
-        moderation = UserModeration.query.filter_by(user_id=report.target_id).first()
-        hidden_until = utcnow() + timedelta(days=30)
-        if not moderation:
-            moderation = UserModeration(
-                user_id=report.target_id,
-                hidden_until=hidden_until,
-                reason=f"Подтверждённая жалоба #{report.id}",
-            )
-            db.session.add(moderation)
-        else:
-            moderation.hidden_until = max(
-                normalize_dt(moderation.hidden_until), hidden_until
-            )
-            moderation.reason = f"Подтверждённая жалоба #{report.id}"
-    db.session.delete(report)
-    db.session.flush()
-    if meeting:
-        purge_chat_if_ready(meeting)
+    reason = str(json_body().get("reason", f"Решение по жалобе #{report.id}"))[:180]
+    apply_admin_action(report, admin, "confirm" if decision == "confirmed" else "dismiss", reason)
     db.session.commit()
     return jsonify(ok=True, decision=decision)
 
@@ -2689,21 +3830,47 @@ def admin_traffic():
         item["unique_visitors"].add(visit.visitor_hash)
     items = [{**item, "unique_visitors": len(item["unique_visitors"])} for item in grouped.values()]
     items.sort(key=lambda item: (-item["visits"], item["source"]))
-    return jsonify(days=days, total_visits=len(visits),
+    channels = {channel: {"visits": 0, "registrations": 0} for channel in ("press", "creator", "ads", "other")}
+    for visit in visits:
+        channel = acquisition_channel(visit.medium)
+        current = channels.setdefault(channel, {"visits": 0, "registrations": 0})
+        current["visits"] += 1
+    for row in Acquisition.query.filter(Acquisition.created_at >= utcnow() - timedelta(days=days)):
+        current = channels.setdefault(row.channel, {"visits": 0, "registrations": 0})
+        current["registrations"] += 1
+    return jsonify(days=days, channels=channels, total_visits=len(visits),
                    unique_visitors=len({visit.visitor_hash for visit in visits}), items=items)
+
+
+def invitation_links(token):
+    telegram_url = f"https://t.me/{BOT_USERNAME}?startapp=invite_{token}"
+    return {"url": telegram_url, "telegram_url": telegram_url, "pwa_url": f"{PUBLIC_URL}/?invite={token}"}
+
+
+@app.post("/api/invitations/claim")
+@login_required
+def claim_pwa_invitation():
+    return jsonify(claimed=claim_invitation(current_user(), json_body().get("token")))
+
+
+def end_of_app_day(now, zone=None):
+    local = now.astimezone(zone or APP_TIMEZONE)
+    return (local.replace(hour=0, minute=0, second=0, microsecond=0)
+            + timedelta(days=1)).astimezone(timezone.utc)
 
 
 @app.get("/api/invitations")
 @login_required
 def list_invitations():
     user = current_user()
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
     account = invite_account(user.id)
     db.session.commit()
     items = Invitation.query.filter_by(inviter_id=user.id).order_by(Invitation.id.desc()).all()
     rewarded = Invitation.query.filter_by(inviter_id=user.id, status="rewarded").count()
     return jsonify(available=account.available, rewarded=rewarded,
                    develops_club=rewarded > 0,
-                   items=[{"url": f"https://t.me/{BOT_USERNAME}?startapp=invite_{item.token}",
+                   items=[{**invitation_links(item.token),
                            "status": item.status} for item in items])
 
 
@@ -2711,6 +3878,7 @@ def list_invitations():
 @login_required
 def create_invitation():
     user = current_user()
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
     account = invite_account(user.id)
     if account.available <= 0:
         return jsonify(error="Приглашения закончились. Оно вернётся после успешной встречи приглашённого"), 409
@@ -2719,13 +3887,51 @@ def create_invitation():
     invitation = Invitation(token=token, inviter_id=user.id, status="created")
     db.session.add(invitation)
     db.session.commit()
-    return jsonify(ok=True, available=account.available,
-                   url=f"https://t.me/{BOT_USERNAME}?startapp=invite_{token}"), 201
+    return jsonify(ok=True, available=account.available, **invitation_links(token)), 201
 
 
 @app.get("/")
 def index():
     return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.get("/about")
+def about_product():
+    from html import escape
+
+    english = request.args.get("lang") == "en"
+    filename = "about-en.html" if english else "about.html"
+    with open(os.path.join(BASE_DIR, filename), encoding="utf-8") as source:
+        return Response(source.read().replace("{{PUBLIC_URL}}", escape(PUBLIC_URL)), mimetype="text/html")
+
+
+@app.get("/robots.txt")
+def robots():
+    return Response(f"User-agent: *\nAllow: /about\nDisallow: /api/\nDisallow: /auth/\n"
+                    f"Disallow: /admin\nSitemap: {PUBLIC_URL}/sitemap.xml\n", mimetype="text/plain")
+
+
+@app.get("/sitemap.xml")
+def sitemap():
+    from xml.sax.saxutils import escape
+
+    urls = "".join(f"<url><loc>{escape(PUBLIC_URL + suffix)}</loc></url>" for suffix in ("/about", "/about?lang=en"))
+    return Response(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>',
+                    mimetype="application/xml")
+
+
+@app.get("/about/qr.png")
+def public_pwa_qr():
+    buffer = io.BytesIO()
+    qrcode.make(f"{PUBLIC_URL}/").save(buffer, format="PNG")
+    return Response(buffer.getvalue(), mimetype="image/png")
+
+
+@app.get("/admin")
+@admin_required
+def admin_page():
+    admin_csrf_token()
+    return send_from_directory(BASE_DIR, "admin.html")
 
 
 @app.get("/sichas-apple-icon-v2.png")
@@ -2735,29 +3941,1629 @@ def ios_app_icon():
     return response
 
 
+PUBLIC_FILES = {
+    "legal.html",
+    "manifest.webmanifest",
+    "favicon-32.png",
+    "apple-touch-icon.png",
+    "app-icon-192.png",
+    "app-icon-512.png",
+    "profile-placeholder.svg",
+    "offline.html",
+    "service-worker.js",
+}
+
+
 @app.get("/<path:path>")
-def static_files(path):
-    full_path = os.path.join(BASE_DIR, path)
-    if os.path.isfile(full_path):
-        return send_from_directory(BASE_DIR, path)
-    return send_from_directory(BASE_DIR, "index.html")
+def public_files(path):
+    if path not in PUBLIC_FILES:
+        abort(404)
+    return send_from_directory(BASE_DIR, path)
 
 
-with app.app_context():
-    db.create_all()
-    cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
-        {"phone_number": None}, synchronize_session=False
+def _parse_start(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+GOOD_DEED_DIRECTIONS = {
+    "community": "Сообщество",
+    "environment": "Экология",
+    "education": "Просвещение",
+    "accessibility": "Доступная среда",
+}
+
+
+def _deed_payload(deed, viewer=None):
+    participants = GoodDeedParticipant.query.filter_by(deed_id=deed.id).all()
+    organizer = active_organizer(deed.owner_id)
+    coordinator_id = deed_coordinator(deed)
+    can_manage = bool(viewer and (viewer.telegram_id in ADMIN_TELEGRAM_IDS or
+                                  organizer and viewer.id in (deed.owner_id, coordinator_id)))
+    joined = [row for row in participants if row.status in {"joined", "confirmed"}]
+    confirmed = [row for row in participants if row.status == "confirmed"]
+    return {
+        "id": deed.id,
+        "title": deed.title,
+        "direction": GOOD_DEED_DIRECTIONS[deed.direction],
+        "description": deed.description,
+        "organizer_name": deed.organizer_name,
+        "organizer_verified": bool(organizer and coordinator_id),
+        "coordinator_name": deed.coordinator_name,
+        "area": deed.area,
+        "starts_at": normalize_dt(deed.starts_at).isoformat(),
+        "duration_minutes": deed.duration_minutes,
+        "capacity": deed.capacity,
+        "instructions": deed.instructions,
+        "status": deed.status,
+        "result_summary": deed.result_summary,
+        "participants": len(joined),
+        "confirmed_participants": len(confirmed),
+        "my_status": next((row.status for row in participants if viewer and row.user_id == viewer.id), None),
+        "can_manage": can_manage,
+        "mine": bool(viewer and viewer.id == deed.owner_id),
+        "can_join": bool(viewer and viewer.id not in (deed.owner_id, deed_coordinator(deed))),
+        "roster": [{"id": row.user_id, "name": db.session.get(User, row.user_id).name}
+                   for row in joined] if can_manage else [],
+    }
+
+
+@app.get("/api/v2/good-deeds")
+def list_good_deeds_v2():
+    viewer = current_user()
+    query = GoodDeed.query
+    can_moderate = bool(viewer and viewer.telegram_id in ADMIN_TELEGRAM_IDS)
+    if not can_moderate:
+        eligible = db.session.query(DeedCoordination.deed_id).join(
+            GoodDeed, GoodDeed.id == DeedCoordination.deed_id
+        ).join(VerifiedOrganizer, VerifiedOrganizer.user_id == GoodDeed.owner_id).join(
+            OrganizerCoordinator, (OrganizerCoordinator.organizer_id == GoodDeed.owner_id)
+            & (OrganizerCoordinator.user_id == DeedCoordination.coordinator_id)
+        ).filter(VerifiedOrganizer.active.is_(True), ~GoodDeed.owner_id.in_(hidden_accounts()),
+                 ~DeedCoordination.coordinator_id.in_(hidden_accounts()))
+        visible = ((GoodDeed.status == "active") & GoodDeed.id.in_(eligible)) | (GoodDeed.status == "completed")
+        if viewer:
+            managed = db.session.query(DeedCoordination.deed_id).filter_by(coordinator_id=viewer.id)
+            query = query.filter(visible | (GoodDeed.owner_id == viewer.id) | GoodDeed.id.in_(managed))
+        else:
+            query = query.filter(visible)
+    deeds = query.order_by(GoodDeed.starts_at.asc()).limit(100).all()
+    organizer = active_organizer(viewer.id) if viewer else None
+    choices = [{"id": row.user_id, "label": row.label}
+               for row in OrganizerCoordinator.query.filter_by(organizer_id=viewer.id)
+               if not user_hidden(row.user_id)] if organizer else []
+    return jsonify(organizer=organizer.name if organizer else None, coordinators=choices, enabled=launch_modules()["good_deeds"], items=[_deed_payload(item, viewer) for item in deeds], can_moderate=can_moderate,
+                   csrf_token=admin_csrf_token() if can_moderate else None)
+
+
+@app.post("/api/v2/good-deeds")
+def create_good_deed_v2():
+    user = current_user()
+    if not user:
+        return jsonify(error="Нужна регистрация через Telegram"), 401
+    if not user_profile_payload(user)["completed"]:
+        return jsonify(error="Сначала заполните профиль и добавьте селфи"), 409
+    data = json_body()
+    if data.get("public_site_confirmed") is not True:
+        return jsonify(error="Подтвердите согласованное общедоступное место и правила безопасности"), 400
+    direction = str(data.get("direction", "community"))
+    if direction not in GOOD_DEED_DIRECTIONS:
+        return jsonify(error="Выберите направление акции"), 400
+    title = str(data.get("title", "")).strip()[:120]
+    description = str(data.get("description", "")).strip()[:500]
+    organizer = active_organizer(user.id)
+    coordinator_id = data.get("coordinator_id")
+    if not organizer or type(coordinator_id) is not int or not eligible_coordinator(user.id, coordinator_id):
+        return jsonify(error="Нужны проверенный организатор и назначенный координатор"), 403
+    coordinator = db.session.get(OrganizerCoordinator, (user.id, coordinator_id))
+    area = str(data.get("area", "")).strip()[:120]
+    instructions = str(data.get("instructions", "")).strip()[:500]
+    starts_at = _parse_start(str(data.get("starts_at", "")))
+    try:
+        duration = min(max(int(data.get("duration_minutes", 120)), 30), 480)
+        capacity = min(max(int(data.get("capacity", 10)), 2), 100)
+    except (TypeError, ValueError):
+        return jsonify(error="Проверьте длительность и количество участников"), 400
+    if min(map(len, [title, description, area, instructions])) < 3 or not starts_at:
+        return jsonify(error="Заполните организатора, координатора, место, время, задачу и инструкции"), 400
+    if starts_at < utcnow() - timedelta(minutes=5):
+        return jsonify(error="Время акции уже прошло"), 400
+    if not place_is_public(area) or prohibited_activity(title, description, instructions, area) or any(re.search(
+        r"квартир|подъезд|парол|банковск|паспорт|передач\w* денег|медицинск|опасн\w* работ", field.casefold()
+    ) for field in (description, instructions)):
+        return jsonify(error="Допустима безопасная помощь в публичном месте"), 400
+    deed = GoodDeed(
+        owner_id=user.id,
+        title=title,
+        direction=direction,
+        description=description,
+        organizer_name=organizer.name,
+        coordinator_name=coordinator.label,
+        area=area,
+        starts_at=starts_at,
+        duration_minutes=duration,
+        capacity=capacity,
+        instructions=instructions,
+        status="pending",
     )
-    legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
-    if legacy_selfies or cleared_phones:
-        for legacy_selfie in legacy_selfies:
-            legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
-        db.session.commit()
-        app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
-                        len(legacy_selfies), cleared_phones)
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
+    if not consume_action(user.id, "good_deed", 5, 86400):
+        return jsonify(error="Дневной лимит новых акций исчерпан"), 429
+    db.session.add(deed)
+    db.session.flush()
+    db.session.add(DeedCoordination(deed_id=deed.id, coordinator_id=coordinator_id))
+    db.session.commit()
+    return jsonify(ok=True, item=_deed_payload(deed, user), pending=True), 201
 
-if BOT_TOKEN and os.getenv("DATABASE_URL"):
+
+@app.post("/api/v2/good-deeds/<int:deed_id>/join")
+def join_good_deed_v2(deed_id):
+    user = current_user()
+    if not user:
+        return jsonify(error="Нужна регистрация через Telegram"), 401
+    if not user_profile_payload(user)["completed"]:
+        return jsonify(error="Сначала заполните профиль и добавьте селфи"), 409
+    deed = transaction_lock(GoodDeed.query.filter_by(id=deed_id), GoodDeed.id)
+    if deed is None:
+        abort(404)
+    if deed.status != "active" or normalize_dt(deed.starts_at) <= utcnow():
+        return jsonify(error="Запись на эту акцию закрыта"), 409
+    participant = GoodDeedParticipant.query.filter_by(deed_id=deed.id, user_id=user.id).first()
+    desired = json_body().get("joined", not bool(participant))
+    if type(desired) is not bool:
+        return jsonify(error="Укажите статус участия"), 400
+    if not desired:
+        if participant:
+            db.session.delete(participant)
+    elif not participant:
+        if user.id in (deed.owner_id, deed_coordinator(deed)):
+            return jsonify(error="Организатор и координатор управляют акцией без записи"), 403
+        if not active_organizer(deed.owner_id) or not deed_coordinator(deed):
+            return jsonify(error="Запись приостановлена до проверки организатора и координатора"), 409
+        count = GoodDeedParticipant.query.filter(
+            GoodDeedParticipant.deed_id == deed.id,
+            GoodDeedParticipant.status.in_(["joined", "confirmed"]),
+        ).count()
+        if count >= deed.capacity:
+            return jsonify(error="Команда уже набрана"), 409
+        db.session.add(GoodDeedParticipant(deed_id=deed.id, user_id=user.id, status="joined"))
+    db.session.commit()
+    return jsonify(ok=True, joined=desired, item=_deed_payload(deed, user))
+
+
+@app.post("/api/v2/good-deeds/<int:deed_id>/complete")
+def complete_good_deed_v2(deed_id):
+    user = current_user()
+    if not user:
+        return jsonify(error="Нужна регистрация через Telegram"), 401
+    deed = transaction_lock(GoodDeed.query.filter_by(id=deed_id), GoodDeed.id)
+    if deed is None:
+        abort(404)
+    if user.telegram_id not in ADMIN_TELEGRAM_IDS and (
+        not active_organizer(deed.owner_id) or user.id not in (deed.owner_id, deed_coordinator(deed))
+    ):
+        return jsonify(error="Результат подтверждает организатор"), 403
+    if deed.status != "active" or normalize_dt(deed.starts_at) + timedelta(minutes=deed.duration_minutes) > utcnow():
+        return jsonify(error="Результат доступен после запланированного окончания опубликованной акции"), 409
+    data = json_body()
+    result = str(data.get("result_summary", "")).strip()[:500]
+    if len(result) < 5:
+        return jsonify(error="Коротко опишите результат доброго дела"), 400
+    try:
+        hours = min(max(float(data.get("hours", deed.duration_minutes / 60)), 0.5), 12)
+    except (TypeError, ValueError):
+        return jsonify(error="Некорректное количество часов"), 400
+    selection = data.get("participant_ids")
+    if selection is not None and (
+        not isinstance(selection, list) or any(type(value) is not int for value in selection)
+    ):
+        return jsonify(error="Выберите участников"), 400
+    if not math.isfinite(hours):
+        return jsonify(error="Некорректное количество часов"), 400
+    participant_ids = set(selection) if selection is not None else None
+    thanks = str(data.get("thanks") or "").strip()[:180]
+    if prohibited_activity(result, thanks):
+        return jsonify(error="Результат содержит недопустимые данные"), 400
+    participants = GoodDeedParticipant.query.filter_by(deed_id=deed.id).all()
+    excluded = {deed.owner_id, deed_coordinator(deed)}
+    for participant in participants:
+        if participant.user_id in excluded:
+            continue
+        if participant_ids is None or participant.user_id in participant_ids:
+            participant.status = "confirmed"
+            participant.hours = hours
+            participant.thanks = thanks or None
+            participant.confirmed_at = utcnow()
+    deed.status = "completed"
+    deed.result_summary = result
+    db.session.commit()
+    return jsonify(ok=True, item=_deed_payload(deed, user))
+
+
+@app.get("/api/v2/good-trace")
+def good_trace_v2():
+    user = current_user()
+    if not user:
+        return jsonify(error="Нужна регистрация через Telegram"), 401
+    rows = GoodDeedParticipant.query.filter_by(user_id=user.id, status="confirmed").all()
+    deed_ids = [row.deed_id for row in rows]
+    deeds = GoodDeed.query.filter(GoodDeed.id.in_(deed_ids)).all() if deed_ids else []
+    return jsonify(
+        confirmed_deeds=len(rows),
+        thanks=sum(bool(row.thanks) for row in rows),
+        hours=round(sum(row.hours for row in rows), 1),
+        directions=sorted({GOOD_DEED_DIRECTIONS[deed.direction] for deed in deeds}),
+        appreciations=[{"deed": deed.title, "text": row.thanks}
+                       for deed in deeds for row in rows if row.deed_id == deed.id and row.thanks],
+    )
+
+
+@app.post("/api/v2/admin/good-deeds/<int:deed_id>/decision")
+@login_required
+def moderate_good_deed(deed_id):
+    user = current_user()
+    if user.telegram_id not in ADMIN_TELEGRAM_IDS:
+        return jsonify(error="Нет доступа"), 403
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    deed = transaction_lock(GoodDeed.query.filter_by(id=deed_id), GoodDeed.id)
+    if not deed:
+        abort(404)
+    if deed.owner_id == user.id:
+        return jsonify(error="Акцию проверяет независимый модератор"), 403
+    decision = json_body().get("decision")
+    if decision not in ("active", "rejected"):
+        return jsonify(error="Выберите публикацию или отклонение"), 400
+    if deed.status != "pending" and not (deed.status == "active" and not deed_coordinator(deed)):
+        return jsonify(error="Решение уже принято"), 409
+    if decision == "active":
+        if not launch_modules()["good_deeds"]:
+            return jsonify(error="Публикация акций приостановлена"), 409
+        organizer = active_organizer(deed.owner_id)
+        coordinator_id = deed_coordinator(deed) or json_body().get("coordinator_id")
+        if (not organizer or type(coordinator_id) is not int or not eligible_coordinator(deed.owner_id, coordinator_id)
+                or coordinator_id == user.id):
+            return jsonify(error="Нужны проверенные организатор и координатор, отдельные от модератора"), 409
+        if normalize_dt(deed.starts_at) <= utcnow() or not place_is_public(deed.area) or prohibited_activity(
+            deed.title, deed.description, deed.area, deed.instructions
+        ):
+            return jsonify(error="Проверьте публичное место, содержание и срок акции"), 409
+        coordinator = db.session.get(OrganizerCoordinator, (deed.owner_id, coordinator_id))
+        db.session.merge(DeedCoordination(deed_id=deed.id, coordinator_id=coordinator_id))
+        deed.organizer_name, deed.coordinator_name = organizer.name, coordinator.label
+    deed.status = decision
+    db.session.add(ModerationAction(moderator_id=user.id, action="good_deed_decision",
+                                    metadata_json=json.dumps({"deed_id": deed.id, "decision": decision})))
+    db.session.commit()
+    return jsonify(ok=True, item=_deed_payload(deed, user))
+
+
+class TelegramPreference(db.Model):
+    __tablename__ = "telegram_preference"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    enabled = db.Column(db.Integer, nullable=False)
+    revision = db.Column(db.Integer, nullable=False)
+
+
+class CompanyWatch(db.Model):
+    __tablename__ = "company_watch"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    token = db.Column(db.String(32), nullable=False)
+    category = db.Column(db.String(20), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    radius = db.Column(db.Integer, nullable=False)
+    starts_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    ends_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    matched = db.Column(db.Integer, nullable=False)
+
+
+class Acquisition(db.Model):
+    __tablename__ = "acquisition"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    channel = db.Column(db.String(20), nullable=False)
+    source = db.Column(db.String(60), nullable=False)
+    campaign = db.Column(db.String(80), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class PrivateTask(db.Model):
+    __tablename__ = "private_task"
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    assignee_id = db.Column(db.Integer, db.ForeignKey("user.id"), index=True)
+    category = db.Column(db.String(20), nullable=False)
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(500), nullable=False)
+    budget = db.Column(db.Integer, nullable=False)
+    status = db.Column(db.String(20), nullable=False, index=True)
+    result = db.Column(db.String(500))
+    dispute = db.Column(db.String(300))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class TaskApplication(db.Model):
+    __tablename__ = "task_application"
+    task_id = db.Column(db.Integer, db.ForeignKey("private_task.id"), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+
+
+def transaction_lock(query, column):
+    if engine.dialect.name == "sqlite":
+        # SQLite serializes writers. Acquire the write lock before reading state.
+        query.update({column: column}, synchronize_session=False)
+        return query.first()
+    return query.with_for_update().first()
+
+
+def queue_user_telegram(user_id, kind, dedupe_key=None, watch_token=None, task_id=None):
+    if not launch_modules()["notifications"]:
+        return False
+    preference = db.session.get(TelegramPreference, user_id)
+    if not preference or not preference.enabled:
+        return False
+    task_preference = task_alert_enabled(user_id, kind.removeprefix("task_")) if task_id else None
+    if task_id and not task_preference:
+        return False
+    dedupe_key = dedupe_key or f"event:{g.request_id if has_request_context() else uuid.uuid4().hex}:{user_id}:{kind}"
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    statement = insert(NotificationOutbox).values(
+        kind="user_telegram", dedupe_key=f"user:{dedupe_key}",
+        payload_json=json.dumps({"user_id": user_id, "revision": preference.revision,
+                                 "watch": watch_token, "event": kind, "reminder": dedupe_key,
+                                 "task_id": task_id, "task_revision": task_preference.revision if task_preference else None}),
+        status="pending", attempts=0, created_at=utcnow(), next_attempt_at=utcnow(),
+    ).on_conflict_do_nothing(index_elements=["dedupe_key"])
+    return bool(db.session.execute(statement).rowcount)
+
+
+def process_user_telegram_outbox(limit=20):
+    if not BOT_TOKEN:
+        return
+    stale = utcnow() - timedelta(minutes=5)
+    NotificationOutbox.query.filter_by(kind="user_telegram", status="sending").filter(
+        NotificationOutbox.next_attempt_at < stale
+    ).update({"status": "undelivered", "last_error": "interrupted"}, synchronize_session=False)
+    db.session.commit()
+    for _ in range(limit):
+        query = NotificationOutbox.query.filter_by(kind="user_telegram", status="pending").order_by(NotificationOutbox.id)
+        row = query.with_for_update(skip_locked=True).first() if engine.dialect.name == "postgresql" else query.first()
+        if not row:
+            break
+        row_id, payload = row.id, json.loads(row.payload_json)
+        reserved = NotificationOutbox.query.filter_by(id=row_id, status="pending").update(
+            {"status": "sending", "attempts": 1, "next_attempt_at": utcnow()}, synchronize_session=False
+        )
+        db.session.commit()
+        if not reserved:
+            continue
+        user = transaction_lock(User.query.filter_by(id=payload["user_id"]), User.id)
+        row = db.session.get(NotificationOutbox, row_id)
+        if not row:
+            db.session.rollback()
+            continue
+        preference = db.session.get(TelegramPreference, payload["user_id"])
+        allowed = bool(user and user.telegram_id.isdigit() and preference and preference.enabled
+                       and preference.revision == payload["revision"] and launch_modules()["notifications"]
+                       and not user_hidden(user.id))
+        event = payload["event"]
+        if event == "presence_reminder":
+            presence = Presence.query.filter_by(user_id=payload["user_id"]).first()
+            allowed = allowed and bool(presence and normalize_dt(presence.active_until) > utcnow()
+                                       and presence_reminder_key(presence) == payload["reminder"])
+        if payload["watch"]:
+            watch = db.session.get(CompanyWatch, payload["user_id"])
+            allowed = allowed and bool(watch and watch.token == payload["watch"]
+                                       and normalize_dt(watch.ends_at) > utcnow())
+        if payload.get("task_id"):
+            task = db.session.get(PrivateTask, payload["task_id"])
+            task_event = event.removeprefix("task_")
+            task_preference = task_alert_enabled(payload["user_id"], task_event)
+            allowed = allowed and bool(task and task_preference and
+                task_preference.revision == payload["task_revision"] and private_task_user(user))
+            if allowed and task_event == "match":
+                allowed = task_match_available(task, user.id)
+        row.status = "cancelled"
+        if allowed:
+            message = {
+                "presence_reminder": "Вы открыты к общению уже час. Изменить статус можно в «Сейчас».",
+                "company_watch": "В «Сейчас» появилась компания по вашей подписке.",
+            }.get(event, TASK_ALERTS.get(event.removeprefix("task_"), "В «Сейчас» есть новое событие встречи."))
+            try:
+                result = telegram_api("sendMessage", {
+                    "chat_id": user.telegram_id, "text": f"{message}\n{PUBLIC_URL}/",
+                    "link_preview_options": {"is_disabled": True},
+                })
+                row.status = "sent" if result and result.get("ok") else "undelivered"
+                row.delivered_at = utcnow() if row.status == "sent" else None
+            except (requests.RequestException, ValueError):
+                # A timeout can occur after Telegram accepts the message.
+                row.status = "undelivered"
+        db.session.commit()
+
+
+def presence_reminder_key(presence):
+    started = normalize_dt(presence.updated_at).replace(microsecond=0).isoformat()
+    return f"presence-reminder:{presence.id}:{started}"
+
+
+@app.route("/api/settings/telegram", methods=["GET", "POST"])
+@login_required
+def telegram_preferences():
+    user = current_user()
+    if request.method == "POST":
+        enabled = json_body().get("enabled")
+        if type(enabled) is not bool:
+            return jsonify(error="Укажите согласие на уведомления"), 400
+        if enabled and not (BOT_TOKEN and user.telegram_id.isdigit()):
+            return jsonify(error="Уведомления Telegram недоступны"), 409
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+        preference = db.session.get(TelegramPreference, user.id)
+        if not preference:
+            db.session.add(TelegramPreference(user_id=user.id, enabled=int(enabled), revision=1))
+        elif preference.enabled != enabled:
+            preference.enabled = int(enabled)
+            preference.revision += 1
+        if not enabled:
+            CompanyWatch.query.filter_by(user_id=user.id).delete()
+        db.session.commit()
+    preference = db.session.get(TelegramPreference, user.id)
+    return jsonify(enabled=bool(preference and preference.enabled), available=bool(BOT_TOKEN and user.telegram_id.isdigit()),
+                   bot_url=f"https://t.me/{BOT_USERNAME}")
+
+
+@app.route("/api/company-watch", methods=["GET", "POST", "DELETE"])
+@login_required
+def company_watch():
+    user = current_user()
+    if request.method != "GET":
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+    watch = db.session.get(CompanyWatch, user.id)
+    if request.method == "DELETE":
+        if watch:
+            db.session.delete(watch)
+            db.session.commit()
+        return jsonify(active=False)
+    if request.method == "POST":
+        modules = launch_modules()
+        if user_hidden(user.id) or not modules["notifications"] or not modules["meetings"]:
+            return jsonify(error="Новые подписки временно недоступны"), 409
+        if not completed_profile(user):
+            return jsonify(error="Сначала заполните профиль"), 403
+        preference = db.session.get(TelegramPreference, user.id)
+        if not (BOT_TOKEN and preference and preference.enabled and user.telegram_id.isdigit()):
+            return jsonify(error="Включите Telegram-уведомления в профиле и запустите бота"), 409
+        data = json_body()
+        category, radius, window = data.get("category"), data.get("radius"), data.get("window")
+        zone = submitted_time_zone(data.get("time_zone"))
+        if zone is None:
+            return jsonify(error="Некорректный часовой пояс"), 400
+        lat, lon = data.get("latitude"), data.get("longitude")
+        if not isinstance(category, str) or category not in VALID_CATEGORIES or type(radius) is not int or radius not in (3, 5, 10, 12) or window not in ("hour", "today") or not valid_coordinates(lat, lon):
+            return jsonify(error="Проверьте занятие, радиус, время и геолокацию"), 400
+        if not consume_action(user.id, "company_watch", 5, 3600):
+            return jsonify(error="Слишком много изменений подписки"), 429
+        if not watch:
+            watch = CompanyWatch(user_id=user.id)
+            db.session.add(watch)
+        now = utcnow()
+        watch.token, watch.category = secrets.token_hex(16), category
+        watch.latitude, watch.longitude = approximate_zone(float(lat), float(lon))
+        watch.radius, watch.starts_at = radius, now
+        watch.ends_at = now + timedelta(hours=1) if window == "hour" else end_of_app_day(now, zone)
+        watch.matched = 0
+        db.session.commit()
+    active = bool(watch and not watch.matched and normalize_dt(watch.ends_at) > utcnow())
+    return jsonify(active=active, matched=bool(watch and watch.matched),
+                   ends_at=normalize_dt(watch.ends_at).isoformat() if watch else None,
+                   category=watch.category if watch else None, radius=watch.radius if watch else None)
+
+
+def process_company_watches():
+    if not BOT_TOKEN or not launch_modules()["notifications"] or not launch_modules()["meetings"]:
+        return
+    now = utcnow()
+    CompanyWatch.query.filter(CompanyWatch.ends_at <= now).delete(synchronize_session=False)
+    watches = CompanyWatch.query.filter_by(matched=0).all()
+    for watch in watches:
+        user_id = watch.user_id
+        preference = db.session.get(TelegramPreference, user_id)
+        if not preference or not preference.enabled or user_hidden(user_id):
+            continue
+        blocks = {row.blocked_id if row.blocker_id == user_id else row.blocker_id for row in UserBlock.query.filter(
+            (UserBlock.blocker_id == user_id) | (UserBlock.blocked_id == user_id)
+        )}
+        excluded = blocks | {user_id}
+        presences = Presence.query.filter(Presence.active_until > now, Presence.category == watch.category)
+        meetings = Meeting.query.filter(Meeting.category == watch.category, Meeting.expires_at > now,
+                                        Meeting.starts_at < watch.ends_at)
+        candidates = [(row.user_id, row.latitude, row.longitude) for row in presences]
+        for meeting in meetings:
+            if targeted_meeting(meeting) or effective_meeting_status(meeting) != "active" or chat_closed_for(meeting, user_id):
+                continue
+            if meeting.category == "help" and meeting.description not in SAFE_HELP_GOALS:
+                continue
+            if len(accepted_user_ids(meeting)) >= (2 if meeting.format == "one" else 6):
+                continue
+            if Interest.query.filter_by(meeting_id=meeting.id, user_id=user_id).first():
+                continue
+            candidates.append((meeting.owner_id, meeting.latitude, meeting.longitude))
+        for owner_id, lat, lon in candidates:
+            if owner_id in excluded or user_hidden(owner_id):
+                continue
+            if haversine_km(watch.latitude, watch.longitude, *approximate_zone(lat, lon)) <= watch.radius:
+                updated = CompanyWatch.query.filter_by(user_id=user_id, token=watch.token, matched=0).update(
+                    {"matched": 1}, synchronize_session=False
+                )
+                if updated:
+                    queue_user_telegram(user_id, "company_watch", f"watch:{watch.token}", watch.token)
+                break
+    db.session.commit()
+
+
+ACQUISITION_CHANNELS = {"press": "press", "creator": "creator", "ads": "ads",
+                        "cpc": "ads", "paid_social": "ads"}
+
+
+def acquisition_channel(medium):
+    return ACQUISITION_CHANNELS.get(medium, "other")
+
+
+def record_acquisition(user, source, medium, campaign):
+    channel = acquisition_channel(medium)
+    if not user or channel == "other" or utcnow() - normalize_dt(user.created_at) > timedelta(hours=24):
+        return
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    db.session.execute(insert(Acquisition).values(
+        user_id=user.id, channel=channel, source=source, campaign=campaign, created_at=utcnow()
+    ).on_conflict_do_nothing(index_elements=["user_id"]))
+
+
+TASK_CATEGORIES = {
+    "editing": "Редактура текста", "digitizing": "Оцифровка открытых материалов",
+    "design": "Оформление материалов", "research": "Поиск общедоступной информации",
+    "stock": "Проверка наличия и выкладки товара", "price": "Проверка цены",
+    "public_info": "Проверка публичной информации на месте", "public_photo": "Разрешённая съёмка объекта",
+
+}
+
+
+def private_task_access():
+    return private_task_user(current_user())
+
+
+def private_task_user(user):
+    allowed = {value.strip() for value in os.getenv("PRIVATE_TASK_TELEGRAM_IDS", "").split(",")}
+    if not user or user_hidden(user.id):
+        return None
+    if user.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids()):
+        return user
+    override = db.session.get(ReleaseSetting, f"task_access:{user.id}")
+    if override is not None:
+        return user if json.loads(override.value) else None
+    return user if user.telegram_id in allowed or corporate_name(user) else None
+
+
+def task_peer_allowed(owner_id, candidate_id):
+    if not private_task_user(db.session.get(User, owner_id)):
+        return False
+    return not UserBlock.query.filter(
+        ((UserBlock.blocker_id == owner_id) & (UserBlock.blocked_id == candidate_id))
+        | ((UserBlock.blocker_id == candidate_id) & (UserBlock.blocked_id == owner_id))
+    ).first()
+
+
+def task_item(task, user, admin):
+    details = db.session.get(TaskDetails, task.id)
+    manager = task.owner_id == user.id or admin
+    status = "expired" if task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(details) else task.status
+    private = manager or task.assignee_id == user.id
+    applications = TaskApplication.query.filter_by(task_id=task.id).all()
+    can_reopen = status in {"refused", "cancelled", "expired"} and not task.result and (status != "expired" or not task.assignee_id)
+    can_dispute_refusal = status == "refused" and bool(task.result) and not task_refusal_resolved(task.id)
+    amounts = task_amounts(task, details)
+    return {
+        "id": task.id, "category": task.category, "title": task.title,
+        "description": task.description, "budget": task.budget, "currency": details.currency if details else "BYN",
+        "terms": task_terms_payload(details),
+        "history": [{"action": row.action, "status": row.status, "at": normalize_dt(row.created_at).isoformat()}
+                    for row in TaskActivity.query.filter_by(task_id=task.id).order_by(TaskActivity.id)] if private else [],
+        "estimated_fee": amounts["fee"], "amounts": amounts,
+        "materials": [{"id": row.id, "url": f"/api/private/tasks/{task.id}/materials/{row.id}"}
+                      for row in TaskMaterial.query.filter_by(task_id=task.id)] if private else [],
+        "status": status, "mine": task.owner_id == user.id,
+        "has_assignee": bool(task.assignee_id),
+        "can_reopen": can_reopen, "can_dispute_refusal": can_dispute_refusal,
+        "assigned_to_me": task.assignee_id == user.id,
+        "applied": any(row.user_id == user.id for row in applications),
+        "result": task.result if private else None, "dispute": task.dispute if private else None,
+        "applicants": [{"id": row.user_id, "name": db.session.get(User, row.user_id).name,
+                        "completed": PrivateTask.query.filter_by(assignee_id=row.user_id, status="accepted").count()}
+                       for row in applications] if manager else [],
+    }
+
+
+@app.route("/api/private/tasks", methods=["GET", "POST"])
+@login_required
+def private_tasks():
+    user = private_task_access()
+    if not user:
+        return jsonify(error="Раздел доступен участникам закрытой группы"), 403
+    admin = user.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids())
+    if request.method == "GET":
+        query = PrivateTask.query
+        if not admin:
+            query = query.filter((PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id)
+                                 | (PrivateTask.status == "approved"))
+        scope = request.args.get("scope", "all")
+        city = request.args.get("city", "").strip()[:100]
+        country = request.args.get("country", "").strip().upper()
+        category = request.args.get("category", "")
+        currency = request.args.get("currency", "")
+        deadline = request.args.get("deadline", "")
+        limits = [request.args.get(key, "") for key in ("budget_min", "budget_max")]
+        if (scope not in {"all", "available", "mine"} or country and not re.fullmatch(r"[A-Z]{2}", country)
+                or category and category not in TASK_CATEGORIES or currency and currency not in TASK_CURRENCIES
+                or deadline not in {"", "24h", "7d"} or any(value and not re.fullmatch(r"[0-9]{1,6}", value) for value in limits)):
+            return jsonify(error="Проверьте фильтры поручений"), 400
+        minimum, maximum = [int(value) if value else None for value in limits]
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return jsonify(error="Минимальная сумма превышает максимальную"), 400
+        now = utcnow()
+        query = query.outerjoin(TaskDetails)
+        available = (PrivateTask.status == "approved") & (PrivateTask.owner_id != user.id) & (
+            TaskDetails.due_at.is_(None) | (TaskDetails.due_at > now)
+        )
+        if scope == "available":
+            enabled = launch_modules()["tasks"] and task_policy()["enabled"]
+            query = query.filter(available, enabled)
+        elif scope == "mine" and not admin:
+            applied = db.session.query(TaskApplication.task_id).filter_by(user_id=user.id)
+            query = PrivateTask.query.outerjoin(TaskDetails).filter(
+                (PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id) | PrivateTask.id.in_(applied))
+        elif not admin:
+            query = query.filter((PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id) | available)
+        if country:
+            query = query.filter(TaskDetails.country == country)
+        if category:
+            query = query.filter(PrivateTask.category == category)
+        if currency:
+            query = query.filter(func.coalesce(TaskDetails.currency, "BYN") == currency)
+        if deadline:
+            query = query.filter(TaskDetails.due_at > now, TaskDetails.due_at <= now + timedelta(days=1 if deadline == "24h" else 7))
+        if minimum is not None:
+            query = query.filter(PrivateTask.budget >= minimum)
+        if maximum is not None:
+            query = query.filter(PrivateTask.budget <= maximum)
+        items = []
+        for task in query.order_by(PrivateTask.id.desc()).yield_per(50):
+            details = db.session.get(TaskDetails, task.id)
+            if city and (not details or not details.city or details.city.casefold() != city.casefold()):
+                continue
+            if scope == "available" or not admin and user.id not in (task.owner_id, task.assignee_id):
+                if not task_peer_allowed(task.owner_id, user.id) or not task_conditions_safe(task):
+                    continue
+            items.append(task_item(task, user, admin))
+            if len(items) == 100:
+                break
+        policy = task_policy()
+        return jsonify(items=items, fee_bps=policy["fee_bps"], max_budget=policy["max_budget"],
+                       enabled=policy["enabled"] and launch_modules()["tasks"], categories=enabled_task_categories(), category_labels=TASK_CATEGORIES, currencies=sorted(TASK_CURRENCIES), moderator=admin, csrf_token=admin_csrf_token() if admin else None,
+                       reputation={"completed": PrivateTask.query.filter_by(assignee_id=user.id, status="accepted").count()})
+    if not completed_profile(user):
+        return jsonify(error="Сначала заполните профиль"), 403
+    if not task_policy()["enabled"] or not launch_modules()["tasks"]:
+        return jsonify(error="Создание поручений приостановлено"), 409
+    data = json_body()
+    category, budget = data.get("category"), data.get("budget")
+    title, description = str(data.get("title") or "").strip(), str(data.get("description") or "").strip()
+    if not isinstance(category, str) or category not in enabled_task_categories() or type(budget) is not int or not 1 <= budget <= task_policy()["max_budget"]:
+        return jsonify(error="Выберите разрешённую категорию и укажите вознаграждение"), 400
+    if not 3 <= len(title) <= 100 or not 10 <= len(description) <= 500:
+        return jsonify(error="Укажите название и описание поручения"), 400
+    terms = parse_task_terms(category, data)
+    if terms is None:
+        return jsonify(error="Проверьте город, страну, срок, валюту и требования к результату"), 400
+    if prohibited_activity(title, description, terms["requirements"]):
+        return jsonify(error="Поручение должно быть безопасным и не должно затрагивать частные данные"), 400
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
+    if not consume_action(user.id, "private_task", 5, 3600):
+        return jsonify(error="Слишком много поручений за час"), 429
+    task = PrivateTask(owner_id=user.id, category=category, title=title, description=description,
+                       budget=budget, status="pending")
+    db.session.add(task)
+    db.session.flush()
+    db.session.add(TaskDetails(task_id=task.id, organization=corporate_name(user), **terms))
+    db.session.add(TaskActivity(task_id=task.id, actor_id=user.id, action="create", status="pending"))
+    db.session.commit()
+    return jsonify(item=task_item(task, user, admin)), 201
+
+
+@app.post("/api/private/tasks/<int:task_id>/action")
+@login_required
+def private_task_action(task_id):
+    user = private_task_access()
+    if not user:
+        return jsonify(error="Нет доступа"), 403
+    admin = user.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids())
+    task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
+    if not task or not (admin or user.id in (task.owner_id, task.assignee_id) or db.session.get(TaskApplication, (task.id, user.id)) or (task.status == "approved" and task_peer_allowed(task.owner_id, user.id))):
+        abort(404)
+    data = json_body()
+    action = data.get("action")
+    details = db.session.get(TaskDetails, task.id)
+    if task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(details):
+        task.status = "expired"
+        record_task_change(task, None, "expired")
+        db.session.commit()
+        task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
+        if not task:
+            abort(404)
+    before_status = task.status
+    previous_assignee = task.assignee_id
+    application_changed = False
+    if action in ("approve", "apply", "assign", "reopen") and (not task_policy()["enabled"] or not launch_modules()["tasks"]):
+        return jsonify(error="Публикация и назначение поручений приостановлены"), 409
+    if action in ("apply", "assign", "start", "submit", "reopen") and not completed_profile(user):
+        return jsonify(error="Сначала заполните профиль"), 403
+    if action in ("apply", "assign") and not task_conditions_safe(task):
+        return jsonify(error="Поручение больше не соответствует правилам"), 409
+    if action in ("approve", "apply", "assign") and details and details.due_at and normalize_dt(details.due_at) <= utcnow():
+        return jsonify(error="Срок поручения истёк"), 409
+    owner, assignee = task.owner_id == user.id, task.assignee_id == user.id
+    if not admin and not owner and action not in ("withdraw", "refuse", "dispute", "confirm_cancel") and not task_peer_allowed(task.owner_id, user.id):
+        abort(404)
+    if owner and previous_assignee and action == "accept" and not task_peer_allowed(user.id, previous_assignee):
+        return jsonify(error="При ограничении контакта результат принимает модератор через спор"), 409
+    text = str(data.get("text") or "").strip()
+    if action in ("approve", "reject", "resolve_accept", "resolve_refuse"):
+        if not admin or owner or assignee or not verify_admin_csrf():
+            return jsonify(error="Действие доступно независимому модератору"), 403
+        transitions = {"approve": ("pending", "approved"), "reject": ("pending", "rejected"),
+                       "resolve_accept": ("disputed", "accepted"), "resolve_refuse": ("disputed", "refused")}
+        before, after = transitions[action]
+        if action == "approve" and not task_conditions_safe(task):
+            return jsonify(error="Поручение больше не соответствует правилам"), 409
+        if action == "resolve_accept" and not task.result:
+            return jsonify(error="Подтвердить завершение можно только при наличии результата"), 409
+        if task.status != before:
+            return jsonify(error="Решение уже принято или действие недоступно"), 409
+        task.status = after
+    elif action == "apply" and not owner and task.status == "approved":
+        if details and details.city and not worker_matches_area(user.id, details):
+            return jsonify(error="Укажите этот город в своём районе работы"), 409
+        if TaskActivity.query.filter_by(task_id=task.id, actor_id=user.id, action="approve").first():
+            return jsonify(error="Модератор своего решения не может принять это поручение"), 403
+        if not db.session.get(TaskApplication, (task.id, user.id)):
+            db.session.add(TaskApplication(task_id=task.id, user_id=user.id))
+            application_changed = True
+    elif action == "withdraw" and not owner and not assignee:
+        application = db.session.get(TaskApplication, (task.id, user.id))
+        if application:
+            db.session.delete(application)
+            application_changed = True
+    elif action == "cancel" and owner and task.status in {"pending", "approved", "assigned", "in_progress"}:
+        task.status = "cancel_requested" if task.assignee_id else "cancelled"
+    elif action == "confirm_cancel" and assignee and task.status == "cancel_requested":
+        task.status = "cancelled"
+    elif action == "reopen" and owner and task.status in {"refused", "cancelled", "expired"} and not task.result and (task.status != "expired" or not task.assignee_id):
+        deadline = data.get("due_at")
+        due_at = _parse_start(deadline) if isinstance(deadline, str) else None
+        if not due_at or not utcnow() < due_at <= utcnow()+timedelta(days=90):
+            return jsonify(error="Укажите будущий срок в пределах 90 дней"), 400
+        if not details:
+            details = TaskDetails(task_id=task.id, requirements="", currency="BYN", fee_bps=0)
+            db.session.add(details)
+        details.due_at = due_at
+        if previous_assignee:
+            TaskApplication.query.filter_by(task_id=task.id, user_id=previous_assignee).delete()
+        task.assignee_id, task.dispute, task.status = None, None, "pending"
+    elif action == "start" and assignee and task.status == "assigned":
+        task.status = "in_progress"
+    elif action == "assign" and owner and task.status == "approved":
+        target = data.get("user_id")
+        if type(target) is not int or not db.session.get(TaskApplication, (task.id, target)) or not private_task_user(db.session.get(User, target)) or not task_peer_allowed(user.id, target) or (details and details.city and not worker_matches_area(target, details)):
+            return jsonify(error="Выберите доступного участника из откликов"), 400
+        task.assignee_id, task.status = target, "assigned"
+    elif action == "submit" and assignee and task.status in {"assigned", "in_progress"} and 5 <= len(text) <= 500:
+        if details and details.due_at and normalize_dt(details.due_at) <= utcnow():
+            return jsonify(error="Срок поручения истёк. Вы можете открыть спор"), 409
+        photos = data.get("photos", [])
+        if not isinstance(photos, list) or len(photos) > 3:
+            return jsonify(error="Можно приложить до трёх фотографий"), 400
+        try:
+            images = [sanitized_photo(photo) for photo in photos]
+        except (ValueError, OSError, Image.DecompressionBombError):
+            return jsonify(error="Загрузите корректное изображение JPEG, PNG или WebP"), 400
+        if task.category == "public_photo" and not images:
+            return jsonify(error="Добавьте фотографию результата"), 400
+        for image in images:
+            db.session.add(TaskMaterial(task_id=task.id, image=encrypt_selfie(image)))
+        task.result, task.status = text, "submitted"
+    elif action == "accept" and owner and task.status == "submitted":
+        task.status = "accepted"
+    elif action == "refuse" and assignee and task.status in {"assigned", "in_progress", "expired"}:
+        task.status = "refused"
+    elif action == "refuse" and owner and task.status == "submitted" and 5 <= len(text) <= 300:
+        task.dispute, task.status = text, "refused"
+    elif action == "dispute" and (
+        (owner and (task.status in {"submitted", "cancel_requested"} or task.status == "expired" and task.assignee_id)) or
+        (assignee and (task.status in ("assigned", "in_progress", "submitted", "cancel_requested", "expired") or (task.status == "refused" and task.result and not task_refusal_resolved(task.id))))
+    ) and 5 <= len(text) <= 300:
+        task.dispute, task.status = text, "disputed"
+    else:
+        return jsonify(error="Действие недоступно для вашей роли или статуса поручения"), 409
+    if task.status != before_status or application_changed:
+        record_task_change(task, user.id, action, previous_assignee)
+    db.session.commit()
+    return jsonify(item=task_item(task, user, admin))
+
+
+def delete_private_features(user_id):
+    for row in NotificationOutbox.query.filter_by(kind="user_telegram"):
+        if json.loads(row.payload_json).get("user_id") == user_id:
+            db.session.delete(row)
+    ReleaseSetting.query.filter(ReleaseSetting.key.in_([f"corporate:{user_id}", f"task_access:{user_id}"])).delete()
+    TaskAlertPreference.query.filter_by(user_id=user_id).delete()
+    CompanyWatch.query.filter_by(user_id=user_id).delete()
+    TelegramPreference.query.filter_by(user_id=user_id).delete()
+    Acquisition.query.filter_by(user_id=user_id).delete()
+    TaskApplication.query.filter_by(user_id=user_id).delete()
+    owned_ids = db.session.query(PrivateTask.id).filter_by(owner_id=user_id)
+    TaskApplication.query.filter(TaskApplication.task_id.in_(owned_ids)).delete(synchronize_session=False)
+    assigned_ids = db.session.query(PrivateTask.id).filter_by(assignee_id=user_id)
+    TaskMaterial.query.filter(TaskMaterial.task_id.in_(owned_ids) | TaskMaterial.task_id.in_(assigned_ids)).delete(synchronize_session=False)
+    TaskActivity.query.filter(TaskActivity.task_id.in_(owned_ids) | (TaskActivity.actor_id == user_id)).delete(synchronize_session=False)
+    TaskDetails.query.filter(TaskDetails.task_id.in_(owned_ids)).delete(synchronize_session=False)
+    PrivateTask.query.filter_by(owner_id=user_id).delete()
+    PrivateTask.query.filter_by(assignee_id=user_id).update({"assignee_id": None, "status": "refused", "result": None, "dispute": None})
+
+
+class TaskDetails(db.Model):
+    __tablename__ = "task_details"
+    task_id = db.Column(db.Integer, db.ForeignKey("private_task.id"), primary_key=True)
+    city = db.Column(db.String(100))
+    organization = db.Column(db.String(120))
+    country = db.Column(db.String(2))
+    due_at = db.Column(db.DateTime(timezone=True))
+    requirements = db.Column(db.String(500), nullable=False)
+    currency = db.Column(db.String(3), nullable=False)
+    fee_bps = db.Column(db.Integer, nullable=False)
+
+
+class TaskMaterial(db.Model):
+    __tablename__ = "task_material"
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey("private_task.id"), nullable=False, index=True)
+    image = db.Column(db.Text, nullable=False)
+
+
+class TaskActivity(db.Model):
+    __tablename__ = "task_activity"
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey("private_task.id"), nullable=False, index=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    action = db.Column(db.String(30), nullable=False)
+    status = db.Column(db.String(20), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ReleaseSetting(db.Model):
+    __tablename__ = "release_setting"
+    key = db.Column(db.String(40), primary_key=True)
+    value = db.Column(db.Text, nullable=False)
+
+
+TASK_CURRENCIES = frozenset({"BYN", "EUR", "USD", "GBP", "PLN", "CAD", "JPY"})
+LOCAL_TASKS = frozenset({"stock", "price", "public_info", "public_photo"})
+DEFAULT_TASK_POLICY = {"categories": list(TASK_CATEGORIES), "max_budget": 10000, "fee_bps": 0, "enabled": True}
+
+
+def submitted_time_zone(value):
+    if value is None:
+        return APP_TIMEZONE
+    if not isinstance(value, str) or not 1 <= len(value) <= 70:
+        return None
+    try:
+        return ZoneInfo(value)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def task_moderator_ids():
+    return {value.strip() for value in os.getenv("TASK_MODERATOR_TELEGRAM_IDS", "").split(",") if value.strip()}
+
+
+def task_policy():
+    setting = db.session.get(ReleaseSetting, "task_policy")
+    return json.loads(setting.value) if setting else DEFAULT_TASK_POLICY
+
+
+def enabled_task_categories():
+    return {key: TASK_CATEGORIES[key] for key in task_policy()["categories"]}
+
+
+def prohibited_activity(*fields):
+    pattern = (r"парол|банковск|паспорт|PIN[- ]?код|cvv|прослед|слежк|разыскать человека|"
+               r"незаконн.{0,10}съ[её]м|персональн.{0,10}данн|перевезти неизвест|"
+               r"частн.{0,10}территор|медицинск.{0,15}манипуляц|несовершеннолет|"
+               r"частн\w* дом|домой к|на дом к|жилищ|квартир|подъезд|неизвестн\w* посыл|оружи|наркот|взрыв|опасн\w* работ|уязвим\w* люд|люд\w* с деменц|\+375[\s()-]*\d[\s()0-9-]{7,}|"
+               r"stalk|track a person|private data|bank password|medical procedure|unknown parcel")
+    return any(re.search(pattern, field, re.IGNORECASE) for field in fields)
+
+
+def parse_task_terms(category, data):
+    city = str(data.get("city") or "").strip()
+    country = str(data.get("country") or "").strip().upper()
+    requirements = str(data.get("requirements") or "").strip()
+    currency = data.get("currency", "BYN")
+    deadline = data.get("due_at")
+    if not isinstance(currency, str) or currency not in TASK_CURRENCIES or len(city) > 100 or len(requirements) > 500:
+        return None
+    if bool(city) != bool(country) or country and not re.fullmatch(r"[A-Z]{2}", country):
+        return None
+    due_at = _parse_start(deadline) if isinstance(deadline, str) else None
+    if deadline and (not due_at or not utcnow() < due_at <= utcnow() + timedelta(days=90)):
+        return None
+    if category in LOCAL_TASKS and not (city and due_at and len(requirements) >= 5
+                                        and data.get("public_site_confirmed") is True):
+        return None
+    due_at = due_at or utcnow() + timedelta(days=7)
+    return {"city": city or None, "country": country or None, "due_at": due_at,
+            "requirements": requirements, "currency": currency, "fee_bps": task_policy()["fee_bps"]}
+
+
+def task_terms_payload(details):
+    if not details:
+        return {"city": None, "country": None, "due_at": None, "requirements": "", "fee_bps": 0, "organization": None}
+    return {"city": details.city, "country": details.country, "requirements": details.requirements,
+            "organization": details.organization,
+            "due_at": normalize_dt(details.due_at).isoformat() if details.due_at else None,
+            "fee_bps": details.fee_bps}
+
+
+def sanitized_photo(value):
+    if not valid_photo(value):
+        raise ValueError("Invalid image")
+    raw = base64.b64decode(value.split(",", 1)[1], validate=True)
+    with Image.open(io.BytesIO(raw)) as photo:
+        if photo.width * photo.height > 12_000_000 or photo.format not in {"JPEG", "PNG", "WEBP"}:
+            raise ValueError("Image size or format")
+        photo.thumbnail((1440, 1440))
+        # A fresh image drops EXIF, GPS coordinates and embedded profiles.
+        clean = Image.new("RGB", photo.size)
+        clean.paste(photo.convert("RGB"))
+        buffer = io.BytesIO()
+        clean.save(buffer, format="JPEG", quality=82)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def expire_task_materials():
+    cutoff = utcnow() - timedelta(days=90)
+    recent = db.session.query(TaskActivity.task_id).filter(TaskActivity.created_at >= cutoff)
+    expired = db.session.query(PrivateTask.id).filter(
+        PrivateTask.status.in_(("accepted", "refused", "rejected")),
+        PrivateTask.created_at < cutoff,
+        ~PrivateTask.id.in_(recent),
+    )
+    TaskMaterial.query.filter(TaskMaterial.task_id.in_(expired)).delete(synchronize_session=False)
+    db.session.commit()
+
+
+@app.get("/api/private/tasks/<int:task_id>/materials/<int:material_id>")
+@login_required
+def task_material_download(task_id, material_id):
+    user = private_task_access()
+    task = db.session.get(PrivateTask, task_id) if user else None
+    if not task or (user.id not in (task.owner_id, task.assignee_id)
+                    and user.telegram_id not in (ADMIN_TELEGRAM_IDS | task_moderator_ids())):
+        abort(404)
+    material = TaskMaterial.query.filter_by(id=material_id, task_id=task_id).first()
+    value = decrypt_selfie(material.image) if material else None
+    if not value:
+        abort(404)
+    return Response(base64.b64decode(value.split(",", 1)[1]), mimetype="image/jpeg",
+                    headers={"Content-Disposition": 'attachment; filename="result.jpg"'})
+
+
+@app.route("/api/admin/release-settings", methods=["GET", "POST"])
+@admin_required
+def release_settings():
+    if request.method == "POST":
+        if not verify_admin_csrf():
+            return jsonify(error="CSRF-проверка не пройдена"), 403
+        data = json_body()
+        categories, max_budget, fee, enabled = (data.get(key) for key in DEFAULT_TASK_POLICY)
+        if not isinstance(categories, list) or not categories or any(
+            not isinstance(key, str) or key not in TASK_CATEGORIES for key in categories
+        ) or type(max_budget) is not int or not 1 <= max_budget <= 100000 or type(fee) is not int or not 0 <= fee <= 5000 or type(enabled) is not bool:
+            return jsonify(error="Проверьте параметры поручений"), 400
+        policy = {"categories": sorted(set(categories)), "max_budget": max_budget, "fee_bps": fee, "enabled": enabled}
+        insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+        statement = insert(ReleaseSetting).values(key="task_policy", value=json.dumps(policy))
+        db.session.execute(statement.on_conflict_do_update(index_elements=["key"], set_={"value": statement.excluded.value}))
+        db.session.add(ModerationAction(moderator_id=current_user().id, action="task_policy",
+                                        metadata_json=json.dumps(policy)))
+        db.session.commit()
+    return jsonify(policy=task_policy(), categories=TASK_CATEGORIES, csrf_token=admin_csrf_token())
+
+
+def corporate_name(user):
+    setting = db.session.get(ReleaseSetting, f"corporate:{user.id}")
+    return setting.value if setting else None
+
+
+@app.route("/api/admin/corporate-customers", methods=["GET", "POST"])
+@admin_required
+def corporate_customers():
+    if request.method == "POST":
+        if not verify_admin_csrf():
+            return jsonify(error="CSRF-проверка не пройдена"), 403
+        data = json_body()
+        account = data.get("account")
+        organization = data.get("organization")
+        if not isinstance(account, str) or not re.fullmatch(r"\d{1,20}", account) or not isinstance(organization, str):
+            return jsonify(error="Укажите Telegram ID и организацию"), 400
+        organization = organization.strip()
+        if organization and not 2 <= len(organization) <= 120:
+            return jsonify(error="Название организации должно содержать от 2 до 120 символов"), 400
+        user = User.query.filter_by(telegram_id=account).first()
+        if not user:
+            return jsonify(error="Пользователь должен сначала зарегистрироваться"), 404
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+        key = f"corporate:{user.id}"
+        existing = db.session.get(ReleaseSetting, key)
+        if organization and not existing:
+            db.session.add(ReleaseSetting(key=key, value=organization))
+        elif organization:
+            existing.value = organization
+        elif existing:
+            db.session.delete(existing)
+        db.session.add(ModerationAction(moderator_id=current_user().id, action="corporate_access",
+                                        metadata_json=json.dumps({"user_id": user.id, "enabled": bool(organization)})))
+        db.session.commit()
+    items = []
+    for setting in ReleaseSetting.query.filter(ReleaseSetting.key.startswith("corporate:")).order_by(ReleaseSetting.key):
+        user = db.session.get(User, int(setting.key.split(":")[1]))
+        if user:
+            items.append({"account": user.telegram_id, "organization": setting.value})
+    return jsonify(items=items, csrf_token=admin_csrf_token())
+
+
+@app.get("/api/admin/release-metrics")
+@admin_required
+def release_metrics():
+    now = utcnow()
+    completed = MeetingState.query.filter_by(status="completed").count()
+    first_day = (now.astimezone(APP_TIMEZONE).date() - timedelta(days=6)).isoformat()
+    recent = DailyActivity.query.filter(DailyActivity.day >= first_day)
+    returning = recent.with_entities(DailyActivity.user_id).group_by(
+        DailyActivity.user_id).having(func.count(DailyActivity.day) >= 2).count()
+    daily = recent.with_entities(DailyActivity.day, func.count(DailyActivity.user_id)).group_by(
+        DailyActivity.day).order_by(DailyActivity.day).all()
+    repeat_count = Meeting.query.join(MeetingState).filter(
+        MeetingState.status == "completed", Meeting.description.startswith("Повторная встреча · ")
+    ).count()
+    grouped = db.session.query(TaskDetails.currency, func.sum(PrivateTask.budget * TaskDetails.fee_bps)).join(
+        TaskDetails, TaskDetails.task_id == PrivateTask.id
+    ).filter(PrivateTask.status == "accepted").group_by(TaskDetails.currency).all()
+    return jsonify(
+        visits=TrafficVisit.query.count(), registrations=User.query.count(),
+        active_7d=recent.with_entities(DailyActivity.user_id).distinct().count(),
+        daily_activity=[{"day": day, "users": count} for day, count in daily],
+        meetings=Meeting.query.count(), responses=Interest.query.count(), confirmed_responses=Interest.query.filter_by(status="accepted").count(),
+        completed_meetings=completed, returning_7d=returning, completed_repeat_meetings=repeat_count, completed_good_deeds=GoodDeed.query.filter_by(status="completed").count(),
+        tasks=PrivateTask.query.count(), completed_tasks=PrivateTask.query.filter_by(status="accepted").count(),
+        estimated_commission=[{"currency": code, "amount": str(round(total / 10000, 2))} for code, total in grouped],
+        actual_revenue=[], runtime_errors=dict(RUNTIME_ERRORS),
+        outbox={status: count for status, count in db.session.query(
+            NotificationOutbox.status, func.count(NotificationOutbox.id)).group_by(NotificationOutbox.status)},
+
+    )
+
+
+class VerifiedOrganizer(db.Model):
+    __tablename__ = "verified_organizer"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    active = db.Column(Boolean, nullable=False)
+
+
+class OrganizerCoordinator(db.Model):
+    __tablename__ = "organizer_coordinator"
+    organizer_id = db.Column(db.Integer, db.ForeignKey("verified_organizer.user_id"), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    label = db.Column(db.String(120), nullable=False)
+
+
+class DeedCoordination(db.Model):
+    __tablename__ = "deed_coordination"
+    deed_id = db.Column(db.Integer, db.ForeignKey("good_deed_v2.id"), primary_key=True)
+    coordinator_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+
+
+class TaskWorkArea(db.Model):
+    __tablename__ = "task_work_area"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    country = db.Column(db.String(2), nullable=False, index=True)
+    city = db.Column(db.String(100), nullable=False)
+
+
+class PublicRateBucket(db.Model):
+    __tablename__ = "public_rate_bucket"
+    key = db.Column(db.String(64), primary_key=True)
+    window = db.Column(db.Integer, nullable=False, index=True)
+    count = db.Column(db.Integer, nullable=False)
+
+
+class DailyActivity(db.Model):
+    __tablename__ = "daily_activity"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    day = db.Column(db.String(10), primary_key=True, index=True)
+
+
+DEFAULT_MODULES = {"meetings": True, "good_deeds": True, "tasks": True, "notifications": True}
+MEETING_ENTRY_ENDPOINTS = {"create_meeting", "repeat_meeting", "express_interest",
+                           "propose_meeting_to_presence", "set_presence"}
+
+
+def launch_modules():
+    setting = db.session.get(ReleaseSetting, "launch_modules")
+    return json.loads(setting.value) if setting else DEFAULT_MODULES
+
+
+def write_release_setting(key, value):
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    statement = insert(ReleaseSetting).values(key=key, value=json.dumps(value))
+    db.session.execute(statement.on_conflict_do_update(index_elements=["key"],
+                                                      set_={"value": statement.excluded.value}))
+
+
+def launch_audit(action, metadata, reason=None):
+    db.session.add(ModerationAction(moderator_id=current_user().id, action=action,
+                                    reason=reason, metadata_json=json.dumps(metadata)))
+
+
+@app.before_request
+def enforce_launch_boundaries():
+    if not request.path.startswith("/api/"):
+        return
+    endpoint = request.endpoint
+    mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+    if not mutation:
+        return
+    user = current_user()
+    safe_actions = {"delete_account", "stop_presence", "logout", "report_user", "read_notifications",
+                    "telegram_preferences", "company_watch"}
+    if user and user_hidden(user.id) and endpoint not in safe_actions:
+        return jsonify(error="Действия аккаунта временно ограничены"), 403
+    if endpoint in MEETING_ENTRY_ENDPOINTS and not launch_modules()["meetings"]:
+        return jsonify(error="Новые встречи временно приостановлены"), 409
+    if endpoint in {"create_good_deed_v2", "join_good_deed_v2"} and not launch_modules()["good_deeds"]:
+        if endpoint != "join_good_deed_v2" or json_body().get("joined") is not False:
+            return jsonify(error="Новые акции и запись временно приостановлены"), 409
+
+
+@app.route("/api/admin/launch-modules", methods=["GET", "POST"])
+@admin_required
+def admin_launch_modules():
+    if request.method == "POST":
+        if not verify_admin_csrf():
+            return jsonify(error="CSRF-проверка не пройдена"), 403
+        modules = json_body().get("modules")
+        if not isinstance(modules, dict) or modules.keys() != DEFAULT_MODULES.keys() or any(type(value) is not bool for value in modules.values()):
+            return jsonify(error="Укажите доступность всех разделов"), 400
+        write_release_setting("launch_modules", modules)
+        launch_audit("launch_modules", modules)
+        bump_sync(feed=True, admin=True)
+        db.session.commit()
+    return jsonify(modules=launch_modules(), csrf_token=admin_csrf_token())
+
+
+@app.get("/api/admin/users")
+@admin_required
+def admin_users():
+    account = request.args.get("account", "").strip()
+    query = User.query
+    if account:
+        if not re.fullmatch(r"[0-9]{1,20}", account):
+            return jsonify(error="Укажите числовой Telegram ID"), 400
+        query = query.filter_by(telegram_id=account)
+    before = request.args.get("before", type=int)
+    if before:
+        query = query.filter(User.id < before)
+    users = query.order_by(User.id.desc()).limit(51).all()
+    return jsonify(items=[{"id": user.id, "name": user.name,
+                           "restricted": user_hidden(user.id),
+                           "admin": user.telegram_id in ADMIN_TELEGRAM_IDS,
+                           "organizer": bool(active_organizer(user.id)),
+                           "task_access": bool(private_task_user(user))}
+                          for user in users[:50]],
+                   next_before=users[49].id if len(users) > 50 else None)
+
+
+@app.post("/api/admin/users/<int:user_id>/access")
+@admin_required
+def admin_user_access(user_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    target = transaction_lock(User.query.filter_by(id=user_id), User.id)
+    if not target:
+        abort(404)
+    if target.telegram_id in ADMIN_TELEGRAM_IDS:
+        return jsonify(error="Администраторы управляются владельцем"), 403
+    data = json_body()
+    hours = data.get("hours")
+    reason = str(data.get("reason") or "").strip()
+    if type(hours) is not int or hours not in (0, 24, 168, 876000) or not 3 <= len(reason) <= 180:
+        return jsonify(error="Укажите срок и причину решения"), 400
+    existing = UserModeration.query.filter_by(user_id=user_id).first()
+    if hours:
+        expires = utcnow() + timedelta(hours=hours)
+        if existing:
+            existing.hidden_until, existing.reason = expires, reason
+        else:
+            db.session.add(UserModeration(user_id=user_id, hidden_until=expires, reason=reason))
+    elif existing:
+        db.session.delete(existing)
+    launch_audit("user_access", {"user_id": user_id, "hours": hours}, reason)
+    bump_sync(feed=True, admin=True, user_ids={user_id})
+    db.session.commit()
+    return jsonify(ok=True)
+
+
+def active_organizer(user_id):
+    record = db.session.get(VerifiedOrganizer, user_id)
+    return record if record and record.active and not user_hidden(user_id) else None
+
+
+def eligible_coordinator(owner_id, coordinator_id):
+    return bool(db.session.get(OrganizerCoordinator, (owner_id, coordinator_id))
+                and not user_hidden(coordinator_id))
+
+
+def deed_coordinator(deed):
+    link = db.session.get(DeedCoordination, deed.id)
+    return link.coordinator_id if link and eligible_coordinator(deed.owner_id, link.coordinator_id) else None
+
+
+@app.route("/api/admin/organizers", methods=["GET", "POST"])
+@admin_required
+def admin_organizers():
+    if request.method == "POST":
+        if not verify_admin_csrf():
+            return jsonify(error="CSRF-проверка не пройдена"), 403
+        data = json_body()
+        user_id, active = data.get("user_id"), data.get("active")
+        name, reason = str(data.get("name") or "").strip(), str(data.get("reason") or "").strip()
+        if type(user_id) is not int or type(active) is not bool or not 3 <= len(name) <= 120 or not 3 <= len(reason) <= 180 or prohibited_activity(name):
+            return jsonify(error="Укажите аккаунт, публичное имя и основание проверки"), 400
+        target = transaction_lock(User.query.filter_by(id=user_id), User.id)
+        if not target or target.id == current_user().id or not completed_profile(target):
+            return jsonify(error="Нужна заполненная анкета другого аккаунта"), 400
+        record = db.session.get(VerifiedOrganizer, user_id)
+        if record:
+            record.name, record.active = name, active
+        else:
+            db.session.add(VerifiedOrganizer(user_id=user_id, name=name, active=active))
+        launch_audit("organizer_review", {"user_id": user_id, "active": active}, reason)
+        db.session.commit()
+    return jsonify(items=[{"user_id": row.user_id, "name": row.name, "active": row.active,
+                           "coordinators": [{"user_id": item.user_id, "label": item.label}
+                                            for item in OrganizerCoordinator.query.filter_by(organizer_id=row.user_id)]}
+                          for row in VerifiedOrganizer.query.order_by(VerifiedOrganizer.user_id.desc()).limit(100)],
+                   csrf_token=admin_csrf_token())
+
+
+@app.post("/api/admin/organizers/<int:organizer_id>/coordinators")
+@admin_required
+def admin_organizer_coordinators(organizer_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    data = json_body()
+    user_id, active = data.get("user_id"), data.get("active")
+    label = str(data.get("label") or "").strip()
+    record = transaction_lock(VerifiedOrganizer.query.filter_by(user_id=organizer_id), VerifiedOrganizer.user_id)
+    if not record:
+        abort(404)
+    if type(user_id) is not int or type(active) is not bool:
+        return jsonify(error="Укажите аккаунт координатора"), 400
+    existing = db.session.get(OrganizerCoordinator, (organizer_id, user_id))
+    if active:
+        user = db.session.get(User, user_id)
+        if not user or user.id == current_user().id or not completed_profile(user) or not 3 <= len(label) <= 120 or prohibited_activity(label):
+            return jsonify(error="Нужна заполненная анкета координатора и публичное имя"), 400
+        if existing:
+            existing.label = label
+        else:
+            db.session.add(OrganizerCoordinator(organizer_id=organizer_id, user_id=user_id, label=label))
+    elif existing:
+        db.session.delete(existing)
+    launch_audit("organizer_coordinator", {"organizer_id": organizer_id, "user_id": user_id, "active": active})
+    db.session.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/api/private/task-work-area", methods=["GET", "POST", "DELETE"])
+@login_required
+def task_work_area():
+    user = private_task_access()
+    if not user:
+        abort(403)
+    if request.method != "GET":
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+    area = db.session.get(TaskWorkArea, user.id)
+    if request.method == "DELETE":
+        if area:
+            db.session.delete(area)
+            db.session.commit()
+        return jsonify(area=None)
+    if request.method == "POST":
+        if not completed_profile(user):
+            return jsonify(error="Сначала заполните профиль"), 403
+        data = json_body()
+        city, country = str(data.get("city") or "").strip(), str(data.get("country") or "").strip().upper()
+        if not 2 <= len(city) <= 100 or not re.fullmatch(r"[A-Z]{2}", country):
+            return jsonify(error="Укажите город и двухбуквенный код страны"), 400
+        if not area:
+            area = TaskWorkArea(user_id=user.id)
+            db.session.add(area)
+        area.city, area.country = city, country
+        db.session.commit()
+    return jsonify(area={"city": area.city, "country": area.country} if area else None)
+
+
+@app.get("/api/private/tasks/<int:task_id>/workers")
+@login_required
+def task_workers(task_id):
+    user = private_task_access()
+    task = db.session.get(PrivateTask, task_id) if user else None
+    if not task or task.owner_id != user.id:
+        abort(404)
+    details = db.session.get(TaskDetails, task_id)
+    if (task.status != "approved" or not details or not details.city or task_deadline_passed(details)
+            or not launch_modules()["tasks"] or not task_policy()["enabled"] or not task_conditions_safe(task)):
+        return jsonify(count=0)
+    # Only aggregate consenting workers. Individual identities appear after an application.
+    candidates = TaskWorkArea.query.filter(
+        TaskWorkArea.country == details.country,
+        TaskWorkArea.user_id != user.id
+    )
+    return jsonify(count=sum(bool(area.city.casefold() == details.city.casefold()
+                                  and private_task_user(db.session.get(User, area.user_id))
+                                  and task_peer_allowed(user.id, area.user_id)) for area in candidates))
+
+
+def record_daily_activity(user):
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    day = utcnow().astimezone(APP_TIMEZONE).date().isoformat()
+    if session.get("activity_day") == day:
+        return
+    db.session.execute(insert(DailyActivity).values(user_id=user.id, day=day)
+                       .on_conflict_do_nothing(index_elements=["user_id", "day"]))
+    db.session.commit()
+    session["activity_day"] = day
+
+
+def hidden_accounts():
+    return db.session.query(UserModeration.user_id).filter(UserModeration.hidden_until > utcnow())
+
+
+def task_conditions_safe(task):
+    details = db.session.get(TaskDetails, task.id)
+    return (task.category in enabled_task_categories()
+            and not prohibited_activity(task.title, task.description, details.requirements if details else "")
+            and (task.category not in LOCAL_TASKS or bool(details and details.city and details.due_at)))
+
+
+def worker_matches_area(user_id, details):
+    area = db.session.get(TaskWorkArea, user_id)
+    return bool(area and area.country == details.country and area.city.casefold() == details.city.casefold())
+
+
+def expire_launch_data():
+    window = int(time.time()) // 60
+    PublicRateBucket.query.filter(PublicRateBucket.window < window - 10).delete()
+    cutoff = (utcnow().astimezone(APP_TIMEZONE).date() - timedelta(days=90)).isoformat()
+    DailyActivity.query.filter(DailyActivity.day < cutoff).delete()
+    db.session.commit()
+
+
+TASK_ALERTS = {
+    "match": "Появилось подходящее поручение",
+    "apply": "Новый отклик на поручение",
+    "withdraw": "Отклик на поручение отозван",
+    "assign": "Вам назначено поручение",
+    "submit": "Исполнитель сдал поручение",
+    "accept": "Результат поручения принят",
+    "cancel": "Поручение отменено",
+    "cancel_requested": "Заказчик предложил отменить поручение",
+    "refuse": "Отказ по поручению",
+    "dispute": "По поручению открыт спор",
+    "resolve_refuse": "Спор по поручению рассмотрен",
+    "expired": "Срок поручения истёк",
+}
+EXPIRABLE_TASK_STATES = frozenset({"pending", "approved", "assigned", "in_progress"})
+
+
+class TaskAlertPreference(db.Model):
+    __tablename__ = "task_alert_preference"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    matching = db.Column(Boolean, nullable=False, default=False)
+    events = db.Column(Boolean, nullable=False, default=False)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+
+
+def task_deadline_passed(details, now=None):
+    return bool(details and details.due_at and normalize_dt(details.due_at) <= (now or utcnow()))
+
+
+def task_match_available(task, user_id):
+    details = db.session.get(TaskDetails, task.id)
+    return (launch_modules()["tasks"] and task_policy()["enabled"] and task.status == "approved"
+            and task_conditions_safe(task) and not task_deadline_passed(details)
+            and task_peer_allowed(task.owner_id, user_id)
+            and (not details or not details.city or worker_matches_area(user_id, details)))
+
+
+def task_amounts(task, details):
+    unit = Decimal("1") if details and details.currency == "JPY" else Decimal("0.01")
+    reward = Decimal(task.budget).quantize(unit)
+    fee = (reward * (details.fee_bps if details else 0) / 10000).quantize(unit, rounding=ROUND_HALF_UP)
+    return {"reward": str(reward), "fee": str(fee), "total": str(reward + fee)}
+
+
+def task_alert_enabled(user_id, event):
+    preference = db.session.get(TaskAlertPreference, user_id)
+    return preference if preference and (preference.matching if event == "match" else preference.events) else None
+
+
+def task_notice(task_id, recipient, event, activity_id):
+    if not recipient or not launch_modules()["notifications"] or not task_alert_enabled(recipient, event):
+        return
+    if not private_task_user(db.session.get(User, recipient)):
+        return
+    key = f"task:{task_id}:{activity_id}:{event}:{recipient}"
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    statement = insert(UserNotification).values(
+        user_id=recipient, kind=f"task_{event}", text=TASK_ALERTS[event], dedupe_key=key, created_at=utcnow()
+    ).on_conflict_do_nothing(index_elements=["dedupe_key"])
+    if db.session.execute(statement).rowcount:
+        bump_sync(user_ids={recipient}, notification_ids={recipient})
+        if BOT_TOKEN:
+            queue_user_telegram(recipient, f"task_{event}", key, task_id=task_id)
+
+
+def notify_task_change(task, action, actor, activity_id, previous_assignee=None):
+    event = {"resolve_accept": "accept", "confirm_cancel": "cancel"}.get(action, action)
+    if action == "cancel" and task.status == "cancel_requested":
+        event = "cancel_requested"
+    if action == "approve":
+        opted_in = TaskAlertPreference.query.filter_by(matching=True).order_by(TaskAlertPreference.user_id)
+        for preference in opted_in:
+            recipient = preference.user_id
+            if recipient not in (task.owner_id, actor) and task_match_available(task, recipient):
+                task_notice(task.id, recipient, "match", activity_id)
+        return
+    if event not in TASK_ALERTS:
+        return
+    recipients = {task.owner_id, task.assignee_id, previous_assignee} - {actor, None}
+    if action in {"cancel", "expired"}:
+        recipients.update(row.user_id for row in TaskApplication.query.filter_by(task_id=task.id))
+    for recipient in sorted(recipients):
+        task_notice(task.id, recipient, event, activity_id)
+
+
+def task_refusal_resolved(task_id):
+    last_change = TaskActivity.query.filter(
+        TaskActivity.task_id == task_id, TaskActivity.action.in_({"refuse", "resolve_refuse"})
+    ).order_by(TaskActivity.id.desc()).first()
+    return bool(last_change and last_change.action == "resolve_refuse")
+
+
+def record_task_change(task, actor, action, previous_assignee=None):
+    record = TaskActivity(task_id=task.id, actor_id=actor or task.owner_id, action=action, status=task.status)
+    db.session.add(record)
+    db.session.flush()
+    notify_task_change(task, action, actor, record.id, previous_assignee)
+
+
+def expire_tasks():
+    due_ids = db.session.query(PrivateTask.id).join(TaskDetails).filter(
+        PrivateTask.status.in_(EXPIRABLE_TASK_STATES), TaskDetails.due_at <= utcnow()
+    ).order_by(TaskDetails.due_at).limit(100).all()
+    for (task_id,) in due_ids:
+        task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
+        if task and task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(db.session.get(TaskDetails, task.id)):
+            task.status = "expired"
+            record_task_change(task, None, "expired")
+        db.session.commit()
+
+
+@app.route("/api/private/task-alerts", methods=["GET", "POST"])
+@login_required
+def private_task_alerts():
+    user = private_task_access()
+    if not user:
+        abort(403)
+    if request.method == "POST":
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+    preference = db.session.get(TaskAlertPreference, user.id)
+    if request.method == "POST":
+        data = json_body()
+        matching, events = data.get("matching"), data.get("events")
+        if type(matching) is not bool or type(events) is not bool:
+            return jsonify(error="Выберите оба параметра уведомлений"), 400
+        if preference is None:
+            preference = TaskAlertPreference(user_id=user.id, matching=matching, events=events, revision=1)
+            db.session.add(preference)
+        elif (matching, events) != (preference.matching, preference.events):
+            preference.matching, preference.events = matching, events
+            preference.revision += 1
+        db.session.commit()
+    return jsonify(matching=bool(preference and preference.matching), events=bool(preference and preference.events))
+
+
+@app.post("/api/admin/users/<int:user_id>/task-access")
+@admin_required
+def admin_task_access(user_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    target = transaction_lock(User.query.filter_by(id=user_id), User.id)
+    if not target:
+        abort(404)
+    enabled = json_body().get("enabled")
+    if type(enabled) is not bool:
+        return jsonify(error="Укажите, разрешён ли доступ"), 400
+    if target.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids()):
+        return jsonify(error="Доступ служебных ролей задаётся настройками владельца"), 403
+    write_release_setting(f"task_access:{user_id}", enabled)
+    launch_audit("task_access", {"user_id": user_id, "enabled": enabled})
+    bump_sync(user_ids={user_id}, admin=True)
+    db.session.commit()
+    return jsonify(ok=True)
+
+
+def verify_production_schema():
+    """Fail before serving traffic when Alembic migrations were not applied."""
+    try:
+        with engine.connect() as connection:
+            versions = set(connection.execute(sql_text("SELECT version_num FROM alembic_version")).scalars())
+    except Exception as error:
+        raise RuntimeError(
+            "Database schema revision cannot be verified; run Alembic migrations before startup"
+        ) from error
+    if versions != {EXPECTED_SCHEMA_REVISION}:
+        raise RuntimeError(
+            f"Database schema is not at required revision {EXPECTED_SCHEMA_REVISION}; "
+            "run Alembic migrations before startup"
+        )
+
+
+if os.getenv("ALEMBIC_RUNNING") != "1":
+    if IS_PRODUCTION:
+        verify_production_schema()
+    else:
+        with app.app_context():
+            db.create_all()
+            cleared_phones = User.query.filter(User.phone_number.isnot(None)).update(
+                {"phone_number": None}, synchronize_session=False
+            )
+            legacy_selfies = ProfileSelfie.query.filter(~ProfileSelfie.image.startswith("enc:")).all()
+            if legacy_selfies or cleared_phones:
+                for legacy_selfie in legacy_selfies:
+                    legacy_selfie.image = encrypt_selfie(legacy_selfie.image)
+                db.session.commit()
+                app.logger.info("Encrypted %s legacy selfies and cleared %s phone values",
+                                len(legacy_selfies), cleared_phones)
+
+if os.getenv("ALEMBIC_RUNNING") != "1" and not ALLOW_TEST_AUTH:
     threading.Thread(target=presence_reminder_loop, name="presence-reminders", daemon=True).start()
+    if BOT_TOKEN:
+        threading.Thread(target=notification_outbox_loop, name="notification-outbox", daemon=True).start()
 
 
 if __name__ == "__main__":

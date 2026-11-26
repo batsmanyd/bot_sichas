@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 *.db
+
+.env
+
+.env.production
+*.dump
+
+/local-backups/
+
+.env.pc-telegram

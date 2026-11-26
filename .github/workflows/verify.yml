@@ -1,0 +1,64 @@
+name: Verify
+on:
+  pull_request:
+  push:
+    branches: [development/0.18]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sichas_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      ALLOW_TEST_AUTH: "true"
+      SECRET_KEY: ci-only-session
+      SELFIE_ENCRYPTION_KEY: ci-only-photo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pip-audit
+      - run: pip check && pip-audit -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+        env:
+          DATABASE_URL: sqlite:////tmp/sichas-ci.db
+      - run: python -m unittest discover -s tests -v
+        env:
+          DATABASE_URL: postgresql://postgres:ci-only@127.0.0.1:5432/sichas_test
+          TEST_POSTGRES_URL: postgresql://postgres:ci-only@127.0.0.1:5432/sichas_test
+          ALLOW_DESTRUCTIVE_TEST_DB: "true"
+      - run: docker build -t sichas-ci .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-save --no-package-lock playwright@1.62.1 && npx playwright install --with-deps chromium
+      - name: Browser acceptance
+        env:
+          DATABASE_URL: sqlite:////tmp/sichas-browser-ci.db
+          PYTHONPATH: .
+          PRIVATE_TASK_TELEGRAM_IDS: test-991,test-992
+        run: |
+          python tests/browser_fixture.py > /tmp/sichas-browser-ci.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; cat /tmp/sichas-browser-ci.log' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8095/health > /dev/null; then break; fi
+            sleep 1
+          done
+          node tests/browser_acceptance.cjs
+      - name: Isolated demo
+        run: |
+          trap 'docker compose -f compose.demo.yaml logs; docker compose -f compose.demo.yaml down' EXIT
+          docker compose -f compose.demo.yaml up --build -d --wait
+          node tests/browser_demo.cjs

@@ -1,0 +1,22 @@
+name: sichas-demo
+services:
+  demo:
+    build:
+      context: .
+      target: demo
+    environment:
+      SICHAS_LOCAL_DEMO: "1"
+      APP_ENV: development
+      DATABASE_URL: sqlite:////demo-data/sichas-demo.db
+      PUBLIC_URL: http://127.0.0.1:8081
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - demo-data:/demo-data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=3).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  demo-data:
