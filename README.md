@@ -14,7 +14,7 @@
 - возвращаемые приглашения и отметка «Развивает клуб»;
 - радиус 3/5/10/12 км;
 - приблизительные зоны на карте и диапазоны расстояния;
-- гостевой просмотр демо и публичных акций без персональных карточек.
+- гостевой просмотр публичных акций без персональных карточек.
 
 ## Переменные Railway
 
@@ -31,7 +31,7 @@
 В Railway также необходимо задать `APP_ENV=production`. В production приложение
 завершает запуск, если отсутствует обязательная конфигурация, используется не
 PostgreSQL/HTTPS, включён тестовый вход или схема БД не находится на Alembic
-revision `0011_launch_readiness`. Временный production-ключ не генерируется.
+revision `0012_task_alerts`. Временный production-ключ не генерируется.
 
 `TELEGRAM_CLIENT_ID` и `TELEGRAM_CLIENT_SECRET` нужны только для необязательного входа из обычного браузера. Основной вход Mini App использует `TELEGRAM_BOT_TOKEN`.
 
@@ -69,30 +69,25 @@ Railway запускает приложение командой из `Procfile`
 
 ## Windows и Docker Desktop
 
-В Docker Desktop включите Linux containers (WSL 2). В PowerShell из корня
-репозитория создайте `.env` с двумя независимыми постоянными ключами:
+В Docker Desktop включите режим Linux containers (WSL 2). Из корня репозитория запустите в PowerShell:
 
 ```powershell
-function New-SichasKey {
-    $bytes = New-Object byte[] 32
-    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
-    [Convert]::ToBase64String($bytes)
-}
-if (-not (Test-Path .env)) {
-    @("SECRET_KEY=$(New-SichasKey)", "SELFIE_ENCRYPTION_KEY=$(New-SichasKey)") | Set-Content .env -Encoding ascii
-}
-docker compose up --build -d --wait
-Invoke-RestMethod http://127.0.0.1:8080/health
+.\scripts\start-windows.ps1
+.\scripts\start-windows.ps1 -Demo
+.\scripts\start-windows.ps1 -Rollback
 ```
 
-Откройте [http://127.0.0.1:8080](http://127.0.0.1:8080). Кнопка «Демо» запускает
-сценарий с вымышленными участниками. Карта использует внешние тайлы. Скачивание
-образа и зависимостей при первой сборке требует доступа в интернет.
+Первая команда запускает или обновляет приложение на [127.0.0.1:8080](http://127.0.0.1:8080/).
+При обновлении скрипт сохраняет снимок SQLite, ключи из `.env` и тег предыдущего образа.
+Откат возвращает последний полный снимок со старым образом. Изменения после создания снимка при этом теряются.
 
-`docker compose down` останавливает локальное приложение. SQLite хранится в томе
-`app-data`. Сохраните исходный `.env` вместе с резервной копией БД. Для переноса
-данных старой версии сначала выполните [миграцию](docs/MIGRATIONS.md) на копии.
+`-Demo` открывает [127.0.0.1:8081/demo](http://127.0.0.1:8081/demo) с переключением ролей,
+отдельной БД и локальным просмотром имитированных уведомлений Telegram. Роли и данные демо
+доступны только при запуске отдельного образа. `-NoBrowser` оставляет браузер закрытым.
+
+База обычного приложения сохраняется в томе `app-data`, демо — в отдельном томе проекта
+`sichas-demo`. Храните копии из `local-backups` вместе с ключами в защищённом месте.
+[Эксплуатация](docs/OPERATIONS.md) · [Миграции](docs/MIGRATIONS.md).
 
 ## Кандидат 1.0.0
 

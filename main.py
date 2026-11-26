@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -54,7 +55,7 @@ ENABLE_SSE = os.getenv(
 ).lower() == "true"
 ADMIN_TELEGRAM_IDS = {value.strip() for value in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if value.strip()}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "vmeste_rjadom_bot").strip().lstrip("@")
-EXPECTED_SCHEMA_REVISION = "0011_launch_readiness"
+EXPECTED_SCHEMA_REVISION = "0012_task_alerts"
 
 if IS_PRODUCTION:
     missing_configuration = [
@@ -1036,6 +1037,7 @@ def purge_meeting_notifications(meeting, user_ids=None):
         UserNotification.created_at >= meeting.created_at,
         UserNotification.kind != "presence_reminder",
         UserNotification.kind != "thanks",
+        ~UserNotification.kind.startswith("task_"),
     ).all()
     removed = 0
     for notice in notices:
@@ -1296,6 +1298,7 @@ def presence_reminder_loop():
             with app.app_context():
                 process_presence_reminders()
                 process_company_watches()
+                expire_tasks()
                 expire_task_materials()
                 expire_launch_data()
                 worker_progress("maintenance")
@@ -1585,6 +1588,7 @@ def sync_state():
         notifications=revision_value(f"notifications:{user.id}"),
         room=room_revision,
         room_id=room_id,
+        private_tasks_enabled=bool(private_task_user(user)),
         modules=launch_modules(),
     )
 
@@ -2347,6 +2351,13 @@ def list_notifications():
     for item in items:
         keep = item.kind == "presence_reminder" and presence_active
         keep = keep or item.kind == "moderation_warning"
+        if item.kind.startswith("task_"):
+            keep = bool(private_task_user(user) and task_alert_enabled(user.id, item.kind.removeprefix("task_"))
+                        and normalize_dt(item.created_at) > now - timedelta(days=30))
+            if keep and item.kind == "task_match":
+                task_id = item.dedupe_key.split(":")[1]
+                task = db.session.get(PrivateTask, int(task_id))
+                keep = bool(task and task_match_available(task, user.id))
         if item.kind == "meeting_confirmation" and item.dedupe_key:
             try:
                 meeting_id = int(item.dedupe_key.split(":")[1])
@@ -3937,8 +3948,7 @@ PUBLIC_FILES = {
     "apple-touch-icon.png",
     "app-icon-192.png",
     "app-icon-512.png",
-    "demo-user.svg",
-    "demo-anna.svg",
+    "profile-placeholder.svg",
     "offline.html",
     "service-worker.js",
 }
@@ -4289,18 +4299,22 @@ def transaction_lock(query, column):
     return query.with_for_update().first()
 
 
-def queue_user_telegram(user_id, kind, dedupe_key=None, watch_token=None):
+def queue_user_telegram(user_id, kind, dedupe_key=None, watch_token=None, task_id=None):
     if not launch_modules()["notifications"]:
         return False
     preference = db.session.get(TelegramPreference, user_id)
     if not preference or not preference.enabled:
+        return False
+    task_preference = task_alert_enabled(user_id, kind.removeprefix("task_")) if task_id else None
+    if task_id and not task_preference:
         return False
     dedupe_key = dedupe_key or f"event:{g.request_id if has_request_context() else uuid.uuid4().hex}:{user_id}:{kind}"
     insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
     statement = insert(NotificationOutbox).values(
         kind="user_telegram", dedupe_key=f"user:{dedupe_key}",
         payload_json=json.dumps({"user_id": user_id, "revision": preference.revision,
-                                 "watch": watch_token, "event": kind, "reminder": dedupe_key}),
+                                 "watch": watch_token, "event": kind, "reminder": dedupe_key,
+                                 "task_id": task_id, "task_revision": task_preference.revision if task_preference else None}),
         status="pending", attempts=0, created_at=utcnow(), next_attempt_at=utcnow(),
     ).on_conflict_do_nothing(index_elements=["dedupe_key"])
     return bool(db.session.execute(statement).rowcount)
@@ -4344,12 +4358,20 @@ def process_user_telegram_outbox(limit=20):
             watch = db.session.get(CompanyWatch, payload["user_id"])
             allowed = allowed and bool(watch and watch.token == payload["watch"]
                                        and normalize_dt(watch.ends_at) > utcnow())
+        if payload.get("task_id"):
+            task = db.session.get(PrivateTask, payload["task_id"])
+            task_event = event.removeprefix("task_")
+            task_preference = task_alert_enabled(payload["user_id"], task_event)
+            allowed = allowed and bool(task and task_preference and
+                task_preference.revision == payload["task_revision"] and private_task_user(user))
+            if allowed and task_event == "match":
+                allowed = task_match_available(task, user.id)
         row.status = "cancelled"
         if allowed:
             message = {
                 "presence_reminder": "Вы открыты к общению уже час. Изменить статус можно в «Сейчас».",
                 "company_watch": "В «Сейчас» появилась компания по вашей подписке.",
-            }.get(event, "В «Сейчас» есть новое событие встречи.")
+            }.get(event, TASK_ALERTS.get(event.removeprefix("task_"), "В «Сейчас» есть новое событие встречи."))
             try:
                 result = telegram_api("sendMessage", {
                     "chat_id": user.telegram_id, "text": f"{message}\n{PUBLIC_URL}/",
@@ -4517,7 +4539,12 @@ def private_task_user(user):
     allowed = {value.strip() for value in os.getenv("PRIVATE_TASK_TELEGRAM_IDS", "").split(",")}
     if not user or user_hidden(user.id):
         return None
-    return user if user.telegram_id in (allowed | ADMIN_TELEGRAM_IDS | task_moderator_ids()) or corporate_name(user) else None
+    if user.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids()):
+        return user
+    override = db.session.get(ReleaseSetting, f"task_access:{user.id}")
+    if override is not None:
+        return user if json.loads(override.value) else None
+    return user if user.telegram_id in allowed or corporate_name(user) else None
 
 
 def task_peer_allowed(owner_id, candidate_id):
@@ -4532,18 +4559,24 @@ def task_peer_allowed(owner_id, candidate_id):
 def task_item(task, user, admin):
     details = db.session.get(TaskDetails, task.id)
     manager = task.owner_id == user.id or admin
+    status = "expired" if task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(details) else task.status
     private = manager or task.assignee_id == user.id
     applications = TaskApplication.query.filter_by(task_id=task.id).all()
+    can_reopen = status in {"refused", "cancelled", "expired"} and not task.result and (status != "expired" or not task.assignee_id)
+    can_dispute_refusal = status == "refused" and bool(task.result) and not task_refusal_resolved(task.id)
+    amounts = task_amounts(task, details)
     return {
         "id": task.id, "category": task.category, "title": task.title,
         "description": task.description, "budget": task.budget, "currency": details.currency if details else "BYN",
         "terms": task_terms_payload(details),
         "history": [{"action": row.action, "status": row.status, "at": normalize_dt(row.created_at).isoformat()}
                     for row in TaskActivity.query.filter_by(task_id=task.id).order_by(TaskActivity.id)] if private else [],
-        "estimated_fee": f'{task.budget * (details.fee_bps if details else 0) / 10000:.2f}',
+        "estimated_fee": amounts["fee"], "amounts": amounts,
         "materials": [{"id": row.id, "url": f"/api/private/tasks/{task.id}/materials/{row.id}"}
                       for row in TaskMaterial.query.filter_by(task_id=task.id)] if private else [],
-        "status": task.status, "mine": task.owner_id == user.id,
+        "status": status, "mine": task.owner_id == user.id,
+        "has_assignee": bool(task.assignee_id),
+        "can_reopen": can_reopen, "can_dispute_refusal": can_dispute_refusal,
         "assigned_to_me": task.assignee_id == user.id,
         "applied": any(row.user_id == user.id for row in applications),
         "result": task.result if private else None, "dispute": task.dispute if private else None,
@@ -4565,20 +4598,58 @@ def private_tasks():
         if not admin:
             query = query.filter((PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id)
                                  | (PrivateTask.status == "approved"))
+        scope = request.args.get("scope", "all")
         city = request.args.get("city", "").strip()[:100]
-        country = request.args.get("country", "").strip().upper()[:3]
-        if country and not re.fullmatch(r"[A-Z]{2}", country):
-            return jsonify(error="Укажите двухбуквенный код страны"), 400
-        if city or country:
-            query = query.join(TaskDetails, TaskDetails.task_id == PrivateTask.id)
-            if city:
-                query = query.filter(func.lower(TaskDetails.city) == city.lower())
-            if country:
-                query = query.filter(TaskDetails.country == country)
-        items = query.order_by(PrivateTask.id.desc()).limit(100)
-        return jsonify(items=[task_item(task, user, admin) for task in items
-                              if admin or user.id in (task.owner_id, task.assignee_id)
-                              or (task_peer_allowed(task.owner_id, user.id) and task_conditions_safe(task))],
+        country = request.args.get("country", "").strip().upper()
+        category = request.args.get("category", "")
+        currency = request.args.get("currency", "")
+        deadline = request.args.get("deadline", "")
+        limits = [request.args.get(key, "") for key in ("budget_min", "budget_max")]
+        if (scope not in {"all", "available", "mine"} or country and not re.fullmatch(r"[A-Z]{2}", country)
+                or category and category not in TASK_CATEGORIES or currency and currency not in TASK_CURRENCIES
+                or deadline not in {"", "24h", "7d"} or any(value and not re.fullmatch(r"[0-9]{1,6}", value) for value in limits)):
+            return jsonify(error="Проверьте фильтры поручений"), 400
+        minimum, maximum = [int(value) if value else None for value in limits]
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return jsonify(error="Минимальная сумма превышает максимальную"), 400
+        now = utcnow()
+        query = query.outerjoin(TaskDetails)
+        available = (PrivateTask.status == "approved") & (PrivateTask.owner_id != user.id) & (
+            TaskDetails.due_at.is_(None) | (TaskDetails.due_at > now)
+        )
+        if scope == "available":
+            enabled = launch_modules()["tasks"] and task_policy()["enabled"]
+            query = query.filter(available, enabled)
+        elif scope == "mine" and not admin:
+            applied = db.session.query(TaskApplication.task_id).filter_by(user_id=user.id)
+            query = PrivateTask.query.outerjoin(TaskDetails).filter(
+                (PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id) | PrivateTask.id.in_(applied))
+        elif not admin:
+            query = query.filter((PrivateTask.owner_id == user.id) | (PrivateTask.assignee_id == user.id) | available)
+        if country:
+            query = query.filter(TaskDetails.country == country)
+        if category:
+            query = query.filter(PrivateTask.category == category)
+        if currency:
+            query = query.filter(func.coalesce(TaskDetails.currency, "BYN") == currency)
+        if deadline:
+            query = query.filter(TaskDetails.due_at > now, TaskDetails.due_at <= now + timedelta(days=1 if deadline == "24h" else 7))
+        if minimum is not None:
+            query = query.filter(PrivateTask.budget >= minimum)
+        if maximum is not None:
+            query = query.filter(PrivateTask.budget <= maximum)
+        items = []
+        for task in query.order_by(PrivateTask.id.desc()).yield_per(50):
+            details = db.session.get(TaskDetails, task.id)
+            if city and (not details or not details.city or details.city.casefold() != city.casefold()):
+                continue
+            if scope == "available" or not admin and user.id not in (task.owner_id, task.assignee_id):
+                if not task_peer_allowed(task.owner_id, user.id) or not task_conditions_safe(task):
+                    continue
+            items.append(task_item(task, user, admin))
+            if len(items) == 100:
+                break
+        return jsonify(items=items,
                        enabled=task_policy()["enabled"] and launch_modules()["tasks"], categories=enabled_task_categories(), category_labels=TASK_CATEGORIES, currencies=sorted(TASK_CURRENCIES), moderator=admin, csrf_token=admin_csrf_token() if admin else None,
                        reputation={"completed": PrivateTask.query.filter_by(assignee_id=user.id, status="accepted").count()})
     if not completed_profile(user):
@@ -4597,6 +4668,7 @@ def private_tasks():
         return jsonify(error="Проверьте город, страну, срок, валюту и требования к результату"), 400
     if prohibited_activity(title, description, terms["requirements"]):
         return jsonify(error="Поручение должно быть безопасным и не должно затрагивать частные данные"), 400
+    transaction_lock(User.query.filter_by(id=user.id), User.id)
     if not consume_action(user.id, "private_task", 5, 3600):
         return jsonify(error="Слишком много поручений за час"), 429
     task = PrivateTask(owner_id=user.id, category=category, title=title, description=description,
@@ -4617,21 +4689,34 @@ def private_task_action(task_id):
         return jsonify(error="Нет доступа"), 403
     admin = user.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids())
     task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
-    if not task or not (admin or user.id in (task.owner_id, task.assignee_id) or (task.status == "approved" and task_peer_allowed(task.owner_id, user.id))):
+    if not task or not (admin or user.id in (task.owner_id, task.assignee_id) or db.session.get(TaskApplication, (task.id, user.id)) or (task.status == "approved" and task_peer_allowed(task.owner_id, user.id))):
         abort(404)
     data = json_body()
     action = data.get("action")
-    before_status = task.status
     details = db.session.get(TaskDetails, task.id)
-    if action in ("approve", "apply", "assign") and (not task_policy()["enabled"] or not launch_modules()["tasks"]):
+    if task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(details):
+        task.status = "expired"
+        record_task_change(task, None, "expired")
+        db.session.commit()
+        task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
+        if not task:
+            abort(404)
+    before_status = task.status
+    previous_assignee = task.assignee_id
+    application_changed = False
+    if action in ("approve", "apply", "assign", "reopen") and (not task_policy()["enabled"] or not launch_modules()["tasks"]):
         return jsonify(error="Публикация и назначение поручений приостановлены"), 409
-    if action in ("apply", "assign", "submit") and not completed_profile(user):
+    if action in ("apply", "assign", "start", "submit", "reopen") and not completed_profile(user):
         return jsonify(error="Сначала заполните профиль"), 403
     if action in ("apply", "assign") and not task_conditions_safe(task):
         return jsonify(error="Поручение больше не соответствует правилам"), 409
     if action in ("approve", "apply", "assign") and details and details.due_at and normalize_dt(details.due_at) <= utcnow():
         return jsonify(error="Срок поручения истёк"), 409
     owner, assignee = task.owner_id == user.id, task.assignee_id == user.id
+    if not admin and not owner and action not in ("withdraw", "refuse", "dispute", "confirm_cancel") and not task_peer_allowed(task.owner_id, user.id):
+        abort(404)
+    if owner and previous_assignee and action == "accept" and not task_peer_allowed(user.id, previous_assignee):
+        return jsonify(error="При ограничении контакта результат принимает модератор через спор"), 409
     text = str(data.get("text") or "").strip()
     if action in ("approve", "reject", "resolve_accept", "resolve_refuse"):
         if not admin or owner or assignee or not verify_admin_csrf():
@@ -4653,12 +4738,36 @@ def private_task_action(task_id):
             return jsonify(error="Модератор своего решения не может принять это поручение"), 403
         if not db.session.get(TaskApplication, (task.id, user.id)):
             db.session.add(TaskApplication(task_id=task.id, user_id=user.id))
+            application_changed = True
+    elif action == "withdraw" and not owner and not assignee:
+        application = db.session.get(TaskApplication, (task.id, user.id))
+        if application:
+            db.session.delete(application)
+            application_changed = True
+    elif action == "cancel" and owner and task.status in {"pending", "approved", "assigned", "in_progress"}:
+        task.status = "cancel_requested" if task.assignee_id else "cancelled"
+    elif action == "confirm_cancel" and assignee and task.status == "cancel_requested":
+        task.status = "cancelled"
+    elif action == "reopen" and owner and task.status in {"refused", "cancelled", "expired"} and not task.result and (task.status != "expired" or not task.assignee_id):
+        deadline = data.get("due_at")
+        due_at = _parse_start(deadline) if isinstance(deadline, str) else None
+        if not due_at or not utcnow() < due_at <= utcnow()+timedelta(days=90):
+            return jsonify(error="Укажите будущий срок в пределах 90 дней"), 400
+        if not details:
+            details = TaskDetails(task_id=task.id, requirements="", currency="BYN", fee_bps=0)
+            db.session.add(details)
+        details.due_at = due_at
+        if previous_assignee:
+            TaskApplication.query.filter_by(task_id=task.id, user_id=previous_assignee).delete()
+        task.assignee_id, task.dispute, task.status = None, None, "pending"
+    elif action == "start" and assignee and task.status == "assigned":
+        task.status = "in_progress"
     elif action == "assign" and owner and task.status == "approved":
         target = data.get("user_id")
         if type(target) is not int or not db.session.get(TaskApplication, (task.id, target)) or not private_task_user(db.session.get(User, target)) or not task_peer_allowed(user.id, target) or (details and details.city and not worker_matches_area(target, details)):
             return jsonify(error="Выберите доступного участника из откликов"), 400
         task.assignee_id, task.status = target, "assigned"
-    elif action == "submit" and assignee and task.status == "assigned" and 5 <= len(text) <= 500:
+    elif action == "submit" and assignee and task.status in {"assigned", "in_progress"} and 5 <= len(text) <= 500:
         if details and details.due_at and normalize_dt(details.due_at) <= utcnow():
             return jsonify(error="Срок поручения истёк. Вы можете открыть спор"), 409
         photos = data.get("photos", [])
@@ -4675,19 +4784,19 @@ def private_task_action(task_id):
         task.result, task.status = text, "submitted"
     elif action == "accept" and owner and task.status == "submitted":
         task.status = "accepted"
-    elif action == "refuse" and assignee and task.status == "assigned":
+    elif action == "refuse" and assignee and task.status in {"assigned", "in_progress", "expired"}:
         task.status = "refused"
     elif action == "refuse" and owner and task.status == "submitted" and 5 <= len(text) <= 300:
         task.dispute, task.status = text, "refused"
     elif action == "dispute" and (
-        (owner and task.status == "submitted") or
-        (assignee and (task.status in ("assigned", "submitted") or (task.status == "refused" and task.result)))
+        (owner and (task.status in {"submitted", "cancel_requested"} or task.status == "expired" and task.assignee_id)) or
+        (assignee and (task.status in ("assigned", "in_progress", "submitted", "cancel_requested", "expired") or (task.status == "refused" and task.result and not task_refusal_resolved(task.id))))
     ) and 5 <= len(text) <= 300:
         task.dispute, task.status = text, "disputed"
     else:
         return jsonify(error="Действие недоступно для вашей роли или статуса поручения"), 409
-    if task.status != before_status or action == "apply" and db.session.new:
-        db.session.add(TaskActivity(task_id=task.id, actor_id=user.id, action=action, status=task.status))
+    if task.status != before_status or application_changed:
+        record_task_change(task, user.id, action, previous_assignee)
     db.session.commit()
     return jsonify(item=task_item(task, user, admin))
 
@@ -4696,7 +4805,8 @@ def delete_private_features(user_id):
     for row in NotificationOutbox.query.filter_by(kind="user_telegram"):
         if json.loads(row.payload_json).get("user_id") == user_id:
             db.session.delete(row)
-    ReleaseSetting.query.filter_by(key=f"corporate:{user_id}").delete()
+    ReleaseSetting.query.filter(ReleaseSetting.key.in_([f"corporate:{user_id}", f"task_access:{user_id}"])).delete()
+    TaskAlertPreference.query.filter_by(user_id=user_id).delete()
     CompanyWatch.query.filter_by(user_id=user_id).delete()
     TelegramPreference.query.filter_by(user_id=user_id).delete()
     Acquisition.query.filter_by(user_id=user_id).delete()
@@ -4800,6 +4910,7 @@ def parse_task_terms(category, data):
     if category in LOCAL_TASKS and not (city and due_at and len(requirements) >= 5
                                         and data.get("public_site_confirmed") is True):
         return None
+    due_at = due_at or utcnow() + timedelta(days=7)
     return {"city": city or None, "country": country or None, "due_at": due_at,
             "requirements": requirements, "currency": currency, "fee_bps": task_policy()["fee_bps"]}
 
@@ -5067,7 +5178,8 @@ def admin_users():
     return jsonify(items=[{"id": user.id, "name": user.name,
                            "restricted": user_hidden(user.id),
                            "admin": user.telegram_id in ADMIN_TELEGRAM_IDS,
-                           "organizer": bool(active_organizer(user.id))}
+                           "organizer": bool(active_organizer(user.id)),
+                           "task_access": bool(private_task_user(user))}
                           for user in users[:50]],
                    next_before=users[49].id if len(users) > 50 else None)
 
@@ -5211,7 +5323,8 @@ def task_workers(task_id):
     if not task or task.owner_id != user.id:
         abort(404)
     details = db.session.get(TaskDetails, task_id)
-    if task.status != "approved" or not details or not details.city:
+    if (task.status != "approved" or not details or not details.city or task_deadline_passed(details)
+            or not launch_modules()["tasks"] or not task_policy()["enabled"] or not task_conditions_safe(task)):
         return jsonify(count=0)
     # Only aggregate consenting workers. Individual identities appear after an application.
     candidates = TaskWorkArea.query.filter(
@@ -5256,6 +5369,161 @@ def expire_launch_data():
     cutoff = (utcnow().astimezone(APP_TIMEZONE).date() - timedelta(days=90)).isoformat()
     DailyActivity.query.filter(DailyActivity.day < cutoff).delete()
     db.session.commit()
+
+
+TASK_ALERTS = {
+    "match": "Появилось подходящее поручение",
+    "apply": "Новый отклик на поручение",
+    "withdraw": "Отклик на поручение отозван",
+    "assign": "Вам назначено поручение",
+    "submit": "Исполнитель сдал поручение",
+    "accept": "Результат поручения принят",
+    "cancel": "Поручение отменено",
+    "cancel_requested": "Заказчик предложил отменить поручение",
+    "refuse": "Отказ по поручению",
+    "dispute": "По поручению открыт спор",
+    "resolve_refuse": "Спор по поручению рассмотрен",
+    "expired": "Срок поручения истёк",
+}
+EXPIRABLE_TASK_STATES = frozenset({"pending", "approved", "assigned", "in_progress"})
+
+
+class TaskAlertPreference(db.Model):
+    __tablename__ = "task_alert_preference"
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    matching = db.Column(Boolean, nullable=False, default=False)
+    events = db.Column(Boolean, nullable=False, default=False)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+
+
+def task_deadline_passed(details, now=None):
+    return bool(details and details.due_at and normalize_dt(details.due_at) <= (now or utcnow()))
+
+
+def task_match_available(task, user_id):
+    details = db.session.get(TaskDetails, task.id)
+    return (launch_modules()["tasks"] and task_policy()["enabled"] and task.status == "approved"
+            and task_conditions_safe(task) and not task_deadline_passed(details)
+            and task_peer_allowed(task.owner_id, user_id)
+            and (not details or not details.city or worker_matches_area(user_id, details)))
+
+
+def task_amounts(task, details):
+    unit = Decimal("1") if details and details.currency == "JPY" else Decimal("0.01")
+    reward = Decimal(task.budget).quantize(unit)
+    fee = (reward * (details.fee_bps if details else 0) / 10000).quantize(unit, rounding=ROUND_HALF_UP)
+    return {"reward": str(reward), "fee": str(fee), "total": str(reward + fee)}
+
+
+def task_alert_enabled(user_id, event):
+    preference = db.session.get(TaskAlertPreference, user_id)
+    return preference if preference and (preference.matching if event == "match" else preference.events) else None
+
+
+def task_notice(task_id, recipient, event, activity_id):
+    if not recipient or not launch_modules()["notifications"] or not task_alert_enabled(recipient, event):
+        return
+    if not private_task_user(db.session.get(User, recipient)):
+        return
+    key = f"task:{task_id}:{activity_id}:{event}:{recipient}"
+    insert = postgresql_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    statement = insert(UserNotification).values(
+        user_id=recipient, kind=f"task_{event}", text=TASK_ALERTS[event], dedupe_key=key, created_at=utcnow()
+    ).on_conflict_do_nothing(index_elements=["dedupe_key"])
+    if db.session.execute(statement).rowcount:
+        bump_sync(user_ids={recipient}, notification_ids={recipient})
+        if BOT_TOKEN:
+            queue_user_telegram(recipient, f"task_{event}", key, task_id=task_id)
+
+
+def notify_task_change(task, action, actor, activity_id, previous_assignee=None):
+    event = {"resolve_accept": "accept", "confirm_cancel": "cancel"}.get(action, action)
+    if action == "cancel" and task.status == "cancel_requested":
+        event = "cancel_requested"
+    if action == "approve":
+        opted_in = TaskAlertPreference.query.filter_by(matching=True).order_by(TaskAlertPreference.user_id)
+        for preference in opted_in:
+            recipient = preference.user_id
+            if recipient not in (task.owner_id, actor) and task_match_available(task, recipient):
+                task_notice(task.id, recipient, "match", activity_id)
+        return
+    if event not in TASK_ALERTS:
+        return
+    recipients = {task.owner_id, task.assignee_id, previous_assignee} - {actor, None}
+    if action in {"cancel", "expired"}:
+        recipients.update(row.user_id for row in TaskApplication.query.filter_by(task_id=task.id))
+    for recipient in sorted(recipients):
+        task_notice(task.id, recipient, event, activity_id)
+
+
+def task_refusal_resolved(task_id):
+    last_change = TaskActivity.query.filter(
+        TaskActivity.task_id == task_id, TaskActivity.action.in_({"refuse", "resolve_refuse"})
+    ).order_by(TaskActivity.id.desc()).first()
+    return bool(last_change and last_change.action == "resolve_refuse")
+
+
+def record_task_change(task, actor, action, previous_assignee=None):
+    record = TaskActivity(task_id=task.id, actor_id=actor or task.owner_id, action=action, status=task.status)
+    db.session.add(record)
+    db.session.flush()
+    notify_task_change(task, action, actor, record.id, previous_assignee)
+
+
+def expire_tasks():
+    due_ids = db.session.query(PrivateTask.id).join(TaskDetails).filter(
+        PrivateTask.status.in_(EXPIRABLE_TASK_STATES), TaskDetails.due_at <= utcnow()
+    ).order_by(TaskDetails.due_at).limit(100).all()
+    for (task_id,) in due_ids:
+        task = transaction_lock(PrivateTask.query.filter_by(id=task_id), PrivateTask.id)
+        if task and task.status in EXPIRABLE_TASK_STATES and task_deadline_passed(db.session.get(TaskDetails, task.id)):
+            task.status = "expired"
+            record_task_change(task, None, "expired")
+        db.session.commit()
+
+
+@app.route("/api/private/task-alerts", methods=["GET", "POST"])
+@login_required
+def private_task_alerts():
+    user = private_task_access()
+    if not user:
+        abort(403)
+    if request.method == "POST":
+        transaction_lock(User.query.filter_by(id=user.id), User.id)
+    preference = db.session.get(TaskAlertPreference, user.id)
+    if request.method == "POST":
+        data = json_body()
+        matching, events = data.get("matching"), data.get("events")
+        if type(matching) is not bool or type(events) is not bool:
+            return jsonify(error="Выберите оба параметра уведомлений"), 400
+        if preference is None:
+            preference = TaskAlertPreference(user_id=user.id, matching=matching, events=events, revision=1)
+            db.session.add(preference)
+        elif (matching, events) != (preference.matching, preference.events):
+            preference.matching, preference.events = matching, events
+            preference.revision += 1
+        db.session.commit()
+    return jsonify(matching=bool(preference and preference.matching), events=bool(preference and preference.events))
+
+
+@app.post("/api/admin/users/<int:user_id>/task-access")
+@admin_required
+def admin_task_access(user_id):
+    if not verify_admin_csrf():
+        return jsonify(error="CSRF-проверка не пройдена"), 403
+    target = transaction_lock(User.query.filter_by(id=user_id), User.id)
+    if not target:
+        abort(404)
+    enabled = json_body().get("enabled")
+    if type(enabled) is not bool:
+        return jsonify(error="Укажите, разрешён ли доступ"), 400
+    if target.telegram_id in (ADMIN_TELEGRAM_IDS | task_moderator_ids()):
+        return jsonify(error="Доступ служебных ролей задаётся настройками владельца"), 403
+    write_release_setting(f"task_access:{user_id}", enabled)
+    launch_audit("task_access", {"user_id": user_id, "enabled": enabled})
+    bump_sync(user_ids={user_id}, admin=True)
+    db.session.commit()
+    return jsonify(ok=True)
 
 
 def verify_production_schema():

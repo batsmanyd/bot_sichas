@@ -15,11 +15,11 @@ const {chromium}=require('playwright');
     await page.locator('#accountState').getByText('Профиль',{exact:true}).waitFor();
     return page;
   }
-  async function tasks(page, reopen=false){
-    if(reopen)await page.locator('[data-close-dialog=privateTasksDialog]').click();
-    else await page.locator('#accountState').click();
+  async function tasks(page, scope='mine'){
+    await page.locator('nav [data-page=home]').click();
     await page.locator('#openPrivateTasks').click();
-    await page.locator('#privateTasksDialog').waitFor();
+    await page.locator('#taskWorkspace').waitFor();
+    if(scope==='available')await page.locator('#taskShowAvailable').click();
   }
   async function deeds(page, reopen=false){
     if(reopen)await page.locator('#closeGoodDeeds').click();
@@ -62,20 +62,20 @@ const {chromium}=require('playwright');
     await tasks(admin);
     await admin.getByRole('button',{name:'Одобрить',exact:true}).click();
     await admin.getByText('Одобрено',{exact:true}).waitFor();
-    await tasks(worker);
+    await tasks(worker,'available');
     await worker.getByRole('button',{name:'Откликнуться',exact:true}).click();
-    await tasks(owner,true);
+    await tasks(owner);
     await owner.getByRole('button',{name:/Назначить/}).click();
     await owner.getByText('Назначено',{exact:true}).waitFor();
-    await tasks(worker,true);
+    await tasks(worker);
     await worker.getByRole('button',{name:'Отправить результат'}).click();
     await worker.locator('#taskResultForm textarea').fill('Исправления готовы');
     await worker.getByRole('button',{name:'Передать результат'}).click();
     await worker.getByText('Результат отправлен',{exact:true}).waitFor();
-    await tasks(owner,true);
+    await tasks(owner);
     await owner.getByRole('button',{name:'Принять результат'}).click();
     await owner.getByText('Принято',{exact:true}).waitFor();
-    for(const page of [owner, worker, admin])await page.locator('[data-close-dialog=privateTasksDialog]').click();
+    for(const page of [owner, worker, admin])await page.locator('#taskBack').click();
     console.log('Browser: task creation → independent approval → application → assignment → delivery → acceptance.');
 
     await deeds(owner);

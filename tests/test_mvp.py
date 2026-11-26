@@ -974,7 +974,7 @@ class MvpFlowTest(unittest.TestCase):
         self.assertIn("if(saved)$('messageInput').value=''", frontend)
         self.assertIn("Не сохранено — текст оставлен для повтора", frontend)
         self.assertIn("$('sendMessage').disabled=true", frontend)
-        self.assertIn("demoRoom.meeting.needs_feedback=true", frontend)
+        self.assertIn("meeting.needs_feedback", frontend)
         self.assertIn("document.addEventListener('visibilitychange',resumeStandaloneLogin)", frontend)
         self.assertIn("tg.close()", frontend)
         self.assertIn("startBotCodeLogin", frontend)
@@ -1001,7 +1001,8 @@ class MvpFlowTest(unittest.TestCase):
     def test_private_repository_files_are_not_public(self):
         for path in (
             "/main.py", "/.git/config", "/tests/test_mvp.py", "/sichas.db",
-            "/static/../main.py", "/%2e%2e/main.py",
+            "/static/../main.py", "/%2e%2e/main.py", "/demo", "/scripts/local_demo.py",
+            "/demo-anna.svg", "/demo-user.svg",
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.first.get(path).status_code, 404)
@@ -1076,7 +1077,7 @@ class MvpFlowTest(unittest.TestCase):
     def test_production_startup_uses_alembic_revision_guard(self):
         with open("main.py", encoding="utf-8") as source:
             backend = source.read()
-        self.assertIn('EXPECTED_SCHEMA_REVISION = "0011_launch_readiness"', backend)
+        self.assertIn('EXPECTED_SCHEMA_REVISION = "0012_task_alerts"', backend)
         self.assertIn("if IS_PRODUCTION:\n        verify_production_schema()", backend)
         self.assertNotIn("if os.getenv(\"ALEMBIC_RUNNING\") != \"1\":\n    with app.app_context():\n        db.create_all()", backend)
 
@@ -1502,6 +1503,62 @@ class MvpFlowTest(unittest.TestCase):
             main.process_user_telegram_outbox()
             self.assertEqual(send.call_count, 2)
             self.assertFalse(self.first.get(path).json["active"])
+
+    def test_task_expiry_withdrawal_reapproval_and_optional_alerts(self):
+        from unittest.mock import patch
+
+        for client, number in zip((self.first, self.second, self.third), (811, 812, 813)):
+            self.login(client, number)
+        tasks = "/api/private/tasks"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS": "test-811,test-812"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-813"}), patch.object(main, "BOT_TOKEN", "stub"):
+            csrf = self.third.get(tasks).json["csrf_token"]
+            headers = {"X-CSRF-Token": csrf}
+            worker = main.User.query.filter_by(telegram_id="test-812").one()
+            main.db.session.add(main.TelegramPreference(user_id=worker.id, enabled=True, revision=1))
+            main.write_release_setting("task_policy", {**main.DEFAULT_TASK_POLICY, "fee_bps": 1000})
+            main.db.session.commit()
+            alerts = "/api/private/task-alerts"
+            self.assertEqual(self.second.get(alerts).json, {"matching": False, "events": False})
+            self.assertEqual(self.second.post(alerts, json={"matching": True, "events": True}).status_code, 200)
+            self.assertEqual(self.first.post(alerts, json={"matching": False, "events": True}).status_code, 200)
+            area = {"city": "Минск", "country": "BY"}
+            self.assertEqual(self.second.post("/api/private/task-work-area", json=area).status_code, 200)
+            due = main.utcnow() + timedelta(hours=2)
+            task = self.first.post(tasks, json={**area, "due_at": due.isoformat(), "title": "Редактура заметки",
+                "description": "Исправить опечатки в короткой заметке", "category": "editing", "budget": 35}).json["item"]
+            self.assertEqual(task["amounts"], {"reward": "35.00", "fee": "3.50", "total": "38.50"})
+            path = f"{tasks}/{task['id']}/action"
+
+            def act(client, action, **values):
+                return client.post(path, json={"action": action, **values}, headers=headers if client is self.third else {})
+
+            self.assertEqual(act(self.third, "approve").status_code, 200)
+            self.assertEqual(main.UserNotification.query.filter_by(user_id=worker.id, kind="task_match").count(), 1)
+            self.assertEqual(main.NotificationOutbox.query.filter_by(kind="user_telegram").count(), 1)
+            self.assertEqual(self.second.get(tasks, query_string={"scope": "available", "city": "МИНСК",
+                "category": "editing", "deadline": "24h", "budget_min": 30, "budget_max": 40}).json["items"][0]["applicants"], [])
+            self.assertEqual(self.second.get(tasks+"?scope=available&budget_min=40").json["items"], [])
+            self.assertEqual(act(self.second, "apply").status_code, 200)
+            self.assertEqual(act(self.second, "withdraw").status_code, 200)
+            self.assertEqual(act(self.first, "assign", user_id=worker.id).status_code, 400)
+            self.assertEqual(act(self.second, "apply").status_code, 200)
+            self.assertEqual(act(self.first, "assign", user_id=worker.id).status_code, 200)
+            self.assertEqual(act(self.second, "start").json["item"]["status"], "in_progress")
+            self.assertEqual(act(self.first, "cancel").json["item"]["status"], "cancel_requested")
+            self.assertEqual(act(self.second, "confirm_cancel").json["item"]["status"], "cancelled")
+            self.assertEqual(act(self.first, "reopen", due_at=due.isoformat()).json["item"]["status"], "pending")
+            self.assertEqual(act(self.third, "approve").json["item"]["applicants"], [])
+            with patch.object(main, "utcnow", return_value=due+timedelta(seconds=1)):
+                self.assertEqual(self.second.get(tasks+"?scope=available").json["items"], [])
+                self.assertEqual(act(self.second, "apply").status_code, 409)
+                self.assertEqual(self.first.get(tasks+"?scope=mine").json["items"][0]["status"], "expired")
+            access = f"/api/admin/users/{worker.id}/task-access"
+            self.assertEqual(self.third.post(access, json={"enabled": False}).status_code, 403)
+            self.assertEqual(self.third.post(access, json={"enabled": False}, headers=headers).status_code, 200)
+            self.assertEqual(self.second.get(tasks).status_code, 403)
+            with patch.object(main, "telegram_api") as telegram:
+                main.process_user_telegram_outbox()
+                telegram.assert_not_called()
 
     def test_0181_private_tasks_require_moderation_and_separate_reputation(self):
         from unittest.mock import patch

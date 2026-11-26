@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS application
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
@@ -12,3 +12,12 @@ COPY --chmod=0644 scripts/bootstrap_db.py ./
 USER app
 EXPOSE 8080
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--worker-class", "gthread", "--workers", "1", "--threads", "16", "--timeout", "0", "main:app"]
+
+FROM application AS demo
+USER root
+RUN install -d -o app -g app /demo-data
+COPY --chmod=0644 scripts/local_demo.py ./
+USER app
+CMD ["python", "/app/local_demo.py"]
+
+FROM application AS release

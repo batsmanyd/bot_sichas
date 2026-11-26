@@ -162,3 +162,30 @@ class PostgresConcurrencyTest(unittest.TestCase):
             ])
         self.assertEqual(sorted(reply.status_code for reply in replies), [200, 200] + [429] * 6)
         self.assertEqual(main.PublicRateBucket.query.one().count, 8)
+
+    def test_only_one_worker_can_be_assigned_concurrently(self):
+        from unittest.mock import patch
+
+        owner, first, second, moderator = [main.app.test_client() for _ in range(4)]
+        for client, code in zip((owner, first, second, moderator), (841, 842, 843, 844)):
+            self.login(client, code)
+        path = "/api/private/tasks"
+        with patch.dict(os.environ, {"PRIVATE_TASK_TELEGRAM_IDS": "test-841,test-842,test-843"}), patch.object(main, "ADMIN_TELEGRAM_IDS", {"test-844"}):
+            response = owner.post(path, json={"category": "editing", "title": "Редактура заметки",
+                "description": "Исправить опечатки в открытой заметке", "budget": 15})
+            self.assertEqual(response.status_code, 201, response.json)
+            task_id = response.json["item"]["id"]
+            action = f"{path}/{task_id}/action"
+            csrf = moderator.get(path).json["csrf_token"]
+            self.assertEqual(moderator.post(action, json={"action": "approve"},
+                headers={"X-CSRF-Token": csrf}).status_code, 200)
+            for client in (first, second):
+                self.assertEqual(client.post(action, json={"action": "apply"}).status_code, 200)
+            applicants = owner.get(path).json["items"][0]["applicants"]
+            owners = [self.clone_client(owner), self.clone_client(owner)]
+            responses = self.concurrent_post([
+                lambda: owners[0].post(action, json={"action": "assign", "user_id": applicants[0]["id"]}),
+                lambda: owners[1].post(action, json={"action": "assign", "user_id": applicants[1]["id"]}),
+            ])
+            self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+            self.assertEqual(main.TaskActivity.query.filter_by(task_id=task_id, action="assign").count(), 1)

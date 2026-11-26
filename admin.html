@@ -30,6 +30,11 @@
     <form id="lookupUser" class="filters"><label>Telegram ID <input name="account" inputmode="numeric" pattern="[0-9]*"></label>
       <button>Найти аккаунт</button></form>
     <div id="launchUsers"></div><button class="action" id="nextUsers" type="button" hidden>Ещё аккаунты</button>
+    <form id="taskAccessForm" class="filters">
+      <label>Участник № <input name="user_id" type="number" min="1" required></label>
+      <label>Закрытые поручения <select name="enabled"><option value="true">Разрешить</option><option value="false">Отозвать</option></select></label>
+      <button type="submit">Сохранить допуск</button>
+    </form>
     <form id="accessForm" class="filters">
       <label>ID аккаунта <input type="number" name="user_id" min="1" required></label>
       <label>Доступ <select name="hours"><option value="24">Ограничить на сутки</option><option value="168">На неделю</option><option value="876000">До решения владельца</option><option value="0">Восстановить</option></select></label>
@@ -147,7 +152,7 @@ async function loadLaunchUsers(before=null){
   const query=new URLSearchParams(new FormData($('lookupUser')));
   if(before)query.set('before',before);
   const data=await api('/api/admin/users?'+query);
-  const rows=data.items.map(user=>`<p>#${user.id} · ${esc(user.name)} · ${user.restricted?'ограничен':'активен'}${user.admin?' · администратор':''}${user.organizer?' · организатор':''} <button type="button" data-access-user="${user.id}">Выбрать</button></p>`).join('');
+  const rows=data.items.map(user=>`<p>#${user.id} · ${esc(user.name)} · ${user.restricted?'ограничен':'активен'}${user.admin?' · администратор':''}${user.organizer?' · организатор':''}${user.task_access?' · есть допуск к поручениям':''} <button type="button" data-access-user="${user.id}">Выбрать</button></p>`).join('');
   if(before)$('launchUsers').insertAdjacentHTML('beforeend',rows);
   else $('launchUsers').innerHTML=rows||'<p>Аккаунты не найдены</p>';
   nextBefore=data.next_before;
@@ -158,6 +163,7 @@ $('launchUsers').onclick=event=>{
   const id=event.target.dataset.accessUser;
   if(!id)return;
   $('accessForm').elements.user_id.value=id;
+  $('taskAccessForm').elements.user_id.value=id;
   $('organizerForm').elements.user_id.value=id;
 };
 $('lookupUser').onsubmit=event=>{event.preventDefault();loadLaunchUsers().catch(error=>{$('launchStatus').textContent=error.message})};
@@ -185,6 +191,10 @@ function bindAdminForm(id,status,task){
 }
 bindAdminForm('moduleForm','launchStatus',async form=>{
   await api('/api/admin/launch-modules',{method:'POST',body:JSON.stringify({modules:Object.fromEntries(moduleKeys.map(key=>[key,form.elements[key].checked]))})});
+});
+bindAdminForm('taskAccessForm','launchStatus',async (_form,body)=>{
+  await api('/api/admin/users/'+Number(body.user_id)+'/task-access',{method:'POST',body:JSON.stringify({enabled:body.enabled==='true'})});
+  await loadLaunchUsers();
 });
 bindAdminForm('accessForm','launchStatus',async (_form,body)=>{
   await api('/api/admin/users/'+Number(body.user_id)+'/access',{method:'POST',body:JSON.stringify({hours:Number(body.hours),reason:body.reason})});

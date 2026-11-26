@@ -18,3 +18,5 @@
 !service-worker.js
 !scripts/
 !scripts/bootstrap_db.py
+
+!scripts/local_demo.py

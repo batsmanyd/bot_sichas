@@ -57,3 +57,8 @@ jobs:
             sleep 1
           done
           node tests/browser_acceptance.cjs
+      - name: Isolated demo
+        run: |
+          trap 'docker compose -f compose.demo.yaml logs; docker compose -f compose.demo.yaml down' EXIT
+          docker compose -f compose.demo.yaml up --build -d --wait
+          node tests/browser_demo.cjs
