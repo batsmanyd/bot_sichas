@@ -90,7 +90,7 @@
 <label>От <input name="budget_min" type="number" min="0" max="100000"></label>
 <label>До <input name="budget_max" type="number" min="0" max="100000"></label>
 <label>Валюта <select name="currency"></select></label>
-</div><button class="chip">Найти поручения</button></form><details><summary>Предложить поручение</summary><form id="privateTaskForm" class="profile-form" style="padding-top:0"><label>Категория <select name="category"></select></label><label>Название <input name="title" minlength="3" maxlength="100" required></label><label>Описание <textarea name="description" minlength="10" maxlength="500" required></textarea></label><label>Вознаграждение <input name="budget" type="number" min="1" max="100000" required></label><label>Валюта <select name="currency"></select></label><label>Город выполнения <input name="city" maxlength="100"></label><label>Код страны, например PL <input name="country" maxlength="2" pattern="[A-Za-z]{2}"></label><label>Срок <input name="due_at" type="datetime-local"></label><label>Требования к результату <textarea name="requirements" maxlength="500"></textarea></label><label class="terms-row"><input type="checkbox" name="public_site_confirmed"><span>Для выездного поручения: место общедоступно, съёмка согласована, сбор чужих данных исключён</span></label><button class="primary">Отправить на модерацию</button></form></details><div id="privateTaskCards" class="cards"></div></div></section>
+</div><button class="chip">Найти поручения</button></form><details><summary>Предложить поручение</summary><form id="privateTaskForm" class="profile-form" style="padding-top:0"><label>Категория <select name="category"></select></label><label>Название <input name="title" minlength="3" maxlength="100" required></label><label>Описание <textarea name="description" minlength="10" maxlength="500" required></textarea></label><label>Вознаграждение <input name="budget" type="number" min="1" max="100000" required></label><label>Валюта <select name="currency"></select></label><label>Город выполнения <input name="city" maxlength="100"></label><label>Код страны, например PL <input name="country" maxlength="2" pattern="[A-Za-z]{2}"></label><label>Срок <input name="due_at" type="datetime-local"></label><label>Требования к результату <textarea name="requirements" maxlength="500"></textarea></label><label class="terms-row"><input type="checkbox" name="public_site_confirmed"><span>Для выездного поручения: место общедоступно, съёмка согласована, сбор чужих данных исключён</span></label><output id="taskAmountPreview" class="meta" aria-live="polite"></output><button class="primary">Отправить на модерацию</button></form></details><div id="privateTaskCards" class="cards"></div></div></section>
   <footer class="legal-footer">© 2026 «Сейчас». Все права защищены.<br><button id="helpBtn" type="button">Как это работает</button> · <a href="/legal.html#privacy">Конфиденциальность</a> · <a href="/legal.html#agreement">Соглашение</a> · <a href="/legal.html#safety">Безопасность</a><br>Контакт: <a href="mailto:dudicoffnet@gmail.com">dudicoffnet@gmail.com</a></footer>
 </main>
 <nav id="nav"><button class="active" data-page="home"><b>⌂</b>Сейчас</button><button data-page="nearby"><b>⌖</b>Рядом</button><button data-page="chats"><b>◌<span id="chatUnreadDot" class="nav-dot"></span></b>Встречи</button><button data-page="profile"><b>♙</b>Профиль</button></nav>
@@ -505,10 +505,13 @@ async function loadPrivateTasks(){
   const currency=$('privateTaskForm').elements.currency, previousCurrency=currency.value||'BYN';
   currency.replaceChildren(...data.currencies.map(code=>new Option(code,code)));
   currency.value=previousCurrency;
+  $('privateTaskForm').dataset.feeBps=data.fee_bps;
+  $('privateTaskForm').elements.budget.max=data.max_budget;
+  renderTaskAmount();
   $('privateReputation').textContent=`Коммерческая репутация · принятых поручений: ${data.reputation.completed}`;
   $('privateTaskCards').innerHTML=data.items.length?data.items.map(task=>`<article class="card" data-task="${task.id}"><div class="card-main">
     <strong>${escapeHtml(task.title)}</strong> <span class="badge">${taskStatuses[task.status]}</span>
-    <div class="meta">${escapeHtml(data.category_labels[task.category])} · ${task.budget} ${escapeHtml(task.currency)}</div>
+    <div class="meta">${escapeHtml(data.category_labels[task.category])}</div>
     ${task.terms.organization?`<div class="meta">Заказчик · ${escapeHtml(task.terms.organization)}</div>`: ''}
     ${task.terms.city?`<div class="meta">${escapeHtml(task.terms.city)}, ${escapeHtml(task.terms.country)}</div>`:''}
     ${task.terms.due_at?`<div class="meta">До ${new Date(task.terms.due_at).toLocaleString()}</div>`:''}
@@ -567,6 +570,16 @@ $('taskAlertsForm').onsubmit=async event=>{
     await loadNotifications(true);
   }catch(error){$('taskAlertsStatus').textContent=error.message}
 };
+function renderTaskAmount(){
+  const form=$('privateTaskForm'), reward=form.elements.budget.valueAsNumber, code=form.elements.currency.value;
+  const preview=$('taskAmountPreview');
+  if(!form.elements.budget.validity.valid||!Number.isInteger(reward)||!code){preview.textContent='';return}
+  const scale=code==='JPY'?1:100;
+  const fee=Math.floor((reward*Number(form.dataset.feeBps)*scale+5000)/10000)/scale;
+  const format=new Intl.NumberFormat('ru',{style:'currency',currency:code});
+  preview.textContent=`Исполнителю ${format.format(reward)} · комиссия ${format.format(fee)} · всего заказчику ${format.format(reward+fee)}`;
+}
+$('privateTaskForm').addEventListener('input',renderTaskAmount);
 $('privateTaskForm').onsubmit=async event=>{
   event.preventDefault();
   const body=Object.fromEntries(new FormData(event.target));

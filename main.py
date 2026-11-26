@@ -4649,8 +4649,9 @@ def private_tasks():
             items.append(task_item(task, user, admin))
             if len(items) == 100:
                 break
-        return jsonify(items=items,
-                       enabled=task_policy()["enabled"] and launch_modules()["tasks"], categories=enabled_task_categories(), category_labels=TASK_CATEGORIES, currencies=sorted(TASK_CURRENCIES), moderator=admin, csrf_token=admin_csrf_token() if admin else None,
+        policy = task_policy()
+        return jsonify(items=items, fee_bps=policy["fee_bps"], max_budget=policy["max_budget"],
+                       enabled=policy["enabled"] and launch_modules()["tasks"], categories=enabled_task_categories(), category_labels=TASK_CATEGORIES, currencies=sorted(TASK_CURRENCIES), moderator=admin, csrf_token=admin_csrf_token() if admin else None,
                        reputation={"completed": PrivateTask.query.filter_by(assignee_id=user.id, status="accepted").count()})
     if not completed_profile(user):
         return jsonify(error="Сначала заполните профиль"), 403
@@ -4660,7 +4661,7 @@ def private_tasks():
     category, budget = data.get("category"), data.get("budget")
     title, description = str(data.get("title") or "").strip(), str(data.get("description") or "").strip()
     if not isinstance(category, str) or category not in enabled_task_categories() or type(budget) is not int or not 1 <= budget <= task_policy()["max_budget"]:
-        return jsonify(error="Выберите разрешённую категорию и укажите сумму в BYN"), 400
+        return jsonify(error="Выберите разрешённую категорию и укажите вознаграждение"), 400
     if not 3 <= len(title) <= 100 or not 10 <= len(description) <= 500:
         return jsonify(error="Укажите название и описание поручения"), 400
     terms = parse_task_terms(category, data)

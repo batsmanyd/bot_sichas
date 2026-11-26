@@ -52,6 +52,7 @@ from PIL import Image
 import main
 
 app = main.app
+app.config["SESSION_COOKIE_NAME"] = "sichas_demo_session"
 db = main.db
 real_utcnow = main.utcnow
 clock_offset = timedelta()

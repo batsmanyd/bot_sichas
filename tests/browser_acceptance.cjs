@@ -57,6 +57,7 @@ const {chromium}=require('playwright');
     for(const [field,value] of Object.entries({title:'Проверочная редактура',description:'Безопасное дистанционное оформление текста',budget:35})){
       await owner.locator('#privateTaskForm [name='+field+']').fill(String(value));
     }
+    await owner.locator('#taskAmountPreview').getByText(/Исполнителю.*комиссия.*всего заказчику/).waitFor();
     await owner.getByRole('button',{name:'Отправить на модерацию'}).click();
     await owner.getByText('На проверке',{exact:true}).waitFor();
     await tasks(admin);
@@ -64,6 +65,9 @@ const {chromium}=require('playwright');
     await admin.getByText('Одобрено',{exact:true}).waitFor();
     await tasks(worker,'available');
     await worker.getByRole('button',{name:'Откликнуться',exact:true}).click();
+    await worker.getByRole('button',{name:'Отозвать отклик',exact:true}).click();
+    await worker.getByRole('button',{name:'Откликнуться',exact:true}).click();
+    await worker.getByRole('button',{name:'Отозвать отклик',exact:true}).waitFor();
     await tasks(owner);
     await owner.getByRole('button',{name:/Назначить/}).click();
     await owner.getByText('Назначено',{exact:true}).waitFor();
@@ -92,6 +96,8 @@ const {chromium}=require('playwright');
     await admin.getByRole('button',{name:'Опубликовать',exact:true}).click();
     await admin.getByText('Открыта',{exact:true}).waitFor();
     await deeds(worker);
+    await worker.getByRole('button',{name:'Участвовать',exact:true}).click();
+    await worker.getByRole('button',{name:'Отменить запись',exact:true}).click();
     await worker.getByRole('button',{name:'Участвовать',exact:true}).click();
     await worker.getByRole('button',{name:'Отменить запись',exact:true}).waitFor();
     assert.equal((await admin.request.post(base+'/__clock/good-deed')).status(),200);
