@@ -9,3 +9,5 @@ __pycache__/
 *.dump
 
 /local-backups/
+
+.env.pc-telegram
